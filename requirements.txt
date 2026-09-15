@@ -16,6 +16,7 @@ pytest==9.1.1
 
 # LangChain 文档抽象与递归文本切分
 langchain==1.4.0
+langchain-openai==1.6.2
 langchain-text-splitters==1.1.2
 langchain-huggingface==1.2.2
 sentence-transformers==6.0.1

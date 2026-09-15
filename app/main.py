@@ -25,7 +25,9 @@ from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
 from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe
 from .knowledge import document_hash, split_note
-from .retrieval import select_top_k
+from .retrieval import search_knowledge
+from .chat_agent import run_agent_turn
+from .tools import build_langchain_tools
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
     blob_to_vector,
@@ -176,6 +178,14 @@ class SearchRequest(BaseModel):
     )
 
 
+class ThreadCreateRequest(BaseModel):
+    title: str = Field(default="新对话", min_length=1, max_length=100)
+
+
+class ChatMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=4000, description="用户发送给知识库助手的消息")
+
+
 class FolderCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=50, description="收藏夹名称")
     description: str = Field(default="", max_length=500, description="收藏夹用途说明")
@@ -255,6 +265,62 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         # @app.get 是装饰器，把 URL 和函数关联起来。GET 主要用于读取。
         # 返回 Python 字典后，FastAPI 会将它转换为客户端能读取的 JSON。
         return {"status": "ok"}
+
+    @app.post("/threads", status_code=201, summary="创建知识库对话")
+    def create_thread(body: ThreadCreateRequest):
+        now = datetime.now(timezone.utc).isoformat()
+        return app.state.store.create_thread(str(uuid4()), body.title.strip(), now)
+
+    @app.get("/threads/{thread_id}", summary="查看对话及最近消息")
+    def get_thread(thread_id: str):
+        thread = app.state.store.thread(thread_id)
+        if thread is None:
+            raise HTTPException(404, detail="对话不存在。")
+        return thread
+
+    @app.post("/threads/{thread_id}/messages", summary="与知识库 Agent 对话")
+    async def send_chat_message(thread_id: str, body: ChatMessageRequest):
+        if app.state.store.thread(thread_id) is None:
+            raise HTTPException(404, detail="对话不存在。")
+        now = datetime.now(timezone.utc).isoformat()
+        app.state.store.add_chat_message(thread_id, "user", body.content.strip(), {}, now)
+
+        def recall(query, limit):
+            # Workbuddy 完成向量记忆召回后会自动走新版；当前版本安全退化为最近记忆。
+            if hasattr(app.state.store, "recall_memories"):
+                return app.state.store.recall_memories(query=query, limit=limit)
+            return app.state.store.active_memories(limit=limit)
+
+        async def create_draft(goal, source_note_ids, start_date):
+            # 复用已有计划接口的校验和持久化逻辑，避免 Agent 另写一套业务规则。
+            return await create_ai_plan_draft(AIDraftPlanRequest(
+                goal=goal, source_note_ids=source_note_ids, start_date=start_date
+            ))
+
+        tools = build_langchain_tools(
+            searcher=lambda query, limit: search_knowledge(
+                app.state.store, query, limit, query_embedder=embed_search_query
+            ),
+            getter=app.state.store.get,
+            recaller=recall,
+            drafter=create_draft,
+        )
+        # 只发送最近 20 条消息：这是滑动窗口短期记忆，避免上下文无限增长。
+        history = app.state.store.thread(thread_id, message_limit=20)["messages"]
+        try:
+            result = await run_agent_turn(history, tools)
+        except Exception as exc:
+            logger.warning("chat_agent_failed thread_id=%s exception_type=%s", thread_id, type(exc).__name__)
+            raise HTTPException(502, detail="知识库助手暂时无法回答，请稍后重试。") from None
+
+        assistant = app.state.store.add_chat_message(
+            thread_id, "assistant", result["content"], {
+                "tool_calls": result["tool_calls"],
+                "source_note_ids": result["source_note_ids"],
+                "plan_id": result["plan_id"],
+            }, datetime.now(timezone.utc).isoformat()
+        )
+        return {"thread_id": thread_id, "message": assistant}
 
     @app.get("/ai/config", summary="检查视觉模型配置；不会显示密钥")
     def ai_config():
@@ -848,24 +914,16 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
 
     @app.post("/search", summary="使用 Embedding 余弦相似度检索知识库")
     def semantic_search(body: SearchRequest):
-        candidates = app.state.store.searchable_embeddings(EMBEDDING_MODEL)
-        if not candidates:
+        selected = search_knowledge(
+            app.state.store, body.query.strip(), body.top_k, body.deduplicate_notes,
+            query_embedder=embed_search_query,
+        )
+        if not selected:
             raise HTTPException(409, detail="知识库中还没有可检索向量，请先建立索引并生成 Embedding。")
-
-        # 秋招知识点：查询与文档必须使用同一个模型和维度，分数才有比较意义。
-        query_vector = embed_search_query(body.query.strip())
-        ranked = []
-        for candidate in candidates:
-            chunk_vector = blob_to_vector(candidate.pop("vector"), candidate["dimension"])
-            score = cosine_similarity(query_vector, chunk_vector)
-            ranked.append({**candidate, "score": score})
-
-        # 秋招知识点：Top-K 是召回阶段；后续可在候选集上增加 reranker 精排。
-        selected = select_top_k(ranked, body.top_k, body.deduplicate_notes)
         return {
             "query": body.query.strip(),
             "model": EMBEDDING_MODEL,
-            "total_candidates": len(candidates),
+            "total_candidates": len(app.state.store.searchable_embeddings(EMBEDDING_MODEL)),
             "deduplicated_notes": body.deduplicate_notes,
             "items": selected,
         }

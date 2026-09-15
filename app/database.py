@@ -38,6 +38,20 @@ class NoteStore:
                 source_note_ids TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, confirmed_at TEXT
             )""")
+            # 对话是短期记忆：thread 保存会话，message 保存按顺序发生的消息。
+            # 与 memories（长期偏好）分表，避免把一句临时追问误当成长期画像。
+            db.execute("""CREATE TABLE IF NOT EXISTS chat_threads (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )""")
+            db.execute("""CREATE INDEX IF NOT EXISTS idx_chat_messages_thread
+                ON chat_messages(thread_id, id)""")
             db.execute("""CREATE TABLE IF NOT EXISTS plan_items (
                 id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL,
                 item_index INTEGER NOT NULL, title TEXT NOT NULL, details TEXT NOT NULL DEFAULT '',
@@ -310,6 +324,43 @@ class NoteStore:
                            (cursor.lastrowid, row["id"]))
             db.execute("UPDATE plans SET status='active', updated_at=? WHERE id=?", (now, plan_id))
         return self.plan(plan_id), task_ids
+
+    def create_thread(self, thread_id, title, now):
+        """创建一次对话；UUID 由接口层生成，数据库只负责持久化。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("""INSERT INTO chat_threads(id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)""", (thread_id, title, now, now))
+        return self.thread(thread_id)
+
+    def thread(self, thread_id, message_limit=20):
+        """读取会话及最近消息；窗口上限用于控制模型上下文成本。"""
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM chat_threads WHERE id=?", (thread_id,)).fetchone()
+            if row is None:
+                return None
+            # 子查询先取最近 N 条，再按正序返回，保证模型看到自然对话顺序。
+            messages = db.execute("""SELECT * FROM (
+                SELECT * FROM chat_messages WHERE thread_id=? ORDER BY id DESC LIMIT ?
+            ) ORDER BY id""", (thread_id, message_limit)).fetchall()
+        result = dict(row)
+        result["messages"] = []
+        for message in messages:
+            item = dict(message)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            result["messages"].append(item)
+        return result
+
+    def add_chat_message(self, thread_id, role, content, metadata, now):
+        """追加一条不可变消息，并更新会话活跃时间。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            cursor = db.execute("""INSERT INTO chat_messages
+                (thread_id, role, content, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (thread_id, role, content, json.dumps(metadata, ensure_ascii=False), now))
+            db.execute("UPDATE chat_threads SET updated_at=? WHERE id=?", (now, thread_id))
+            message_id = cursor.lastrowid
+        return next(item for item in self.thread(thread_id)["messages"] if item["id"] == message_id)
 
     def create_job(self, job_id, job_type, now, progress):
         """先持久化 queued 记录，再安排后台工作，避免任务没有可查询的 ID。"""
