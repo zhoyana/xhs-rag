@@ -1,4 +1,5 @@
 """持久化模块：SQLite 是本地文件数据库，无需另外安装服务。"""
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
@@ -68,6 +69,21 @@ class NoteStore:
                 category TEXT NOT NULL, intent TEXT NOT NULL,
                 selected_actions TEXT NOT NULL, updated_at TEXT NOT NULL
             )""")
+            # 记忆层：用户确认意图后沉淀的长期偏好，供后续 AI 分析注入提示词。
+            # type 用 CHECK 约束兜底：应用层校验管体验，数据库约束管数据正确性。
+            # status 软删除（active/dismissed），与 tasks/folders 的策略一致，可审计可恢复。
+            db.execute("""CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL CHECK(type IN ('preference', 'habit', 'correction')),
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL UNIQUE,
+                model TEXT NOT NULL,
+                source_note_id TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'dismissed')),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
+            # 秋招知识点：content_hash 是内容 SHA-256 指纹 + UNIQUE 约束，重复记忆在
+            # 数据库层直接插不进去——幂等去重从“代码约定”升级为“硬约束”（对齐 chunks）。
             # 任务使用普通关系表保存，安卓 App 以后只需读取这些字段即可展示待办。
             db.execute("""CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY, note_id TEXT NOT NULL,
@@ -638,6 +654,76 @@ class NoteStore:
                 (note_id, decision, category, intent,
                  json.dumps(actions, ensure_ascii=False), updated_at))
         return self.intent_confirmation(note_id)
+
+    # ---- 记忆层（Memory Layer）----
+    # 记忆是意图确认的副产品：确认是主链路，沉淀失败不影响确认接口。
+
+    @staticmethod
+    def memory_content_hash(content):
+        """内容指纹：同一句话重复沉淀时在数据库层直接被 UNIQUE 拒绝。"""
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def save_memories(self, model, records, source_note_id, now):
+        """批量保存提取出的记忆；返回真正新建的部分（重复内容被数据库跳过）。
+
+        秋招知识点：INSERT OR IGNORE + UNIQUE 是常用的幂等写入组合——
+        重复执行同一批提取结果不会产生重复记忆，调用方无需先查询再插入。
+        """
+        saved_ids = []
+        with closing(sqlite3.connect(self.path)) as db, db:
+            for record in records:
+                cursor = db.execute("""INSERT OR IGNORE INTO memories
+                    (type, content, content_hash, model, source_note_id,
+                     status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+                    (record["type"], record["content"],
+                     self.memory_content_hash(record["content"]),
+                     model, source_note_id, now, now))
+                if cursor.rowcount == 1:
+                    saved_ids.append(cursor.lastrowid)
+        # 秋招知识点：回读必须放在事务提交之后——另一个连接看不到未提交的写入。
+        return [self.memory(memory_id) for memory_id in saved_ids]
+
+    def memory(self, memory_id):
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        return dict(row) if row else None
+
+    def memories(self, status=None, limit=50, offset=0):
+        """列出记忆；默认包含 dismissed，管理接口可用 status 过滤。"""
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            if status:
+                rows = db.execute("""SELECT * FROM memories WHERE status = ?
+                    ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
+                    (status, limit, offset)).fetchall()
+            else:
+                rows = db.execute("""SELECT * FROM memories
+                    ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
+                    (limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_memories(self, limit=10):
+        """注入提示词用：只取 active，按 updated_at 倒序（最近整理过的最可信）。
+
+        秋招知识点：注入条数设上限是上下文预算管理——记忆条目短（约 100 字），
+        10 条对 token 成本影响可忽略，同时避免无限增长的提示词。
+        """
+        return self.memories(status="active", limit=limit)
+
+    def update_memory(self, memory_id, fields, now):
+        """只更新白名单字段；content 变化时同步重算 content_hash。"""
+        allowed = {"type", "content", "status"}
+        changes = {key: value for key, value in fields.items() if key in allowed}
+        if "content" in changes:
+            changes["content_hash"] = self.memory_content_hash(changes["content"])
+        changes["updated_at"] = now
+        assignments = ", ".join(f"{key} = ?" for key in changes)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(f"UPDATE memories SET {assignments} WHERE id = ?",
+                       [*changes.values(), memory_id])
+        return self.memory(memory_id)
 
     @staticmethod
     def _task_dict(row):

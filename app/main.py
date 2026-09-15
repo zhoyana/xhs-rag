@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from .database import NoteStore, DEFAULT_DB
 from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
-from .ai import AIProblem, analyze_note, suggest_folders, draft_plan
+from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe
 from .knowledge import document_hash, split_note
 from .retrieval import select_top_k
 from .embeddings import (
@@ -663,7 +663,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         confirmation = app.state.store.intent_confirmation(note_id)
         try:
             result, model = await suggest_folders(
-                note, analysis_record["analysis"], confirmation, folders
+                note, analysis_record["analysis"], confirmation, folders,
+                # 同一篇笔记在不同用户手里应该进不同收藏夹，靠的就是这份记忆。
+                app.state.store.active_memories(),
             )
         except AIProblem as exc:
             raise HTTPException(502, detail=str(exc)) from None
@@ -830,7 +832,10 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             return {"status": "cached", **cached}
         try:
             result, model = await analyze_note(
-                note, app.state.store.assets(note_id), app.state.media_root
+                note, app.state.store.assets(note_id), app.state.media_root,
+                # 注入用户确认过的长期记忆：同一篇笔记，带记忆的分析会更贴近
+                # 这位用户自己的分类习惯；没有记忆时该参数为空列表，提示词不变。
+                app.state.store.active_memories(),
             )
         except AIProblem as exc:
             raise HTTPException(502, detail=str(exc)) from None
@@ -868,8 +873,35 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             "confirmation": confirmation,
         }
 
+    async def extract_memory_after_confirmation(note_id: str):
+        """确认意图之后的附加动作：提炼长期记忆并落库。
+
+        秋招知识点（后台任务的边界）：这里刻意不写 jobs 表。记忆提炼是"尽力而为"
+        的副产品，没有客户端轮询它的进度；而 BackgroundTasks 只存在于当前进程
+        的内存里，重启即丢。为一次可丢失的后台动作再建任务表、状态机和轮询接口
+        属于过度设计——真正需要可靠投递时应该上持久队列（Celery/RQ），
+        而不是自己搭半个队列。
+        """
+        store = app.state.store
+        note = store.get(note_id)
+        confirmation = store.intent_confirmation(note_id)
+        if note is None or confirmation is None:
+            return
+        # 已有记忆一起传进去，让模型在提示词内自查重复。
+        memories, model = await extract_memories_safe(
+            note, confirmation, store.active_memories()
+        )
+        if not memories or not model:
+            # 降级路径：safe 包装已经写过 memory_extract_failed 日志。
+            return
+        saved = store.save_memories(
+            model, memories, note_id, datetime.now(timezone.utc).isoformat()
+        )
+        logger.info("memory_extracted note_id=%s saved=%d", note_id, len(saved))
+
     @app.put("/notes/{note_id}/intent", summary="确认、修改或忽略模型推测的收藏意图")
-    def confirm_intent(note_id: str, body: IntentConfirmationRequest):
+    def confirm_intent(note_id: str, body: IntentConfirmationRequest,
+                       background_tasks: BackgroundTasks):
         state = get_intent(note_id)
         proposal = state["proposal"]
 
@@ -899,7 +931,14 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         confirmation = app.state.store.save_intent_confirmation(
             note_id, body.decision, category, intent, actions, updated_at
         )
-        return {**state, "status": body.decision, "confirmation": confirmation}
+        # 只有用户真正采用（confirmed / edited）时才值得学习：dismissed 表示
+        # "模型猜错了"，这条信息本身没有可复用的偏好，也就没必要多花一次调用。
+        memory_job = "queued" if body.decision != "dismissed" else "skipped"
+        if memory_job == "queued":
+            # 先返回确认结果，提炼在响应之后执行：提炼失败不会影响这次确认。
+            background_tasks.add_task(extract_memory_after_confirmation, note_id)
+        return {**state, "status": body.decision, "confirmation": confirmation,
+                "memory_job": memory_job}
 
     @app.post("/notes/{note_id}/tasks", summary="从已确认的收藏意图创建任务")
     def create_task(note_id: str, body: TaskCreateRequest):
