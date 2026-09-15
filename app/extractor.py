@@ -1,0 +1,127 @@
+"""提取模块：只读取公开网页，不接收 Cookie，不执行网页脚本。"""
+import re
+from urllib.parse import urlsplit, urljoin
+
+import httpx
+import json5
+
+
+class ImportProblem(Exception):
+    # 自定义异常类型：把“预期的导入问题”与意外程序错误区分开。
+    # pass 表示无需添加额外实现，直接使用 Exception 的行为。
+    pass
+
+
+# 集合用于域名白名单判断。只做精确匹配，不信任“名字里包含小红书”的网站。
+# 这只是本地原型的基础限制，不等于完整的公网 SSRF 防护。
+HOSTS = {"www.xiaohongshu.com", "xiaohongshu.com", "xhslink.com", "www.xhslink.com"}
+
+
+def check_url(url: str) -> str:
+    # url: str 和 -> str 是类型提示，分别说明输入和返回值应为字符串。
+    # 普通 Python 函数不会自动执行类型校验，因此仍需要下面的实际检查。
+    try:
+        parsed = urlsplit(url)
+        # 将 URL 拆成协议、域名、端口等，再拒绝未知域名、用户密码和不允许的端口。
+        valid = (parsed.scheme in {"https", "http"} and parsed.hostname in HOSTS
+                 and not parsed.username and not parsed.password
+                 and parsed.port in {None, 80, 443})
+    except ValueError:
+        # 例如无法解析的端口号，也要作为不合法 URL 处理。
+        valid = False
+    if not valid:
+        raise ImportProblem("仅接受小红书官方网页或分享域名，不能访问任意地址。")
+    return url
+
+
+def share_url(text: str) -> str:
+    # 兼容聊天中复制的 Markdown 转义。
+    cleaned = text.replace("\\_", "_").replace("\\&", "&")
+    # re.search 用正则表达式寻找第一个匹配项；r'...' 避免 Python 先处理反斜杠。
+    # 这个模式从 http(s) 开始，读到空格或常见分享文本分隔符前停止。
+    match = re.search(r'https?://[^\s<>"）)\]，]+', cleaned)
+    if not match:
+        raise ImportProblem("没有找到链接，请粘贴完整分享文本或 URL。")
+    # group() 取匹配到的文本；rstrip() 清理尾部标点，然后再检查安全边界。
+    return check_url(match.group().rstrip("。；;"))
+
+
+async def fetch_page(url: str) -> tuple[str, str]:
+    # 返回 (网页 HTML, 最终 URL)。最终 URL 很重要：短链接跳转后才能定位笔记编号。
+    # async with 在退出代码块时关闭网络资源；User-Agent 是请求头，不是登录凭据。
+    # timeout=15 限制各类网络等待，不是整个导入过程严格的 15 秒总上限。
+    # 手动检查每次重定向，防止分享链接被用作任意网址代理。
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False,
+                                 headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for _ in range(5):
+            # _ 表示不需要使用循环计数值。最多发起五次请求，防止无限跳转。
+            check_url(url)
+            async with client.stream("GET", url) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    # 这些 HTTP 状态码表示跳转；Location 头提供新的地址。
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ImportProblem("分享链接跳转地址缺失。")
+                    url = urljoin(url, location)
+                    # continue 跳过本轮后续代码；下一轮会重新验证跳转目标的域名。
+                    continue
+                if response.status_code >= 400:
+                    raise ImportProblem(f"来源站点返回 HTTP {response.status_code}，未导入。")
+                chunks = bytearray()
+                # 按块读取并累计大小，避免一次性无上限地读入整个网页。
+                async for chunk in response.aiter_bytes():
+                    chunks.extend(chunk)
+                    if len(chunks) > 5_000_000:
+                        raise ImportProblem("网页超过 5 MB，已停止读取。")
+                return chunks.decode("utf-8", errors="replace"), url
+    raise ImportProblem("链接跳转次数过多，已停止读取。")
+
+
+def parse_note(html: str, final_url: str) -> dict:
+    # 小红书页面可能在脚本中包含初始化数据。这不是官方 API，页面变化会导致失效。
+    # re.S 使正则中的点号也能匹配换行；(.*?) 捕获尽可能短的内容。
+    match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(.*?)</script>", html, re.S)
+    if not match:
+        raise ImportProblem("网页没有笔记数据：可能需要登录、内容受限或网页结构已变化。")
+    try:
+        # json5 不执行 JavaScript；只把字符串外的 undefined 转成 null。
+        literal = match.group(1).strip().rstrip(";")
+        # 下方较复杂的正则优先匹配完整引号字符串，保留字符串里的 "undefined"。
+        # lambda 是匿名小函数：有字符串捕获组就原样保留，否则替换 undefined。
+        literal = re.sub(r'("(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27)|\bundefined\b',
+                         lambda m: m.group(1) if m.group(1) else "null", literal)
+        state = json5.loads(literal)
+        # JSON5 将数据文本转成字典，不使用 eval，避免执行不可信的网页代码。
+        details = state["note"]["noteDetailMap"]
+        id_match = re.search(r"/(?:explore|discovery/item)/([a-zA-Z0-9]+)", urlsplit(final_url).path)
+        if not id_match:
+            raise ImportProblem("未定位到笔记详情地址，可能跳转到了登录或错误页面。")
+        note_id = id_match.group(1)
+        # 按 URL 中的编号找当前笔记，不直接取页面里的第一条，以免误导入推荐内容。
+        note = details[note_id]["note"]
+        title = note.get("title", "").strip()
+        # 字典.get(key, 默认值) 在键不存在时返回默认值；strip() 去掉首尾空白。
+        content = note.get("desc", "").strip()
+        if not title or not content:
+            raise ImportProblem("缺少标题或正文，未按完整笔记入库；请核对原笔记。")
+        images = []
+        for item in note.get("imageList", []):
+            image_url = item.get("urlDefault") or item.get("url", "")
+            # or 在第一个值为空时使用备用值；isinstance 检查是否确实是字符串。
+            if isinstance(image_url, str) and image_url.startswith(("https://", "http://")):
+                images.append(image_url)
+        kind = note.get("type", "unknown")
+        # warnings 提醒客户端当前导入的范围，避免把“图片地址”误当成已识别的知识。
+        warnings = ["图片仅保存远程地址，未下载、未进行文字识别。"] if images else []
+        if kind == "video":
+            warnings.append("只导入视频笔记的文字描述，未提取或转写视频。")
+        return {"note_id": note_id, "title": title, "content": content,
+                # f"...{变量}..." 是格式化字符串。这里只保存不带访问 token 的来源地址。
+                "source_url": f"https://www.xiaohongshu.com/explore/{note_id}",
+                "images": images, "kind": kind, "warnings": warnings}
+    except ImportProblem:
+        # 单独写 raise 会把当前异常原样向外传递，保留已经写好的具体错误说明。
+        raise
+    except (ValueError, TypeError, KeyError, AttributeError):
+        # 捕获解析与字段结构错误；不要用一个宽泛的 except 隐藏所有编程错误。
+        raise ImportProblem("笔记数据不符合预期结构，未导入；需要更新解析器。") from None

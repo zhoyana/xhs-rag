@@ -1,0 +1,11 @@
+.venv/
+.venv-local/
+__pycache__/
+.pytest_cache/
+test-temp-*/
+/data/
+*.log
+uvicorn.*.log
+*.lock
+# 本地密钥文件绝不能提交到 Git，也不要发给别人。
+.env

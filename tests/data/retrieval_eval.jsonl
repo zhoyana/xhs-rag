@@ -1,0 +1,10 @@
+{"id":"q001","query":"时间序列预测要怎么做","relevant_note_ids":["6a982cac0000000011035f54","6a9998e9000000002601c8b3"],"difficulty":"easy","reason":"两篇笔记均强调从简单基线（如 Seasonal Naive、Linear、DLinear）开始，避免盲目堆叠复杂模型；考察系统对“时序预测方法论”的召回能力。"}
+{"id":"q002","query":"训练预测模型时，怎样避免偷看未来数据？","relevant_note_ids":["6a982cac0000000011035f54"],"difficulty":"medium","reason":"该笔记讨论了预测时不可获得的外生变量、未来信息泄漏等问题，并强调明确预测范围与可用变量；考察对数据泄漏概念的语义匹配。"}
+{"id":"q003","query":"时间序列研究有哪些新方向？","relevant_note_ids":["6a94ead10000000025011119"],"difficulty":"easy","reason":"该笔记汇总了 ICML 2026 时间序列预测论文与研究亮点，直接对应“新方向”的查询意图；考察对综述类内容的召回。"}
+{"id":"q004","query":"模型堆得很复杂但效果没有提升，应该先检查什么？","relevant_note_ids":["6a9998e9000000002601c8b3","6a982cac0000000011035f54"],"difficulty":"medium","reason":"两篇笔记均批评盲目堆叠 Transformer/卷积/注意力，主张先检查数据质量、基线和问题定义；考察对“复杂模型无效”诊断建议的召回。"}
+{"id":"q005","query":"Agent怎么保存长期会话记忆？","relevant_note_ids":["69ff02ff0000000023006644"],"difficulty":"medium","reason":"该笔记以 Hermes Agent 为例，介绍了 SQLite、FTS5、检索与摘要等长期记忆存储方案；考察对具体技术栈的召回。"}
+{"id":"q006","query":"怎样把 Agent 做过的复杂流程沉淀成可复用能力？","relevant_note_ids":["69ff02ff0000000023006644"],"difficulty":"hard","reason":"查询未直接出现“skills”，但笔记中介绍了 skills 系统用于沉淀可复用能力；考察语义泛化与间接匹配。"}
+{"id":"q007","query":"零经验找 AI 实习，怎样用岗位 JD 选择和改造项目？","relevant_note_ids":["6a0960f500000000080319ce"],"difficulty":"medium","reason":"该笔记详细说明根据 JD 搜索、理解并改造 GitHub 项目的流程，直接匹配“零经验找实习”的实操需求。"}
+{"id":"q008","query":"如何把 AI 项目整理成 STAR 简历描述并准备模拟面试？","relevant_note_ids":["6a0960f500000000080319ce"],"difficulty":"medium","reason":"该笔记覆盖 STAR 项目描述、量化指标和模拟面试演练，与查询的多个要点一一对应。"}
+{"id": "q009","query": "我想做饭，给我推荐一个菜谱？","relevant_note_ids": ["6a053a8c000000000803123c","69f59c8e000000002003b703"],"difficulty": "easy","reason": "知识库中裤带面和沙拉笔记都提供了食材与做法；考察宽泛菜谱需求下的多结果召回。"}
+{"id":"q010","query":"汽车发动机出现异响应该怎样维修？","relevant_note_ids":[],"difficulty":"no_answer","reason":"知识库中无汽车维修内容，预期不应返回任何相关笔记；用于评估系统在无答案场景下是否会强行返回伪相关结果（no_answer 测试）。"}
