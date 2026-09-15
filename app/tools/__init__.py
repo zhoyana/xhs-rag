@@ -6,5 +6,6 @@
 from .knowledge_tools import get_note_tool, search_notes_tool
 from .memory_tools import recall_memories_tool
 from .plan_tools import draft_plan_tool
+from .langchain_tools import build_langchain_tools
 
-__all__ = ["search_notes_tool", "get_note_tool", "recall_memories_tool", "draft_plan_tool"]
+__all__ = ["search_notes_tool", "get_note_tool", "recall_memories_tool", "draft_plan_tool", "build_langchain_tools"]
