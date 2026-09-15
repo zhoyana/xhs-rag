@@ -39,7 +39,8 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 分析完成后，先用 `GET /notes/{note_id}/intent` 查看模型建议。它最初显示 `pending`。
 再通过 `PUT /notes/{note_id}/intent` 提交用户选择：`confirmed` 直接采用建议，`edited`
 保存用户修改后的分类和意图，`dismissed` 表示暂不采用。确认数据和模型分析分表保存，
-后续创建提醒时只使用用户确认过的结果。
+后续创建提醒时只使用用户确认过的结果。确认成功后，后台会自动从这次选择里提炼长期记忆
+（`dismissed` 除外），详见后面的「长期记忆」一节。
 
 ## 任务接口
 
@@ -183,3 +184,64 @@ content_hash，禁止把不同模型或过期内容的向量混在一起比较�
 若人工标注的相关笔记尚未生成 Embedding，会停止并列出缺失 note_id，避免错误地拉低指标。
 评测默认调用正在运行的 `http://127.0.0.1:8000/search`，复用后端已加载的模型，避免两个
 Python 进程各加载一份 PyTorch/BGE 导致内存不足，同时覆盖真实 HTTP 端到端链路。
+
+## 长期记忆：让建议越用越准
+
+前面的章节解决的是「把一篇笔记读懂」，这一节解决的是「把用户读懂」。系统会把用户在
+确认意图时做出的选择沉淀成长期记忆，并在后续分析时把记忆带回给模型——这是整个项目里
+唯一会随使用而变好的部分。
+
+### 闭环
+
+1. **沉淀**：`PUT /notes/{note_id}/intent` 确认成功后（`confirmed` / `edited`；`dismissed`
+   不触发），后台异步调用模型，从「笔记 + 用户确认的意图」里提炼 0~2 条记忆，写入
+   `memories` 表。响应新增 `memory_job` 字段（`queued` / `skipped`），原有字段保持不变。
+2. **注入**：`POST /notes/{note_id}/analyze` 和 `POST /notes/{note_id}/folder-suggestions`
+   会把最近 10 条生效中的记忆拼进提示词，并在提示词里明确声明"仅供参考、不要盲从"——
+   记忆是先验而非硬约束，避免历史偏好压制当前内容。
+3. **管理**：记忆由模型提炼，可能不准或过时，所以留了完整的修正入口：
+
+| 接口 | 作用 |
+|------|------|
+| `GET /memories` | 查看记忆列表，默认包含已删除的（便于判断误删），可用 `status` 过滤 |
+| `GET /memories/{memory_id}` | 查看单条 |
+| `PUT /memories/{memory_id}` | 修正内容或类型；提交 `{"status": "active"}` 可恢复已删除的记忆 |
+| `DELETE /memories/{memory_id}` | 软删除（`status=dismissed`），保留记录可追溯 |
+
+### 三类记忆
+
+`preference`（内容偏好）、`habit`（行为习惯）、`correction`（纠正记录），
+取值由数据库 `CHECK` 约束兜底。
+
+### 设计要点
+
+- **幂等**：`content_hash` 加 `UNIQUE`，写入用 `INSERT OR IGNORE`，重复沉淀不会产生重复记忆。
+- **可追溯**：每条记忆记下 `source_note_id`（来自哪篇笔记）与 `model`（哪次模型调用产出）。
+- **不可信输入**：笔记正文、意图、已有记忆、注入的记忆，进提示词前统一清洗
+  （剥离控制字符、折叠空白、按长度截断），防止内容里的文字伪造出新的指令边界。
+- **降级**：提炼失败只记日志（`memory_extract_failed`），绝不影响意图确认这条主链路。
+
+### 秋招知识点
+
+| 主题 | 位置 |
+|------|------|
+| CHECK / UNIQUE 约束做数据正确性兜底 | `app/database.py` 的 `memories` 建表语句 |
+| 幂等写入与去重的区别 | `NoteStore.save_memories` |
+| 软删除与可审计性 | `NoteStore.update_memory`、`DELETE /memories/{id}` |
+| 事务可见性：跨连接的读必须等提交 | `NoteStore.save_memories`（先收集 id，出事务再回读） |
+| 提示词注入防御（控制字符 / 截断 / 指令边界） | `app/ai.py` 的 `_sanitize_inline`、`_memory_block` |
+| 模型输出不可信与三段式校验 | `app/ai.py` 的 `_valid_memories` |
+| 主链路与副产品解耦、静默降级与 fail fast 的边界 | `app/ai.py` 的 `extract_memories_safe` |
+| BackgroundTasks 的边界、何时才该上持久队列 | `app/main.py` 的 `extract_memory_after_confirmation` |
+| 记忆是先验而非硬约束（上下文偏置） | `app/ai.py` 的 `_memory_block` |
+| 批量赋值 / 字段级越权防护 | `MemoryUpdateRequest` + `NoteStore.update_memory` 的 `allowed` 白名单 |
+| 上下文预算与成本控制 | `MEMORY_*` 常量、`active_memories(limit=10)` |
+
+### 测试
+
+```powershell
+.\.venv-local\Scripts\python.exe -m pytest tests/test_memories.py tests/test_memory_extract.py tests/test_memory_trigger.py tests/test_memory_inject.py tests/test_memory_api.py -q
+```
+
+五个测试文件全部用替身替换真实模型调用，不联网、不产生费用：分别覆盖存储层约束、
+提示词清洗与逐条校验、确认后触发落库、记忆注入接线、管理接口的越权与冲突处理。

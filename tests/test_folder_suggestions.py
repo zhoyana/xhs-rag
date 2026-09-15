@@ -24,7 +24,7 @@ def test_ai_suggestion_is_cached_then_confirmed(tmp_path, monkeypatch):
     prepared_store(db_path)
     calls = []
 
-    async def fake_suggest(note, analysis, confirmation, folders):
+    async def fake_suggest(note, analysis, confirmation, folders, memories=None):
         calls.append([folder["id"] for folder in folders])
         return {"suggestions": [
             {"folder_id": folders[0]["id"], "confidence": 0.95, "reason": "属于 Agent 技术"},
@@ -70,7 +70,7 @@ def test_confirmation_validates_folder_ids(tmp_path, monkeypatch):
     db_path = tmp_path / "suggestions.sqlite3"
     prepared_store(db_path)
 
-    async def fake_suggest(note, analysis, confirmation, folders):
+    async def fake_suggest(note, analysis, confirmation, folders, memories=None):
         return {"suggestions": [{
             "folder_id": folders[0]["id"], "confidence": 0.8, "reason": "相关"
         }], "uncertainties": []}, "test-model"

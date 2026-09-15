@@ -184,6 +184,25 @@ class FolderSuggestionConfirmRequest(BaseModel):
     )
 
 
+class MemoryUpdateRequest(BaseModel):
+    """修正长期记忆：请求模型本身就是字段白名单。
+
+    秋招知识点（批量赋值 / Mass Assignment 防护）：model 与 source_note_id
+    这类由服务端掌控的字段刻意不在这里声明——否则请求体就能决定"能改哪些
+    字段"，用户可以伪造记忆的产出模型与来源笔记，破坏可审计性和可追溯性。
+    声明式白名单还有第二层好处：Pydantic 直接丢弃未声明的键，接口层就完成了
+    过滤；存储层的 allowed 集合再兜一次底，两层叠加即纵深防御。
+    """
+
+    type: Literal["preference", "habit", "correction"] | None = Field(
+        default=None, description="记忆类型：内容偏好 / 行为习惯 / 纠正记录")
+    content: str | None = Field(
+        default=None, min_length=1, max_length=200,
+        description="记忆内容，用第三人称“用户……”陈述；留空表示不改")
+    status: Literal["active", "dismissed"] | None = Field(
+        default=None, description="active 生效；dismissed 表示已删除，改回 active 即恢复")
+
+
 def create_app(db_path=DEFAULT_DB, media_root=None):
     # 从项目根目录的 .env 读取本地配置。这个文件已被 .gitignore 排除，
     # 因而不会在提交代码时意外上传 API Key。
@@ -1006,6 +1025,53 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         require_task(task_id)
         return app.state.store.update_task(
             task_id, {"status": "cancelled"}, datetime.now(timezone.utc).isoformat()
+        )
+
+    # ------------------------------ 长期记忆管理 ------------------------------
+    # 记忆是模型自动提炼出来的，可能过时、也可能理解偏了，所以必须给用户
+    # 查看、修正、删除的出口。能被纠正的记忆才是资产，只能被动接受的记忆是负担。
+
+    def require_memory(memory_id: int):
+        memory = app.state.store.memory(memory_id)
+        if memory is None:
+            raise HTTPException(404, detail="记忆不存在。")
+        return memory
+
+    @app.get("/memories", summary="查看长期记忆列表")
+    def list_memories(status: Literal["active", "dismissed"] | None = None,
+                      limit: int = Query(50, ge=1, le=100),
+                      offset: int = Query(0, ge=0)):
+        # 默认不筛 status：用户要能看到"被删掉的记忆"，否则无从判断误删。
+        return {"items": app.state.store.memories(status, limit, offset)}
+
+    @app.get("/memories/{memory_id}", summary="查看单条记忆")
+    def get_memory(memory_id: int):
+        return require_memory(memory_id)
+
+    @app.put("/memories/{memory_id}", summary="修正记忆内容、类型，或恢复已删除的记忆")
+    def update_memory(memory_id: int, body: MemoryUpdateRequest):
+        require_memory(memory_id)
+        # exclude_unset=True：只处理请求体里真正出现的字段，没提交的保持原值。
+        fields = body.model_dump(exclude_unset=True)
+        if isinstance(fields.get("content"), str):
+            fields["content"] = fields["content"].strip()
+            # min_length 能拦住空串，但拦不住纯空格，这里补一次业务校验。
+            if not fields["content"]:
+                raise HTTPException(400, detail="记忆内容不能为空。")
+        try:
+            return app.state.store.update_memory(
+                memory_id, fields, datetime.now(timezone.utc).isoformat()
+            )
+        except sqlite3.IntegrityError:
+            # content_hash 的 UNIQUE 约束兜底：改成了另一条记忆已有的内容。
+            raise HTTPException(409, detail="已存在相同内容的记忆。") from None
+
+    @app.delete("/memories/{memory_id}", summary="删除记忆（软删除，保留记录）")
+    def dismiss_memory(memory_id: int):
+        require_memory(memory_id)
+        # 与任务取消保持一致：只改状态、不物理删除，之后还能改回 active 恢复。
+        return app.state.store.update_memory(
+            memory_id, {"status": "dismissed"}, datetime.now(timezone.utc).isoformat()
         )
 
     return app

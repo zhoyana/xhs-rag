@@ -42,7 +42,7 @@ def test_analyze_save_cache_and_force(tmp_path, monkeypatch):
     })
 
     calls = []
-    async def fake_analyze(note, assets, media_root):
+    async def fake_analyze(note, assets, media_root, memories=None):
         calls.append(note["note_id"])
         return {
             "summary": "学习 Python 的方法",
