@@ -150,6 +150,18 @@ class PlanUpdateRequest(BaseModel):
     goal: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
+class PlanItemUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    details: str | None = Field(default=None, max_length=2000)
+    scheduled_at: datetime | None = None
+    reminder_at: datetime | None = None
+    timezone: str | None = Field(default=None, max_length=100)
+
+
+class PlanItemsReorderRequest(BaseModel):
+    item_ids: list[int] = Field(min_length=1, max_length=30)
+
+
 class AIDraftPlanRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=1000)
     source_note_ids: list[str] = Field(min_length=1, max_length=10)
@@ -545,6 +557,57 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return app.state.store.update_plan_status(
             plan_id, "confirmed", datetime.now(timezone.utc).isoformat()
         )
+
+    def require_draft_item(plan_id: int, item_id: int):
+        plan = get_plan(plan_id)
+        if plan["status"] != "draft":
+            raise HTTPException(409, detail="只有 draft 状态的计划可以编辑步骤。")
+        item = next((item for item in plan["items"] if item["id"] == item_id), None)
+        if item is None:
+            raise HTTPException(404, detail="计划步骤不存在。")
+        return item
+
+    @app.put("/plans/{plan_id}/items/{item_id}", summary="修改计划步骤")
+    def update_plan_item(plan_id: int, item_id: int, body: PlanItemUpdateRequest):
+        require_draft_item(plan_id, item_id)
+        fields = body.model_dump(exclude_unset=True)
+        if "title" in fields:
+            fields["title"] = fields["title"].strip()
+        if "details" in fields:
+            fields["details"] = fields["details"].strip()
+        current = app.state.store.plan_item(item_id)
+        timezone_name = fields.get("timezone", current["timezone"])
+        valid_timezone(timezone_name)
+        scheduled = fields.get("scheduled_at")
+        reminder = fields.get("reminder_at")
+        scheduled_text = utc_text(scheduled, "scheduled_at") if scheduled else current["scheduled_at"]
+        reminder_text = utc_text(reminder, "reminder_at") if reminder else current["reminder_at"]
+        if reminder_text and reminder_text > scheduled_text:
+            raise HTTPException(400, detail="提醒时间不能晚于步骤执行时间。")
+        if "scheduled_at" in fields:
+            fields["scheduled_at"] = scheduled_text
+        if "reminder_at" in fields:
+            fields["reminder_at"] = reminder_text
+        return app.state.store.update_plan_item(
+            item_id, fields, datetime.now(timezone.utc).isoformat()
+        )
+
+    @app.delete("/plans/{plan_id}/items/{item_id}", summary="删除计划草案步骤")
+    def delete_plan_item(plan_id: int, item_id: int):
+        require_draft_item(plan_id, item_id)
+        return app.state.store.delete_plan_item(item_id, datetime.now(timezone.utc).isoformat())
+
+    @app.post("/plans/{plan_id}/items/reorder", summary="调整计划步骤顺序")
+    def reorder_plan_items(plan_id: int, body: PlanItemsReorderRequest):
+        plan = get_plan(plan_id)
+        if plan["status"] != "draft":
+            raise HTTPException(409, detail="只有 draft 状态的计划可以调整步骤。")
+        try:
+            return app.state.store.reorder_plan_items(
+                plan_id, body.item_ids, datetime.now(timezone.utc).isoformat()
+            )
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc)) from None
 
     @app.post("/plans/{plan_id}/create-tasks", summary="将已确认计划转换为任务")
     def plan_create_tasks(plan_id: int):

@@ -69,3 +69,27 @@ def test_ai_draft_plan_is_saved_as_draft(tmp_path, monkeypatch):
         assert response.status_code == 201
         assert response.json()["status"] == "draft"
         assert response.json()["plan"]["items"][0]["title"] == "理解 RAG"
+
+
+def test_plan_items_can_be_edited_deleted_and_reordered_only_in_draft(tmp_path):
+    db_path = tmp_path / "plan-edit.sqlite3"
+    NoteStore(db_path).save({"note_id": "source", "title": "资料", "content": "内容", "images": []})
+    with TestClient(create_app(db_path)) as client:
+        plan = client.post("/plans", json={
+            "title": "计划", "goal": "目标", "source_note_ids": ["source"],
+            "items": [
+                {"title": "第一步", "scheduled_at": "2026-09-16T20:00:00+08:00"},
+                {"title": "第二步", "scheduled_at": "2026-09-17T20:00:00+08:00"},
+                {"title": "第三步", "scheduled_at": "2026-09-18T20:00:00+08:00"}
+            ]
+        }).json()
+        ids = [item["id"] for item in plan["items"]]
+        edited = client.put(f"/plans/{plan['id']}/items/{ids[0]}", json={"title": "修改后的第一步"})
+        assert edited.status_code == 200 and edited.json()["title"] == "修改后的第一步"
+        reordered = client.post(f"/plans/{plan['id']}/items/reorder", json={"item_ids": ids[::-1]})
+        assert [item["id"] for item in reordered.json()["items"]] == ids[::-1]
+        deleted = client.delete(f"/plans/{plan['id']}/items/{ids[1]}")
+        assert len(deleted.json()["items"]) == 2
+        assert [item["item_index"] for item in deleted.json()["items"]] == [0, 1]
+        client.post(f"/plans/{plan['id']}/confirm")
+        assert client.put(f"/plans/{plan['id']}/items/{ids[0]}", json={"title": "禁止修改"}).status_code == 409

@@ -233,6 +233,61 @@ class NoteStore:
                        (status, now, now if status == "confirmed" else None, plan_id))
         return self.plan(plan_id)
 
+    def update_plan_item(self, item_id, fields, now):
+        """更新草案步骤；调用方先确认该步骤所属计划仍是 draft。"""
+        allowed = {"title", "details", "scheduled_at", "reminder_at", "timezone"}
+        changes = {key: value for key, value in fields.items() if key in allowed}
+        if not changes:
+            return self.plan_item(item_id)
+        assignments = ", ".join(f"{key}=?" for key in changes)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(f"UPDATE plan_items SET {assignments} WHERE id=?",
+                       [*changes.values(), item_id])
+            db.execute("UPDATE plans SET updated_at=? WHERE id=(SELECT plan_id FROM plan_items WHERE id=?)",
+                       (now, item_id))
+        return self.plan_item(item_id)
+
+    def plan_item(self, item_id):
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["source_note_ids"] = [item[0] for item in db.execute(
+                "SELECT note_id FROM plan_item_sources WHERE plan_item_id=?", (item_id,)
+            ).fetchall()]
+            return result
+
+    def delete_plan_item(self, item_id, now):
+        """删除草案步骤和对应来源关系，并重新编号剩余步骤。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            row = db.execute("SELECT plan_id, item_index FROM plan_items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                return None
+            plan_id, old_index = row
+            db.execute("DELETE FROM plan_item_sources WHERE plan_item_id=?", (item_id,))
+            db.execute("DELETE FROM plan_items WHERE id=?", (item_id,))
+            db.execute("UPDATE plan_items SET item_index=item_index-1 WHERE plan_id=? AND item_index>?",
+                       (plan_id, old_index))
+            db.execute("UPDATE plans SET updated_at=? WHERE id=?", (now, plan_id))
+        return self.plan(plan_id)
+
+    def reorder_plan_items(self, plan_id, item_ids, now):
+        """按用户给出的完整 ID 顺序重排；事务保证不会出现重复序号。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            rows = db.execute("SELECT id FROM plan_items WHERE plan_id=?", (plan_id,)).fetchall()
+            actual = {row[0] for row in rows}
+            if set(item_ids) != actual or len(item_ids) != len(actual):
+                raise ValueError("item_ids 必须包含该计划的全部步骤且不能重复。")
+            # 临时加偏移，避免 UNIQUE(plan_id, item_index) 的交换冲突。
+            db.executemany("UPDATE plan_items SET item_index=? WHERE id=?",
+                           [(index + 1000, item_id) for index, item_id in enumerate(item_ids)])
+            db.executemany("UPDATE plan_items SET item_index=? WHERE id=?",
+                           [(index, item_id) for index, item_id in enumerate(item_ids)])
+            db.execute("UPDATE plans SET updated_at=? WHERE id=?", (now, plan_id))
+        return self.plan(plan_id)
+
     def create_plan_tasks(self, plan_id, note_id, now):
         """确认后的每个步骤只生成一次任务，重复调用不会重复创建。"""
         with closing(sqlite3.connect(self.path)) as db, db:
