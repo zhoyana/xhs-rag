@@ -7,6 +7,9 @@ def test_langchain_tools_expose_stable_names_and_schema():
     tools = build_langchain_tools(searcher=lambda q, n: [], getter=lambda _: None,
                                   recaller=lambda q, n: [], drafter=lambda *args: None)
     assert [tool.name for tool in tools] == ["search_notes", "get_note", "recall_memories", "draft_plan"]
+    # 秋招知识点：Agent 根据 JSON Schema 构造工具参数，参数校验在业务执行前完成。
+    schema = tools[0].args_schema.model_json_schema()
+    assert schema["properties"]["limit"]["maximum"] == 20
     assert tools[0].invoke({"query": "RAG", "limit": 3})["ok"] is True
 
 
