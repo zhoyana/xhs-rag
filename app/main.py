@@ -199,8 +199,10 @@ class MemoryUpdateRequest(BaseModel):
     content: str | None = Field(
         default=None, min_length=1, max_length=200,
         description="记忆内容，用第三人称“用户……”陈述；留空表示不改")
-    status: Literal["active", "dismissed"] | None = Field(
-        default=None, description="active 生效；dismissed 表示已删除，改回 active 即恢复")
+    status: Literal["active", "superseded", "dismissed"] | None = Field(
+        default=None,
+        description="active 生效；dismissed 已删除，改回 active 即恢复；"
+                    "superseded 是系统内部状态，手动设置会被 400 拒绝")
 
 
 def create_app(db_path=DEFAULT_DB, media_root=None):
@@ -1038,7 +1040,7 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return memory
 
     @app.get("/memories", summary="查看长期记忆列表")
-    def list_memories(status: Literal["active", "dismissed"] | None = None,
+    def list_memories(status: Literal["active", "superseded", "dismissed"] | None = None,
                       limit: int = Query(50, ge=1, le=100),
                       offset: int = Query(0, ge=0)):
         # 默认不筛 status：用户要能看到"被删掉的记忆"，否则无从判断误删。
@@ -1053,6 +1055,11 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         require_memory(memory_id)
         # exclude_unset=True：只处理请求体里真正出现的字段，没提交的保持原值。
         fields = body.model_dump(exclude_unset=True)
+        # superseded 由系统在“新记忆替换旧口径”时自动打标，用户手动设置
+        # 会破坏状态机语义（superseded 必须有替换它的那条新记忆可追溯）。
+        if fields.get("status") == "superseded":
+            raise HTTPException(
+                400, detail="superseded 是系统内部状态，不能手动设置；要下线一条记忆请删除它。")
         if isinstance(fields.get("content"), str):
             fields["content"] = fields["content"].strip()
             # min_length 能拦住空串，但拦不住纯空格，这里补一次业务校验。
