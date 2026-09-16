@@ -8,8 +8,10 @@ import json5
 
 class ImportProblem(Exception):
     # 自定义异常类型：把“预期的导入问题”与意外程序错误区分开。
-    # pass 表示无需添加额外实现，直接使用 Exception 的行为。
-    pass
+    # code 只表示失败阶段，不包含分享 URL、Token 或网页内容。
+    def __init__(self, message: str, code: str = "import_error"):
+        super().__init__(message)
+        self.code = code
 
 
 # 集合用于域名白名单判断。只做精确匹配，不信任“名字里包含小红书”的网站。
@@ -82,7 +84,13 @@ def parse_note(html: str, final_url: str) -> dict:
     # re.S 使正则中的点号也能匹配换行；(.*?) 捕获尽可能短的内容。
     match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(.*?)</script>", html, re.S)
     if not match:
-        raise ImportProblem("网页没有笔记数据：可能需要登录、内容受限或网页结构已变化。")
+        raise ImportProblem("网页没有笔记数据：可能需要登录、内容受限或网页结构已变化。",
+                            "initial_state_missing")
+    id_match = re.search(r"/(?:explore|discovery/item)/([a-zA-Z0-9]+)", urlsplit(final_url).path)
+    if not id_match:
+        raise ImportProblem("未定位到笔记详情地址，可能跳转到了登录或错误页面。",
+                            "note_url_missing")
+    note_id = id_match.group(1)
     try:
         # json5 不执行 JavaScript；只把字符串外的 undefined 转成 null。
         literal = match.group(1).strip().rstrip(";")
@@ -90,20 +98,38 @@ def parse_note(html: str, final_url: str) -> dict:
         # lambda 是匿名小函数：有字符串捕获组就原样保留，否则替换 undefined。
         literal = re.sub(r'("(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27)|\bundefined\b',
                          lambda m: m.group(1) if m.group(1) else "null", literal)
-        state = json5.loads(literal)
-        # JSON5 将数据文本转成字典，不使用 eval，避免执行不可信的网页代码。
-        details = state["note"]["noteDetailMap"]
-        id_match = re.search(r"/(?:explore|discovery/item)/([a-zA-Z0-9]+)", urlsplit(final_url).path)
-        if not id_match:
-            raise ImportProblem("未定位到笔记详情地址，可能跳转到了登录或错误页面。")
-        note_id = id_match.group(1)
-        # 按 URL 中的编号找当前笔记，不直接取页面里的第一条，以免误导入推荐内容。
-        note = details[note_id]["note"]
+        try:
+            state = json5.loads(literal)
+        except (ValueError, TypeError):
+            raise ImportProblem("网页中的笔记状态无法解析，未导入。", "state_json_invalid") from None
+        # JSON5 只解析文本、不执行 JavaScript；每个结构节点单独诊断。
+        note_state = state.get("note") if isinstance(state, dict) else None
+        details = note_state.get("noteDetailMap") if isinstance(note_state, dict) else None
+        if not isinstance(details, dict):
+            raise ImportProblem("网页缺少笔记详情映射，可能是页面结构变化或内容受限。",
+                                "note_detail_map_missing")
+        # 不直接取第一条：页面可能有推荐笔记，必须与链接中的 ID 对上。
+        entry = details.get(note_id)
+        if entry is None:
+            # 部分页面的 map 键不同，但内部 noteId 仍是目标笔记 ID。
+            matches = [value for value in details.values()
+                       if isinstance(value, dict)
+                       and isinstance(value.get("note"), dict)
+                       and value["note"].get("noteId") == note_id]
+            if len(matches) == 1:
+                entry = matches[0]
+        if not isinstance(entry, dict):
+            raise ImportProblem("网页没有与分享链接匹配的笔记详情，未导入。",
+                                "requested_note_id_missing")
+        note = entry.get("note")
+        if not isinstance(note, dict):
+            raise ImportProblem("网页中的笔记字段结构已变化，未导入。", "note_fields_invalid")
         title = note.get("title", "").strip()
         # 字典.get(key, 默认值) 在键不存在时返回默认值；strip() 去掉首尾空白。
         content = note.get("desc", "").strip()
         if not title or not content:
-            raise ImportProblem("缺少标题或正文，未按完整笔记入库；请核对原笔记。")
+            raise ImportProblem("缺少标题或正文，未按完整笔记入库；请核对原笔记。",
+                                "note_content_missing")
         images = []
         for item in note.get("imageList", []):
             image_url = item.get("urlDefault") or item.get("url", "")
@@ -124,4 +150,5 @@ def parse_note(html: str, final_url: str) -> dict:
         raise
     except (ValueError, TypeError, KeyError, AttributeError):
         # 捕获解析与字段结构错误；不要用一个宽泛的 except 隐藏所有编程错误。
-        raise ImportProblem("笔记数据不符合预期结构，未导入；需要更新解析器。") from None
+        raise ImportProblem("笔记字段不符合预期，未导入；需要更新解析器。",
+                            "note_fields_invalid") from None

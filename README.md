@@ -34,6 +34,11 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 接口会逐条返回 `imported`、`existing`、`duplicate` 或 `failed`，单条失败不会回滚其他成功项。
 批量收件箱只导入笔记，不自动下载图片或调用 AI，避免一次操作产生过多请求和费用。
 
+`POST /notes/intake` 若在导入阶段失败，可查询 `GET /jobs/{job_id}` 的
+`progress.error_code`。解析器会区分 `initial_state_missing`、`state_json_invalid`、
+`note_detail_map_missing`、`requested_note_id_missing`、`note_fields_invalid` 等阶段；
+这些代码不包含分享链接、临时 Token 或网页正文。失败时不会保存半篇笔记，也不会下载图片。
+
 ## 确认收藏意图
 
 分析完成后，先用 `GET /notes/{note_id}/intent` 查看模型建议。它最初显示 `pending`。

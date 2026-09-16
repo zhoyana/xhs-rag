@@ -36,6 +36,41 @@ def test_missing_data_is_not_success(html):
         parse_note(html, URL)
 
 
+def test_parser_returns_safe_stage_codes_and_does_not_import_recommendation():
+    # 结构变更要能定位，同时绝不能拿页面中的第一条推荐笔记充当目标笔记。
+    with pytest.raises(ImportProblem) as missing_map:
+        parse_note('<script>window.__INITIAL_STATE__={"note":{}};</script>', URL)
+    assert missing_map.value.code == "note_detail_map_missing"
+
+    other_html = fixture_html().replace("abc123", "other456")
+    with pytest.raises(ImportProblem) as missing_id:
+        parse_note(other_html, URL)
+    assert missing_id.value.code == "requested_note_id_missing"
+
+
+def test_parser_can_use_matching_internal_note_id_when_map_key_changes():
+    state = {"note": {"noteDetailMap": {"different-key": {"note": {
+        "noteId": "abc123", "title": "目标标题", "desc": "目标正文", "imageList": []
+    }}}}}
+    html = '<script>window.__INITIAL_STATE__=' + json.dumps(state) + ';</script>'
+    assert parse_note(html, URL)["title"] == "目标标题"
+
+
+def test_intake_job_exposes_only_safe_error_code(tmp_path, monkeypatch):
+    async def fake_fetch(_url):
+        return '<script>window.__INITIAL_STATE__={"note":{}};</script>', URL
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    with TestClient(create_app(tmp_path / "intake.sqlite3")) as client:
+        queued = client.post("/notes/intake", json={"share_text": URL})
+        assert queued.status_code == 202
+        job = client.get(f"/jobs/{queued.json()['job_id']}").json()
+        assert job["status"] == "failed"
+        assert job["progress"]["error_code"] == "note_detail_map_missing"
+        assert job["note_id"] is None
+        assert client.get("/notes").json()["items"] == []
+
+
 @pytest.mark.parametrize("url", ["http://127.0.0.1", "https://evil.com", "https://www.xiaohongshu.com.evil.com/a",
                                  "https://user:pass@www.xiaohongshu.com/a", "https://www.xiaohongshu.com:8000/a"])
 def test_reject_unapproved_urls(url):

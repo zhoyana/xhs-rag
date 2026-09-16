@@ -412,6 +412,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             )
         except ImportProblem as exc:
             progress["import"] = "failed"
+            progress["error_code"] = exc.code
+            # 只记录错误阶段和 job_id，不记录带临时授权的链接或网页正文。
+            logger.warning("intake_import_failed job_id=%s error_code=%s", job_id, exc.code)
             store.update_job(job_id, status="failed", current_step="failed",
                              progress=progress, error=str(exc),
                              now=datetime.now(timezone.utc).isoformat(),
