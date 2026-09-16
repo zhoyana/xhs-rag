@@ -1,16 +1,40 @@
 """LangChain 对话 Agent：让模型选择工具，并把工具结果送回模型。"""
 import json
 import os
+import re
+from datetime import datetime
+from time import perf_counter
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 
-SYSTEM_PROMPT = """你是用户的小红书知识库学习助手。
+SYSTEM_PROMPT = """你是用户的小红书知识库学习助手。当前日期是 {today}。
 回答收藏内容前先使用 search_notes；需要完整原文时再使用 get_note。
 制定计划前应检索相关笔记并读取用户记忆，之后只能生成 draft 草案。
 绝不能替用户确认计划或创建任务。回答使用简洁中文，并说明参考了哪些笔记。
 """
+
+
+PLAN_REQUEST_PATTERN = re.compile(
+    r"(制定|生成|创建|安排|规划).{0,8}(计划|日程|学习安排|复习安排)|"
+    r"(计划|日程).{0,8}(制定|生成|创建|安排|规划)"
+)
+
+
+def plan_requested(text: str) -> bool:
+    """只有用户明确要求制定计划时，才授权 Agent 看见 draft_plan 工具。"""
+    return bool(PLAN_REQUEST_PATTERN.search(text))
+
+
+def safe_tool_error(exc: Exception) -> dict:
+    """保留可诊断错误码，但不把异常堆栈、URL 或密钥交给模型。"""
+    status_code = getattr(exc, "status_code", None)
+    detail = getattr(exc, "detail", None)
+    if isinstance(status_code, int):
+        return {"code": f"http_{status_code}", "message": str(detail or "工具请求失败")}
+    return {"code": "tool_exception", "message": "工具执行失败，请稍后重试。"}
 
 
 def deepseek_chat_model():
@@ -35,36 +59,64 @@ async def run_agent_turn(history: list[dict], tools: list, model=None, max_round
     """
     llm = model or deepseek_chat_model()
     model_with_tools = llm.bind_tools(tools)
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    messages = [SystemMessage(content=SYSTEM_PROMPT.format(today=today))]
     for item in history:
         message_type = HumanMessage if item["role"] == "user" else AIMessage
         messages.append(message_type(content=item["content"]))
 
     tool_map = {tool.name: tool for tool in tools}
-    traces, source_note_ids, plan_id = [], [], None
+    traces, retrieved_note_ids, viewed_note_ids, plan_id = [], [], [], None
     for _ in range(max_rounds):
         response = await model_with_tools.ainvoke(messages)
         messages.append(response)
         if not response.tool_calls:
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            # cited 只记录模型最终回答中出现过，或通过 get_note 明确展开过的来源。
+            cited = list(viewed_note_ids)
+            cited.extend(note_id for note_id in retrieved_note_ids
+                         if note_id in content or note_id[:8] in content)
+            cited = list(dict.fromkeys(cited))
             return {
-                "content": response.content if isinstance(response.content, str) else str(response.content),
+                "content": content,
                 "tool_calls": traces,
-                "source_note_ids": list(dict.fromkeys(source_note_ids)),
+                "retrieved_note_ids": list(dict.fromkeys(retrieved_note_ids)),
+                "cited_note_ids": cited,
+                # 兼容旧客户端；新代码应优先读取 cited_note_ids。
+                "source_note_ids": cited,
                 "plan_id": plan_id,
             }
 
         for call in response.tool_calls:
             tool = tool_map.get(call["name"])
+            started = perf_counter()
             if tool is None:
-                result = {"ok": False, "data": None, "error": "模型请求了不存在的工具"}
+                result = {"ok": False, "data": None,
+                          "error": {"code": "unknown_tool", "message": "工具不存在"}}
             else:
                 try:
                     result = await tool.ainvoke(call["args"])
                 except Exception as exc:  # 工具失败应回传给模型，让它解释或换策略。
-                    result = {"ok": False, "data": None, "error": type(exc).__name__}
-            traces.append({"name": call["name"], "args": call["args"], "ok": result.get("ok", False)})
+                    result = {"ok": False, "data": None, "error": safe_tool_error(exc)}
+            data = result.get("data")
+            error = result.get("error")
+            scores = ([item.get("score") for item in data
+                       if isinstance(item.get("score"), (int, float))]
+                      if isinstance(data, list) else [])
+            trace = {
+                "name": call["name"], "args": call["args"], "ok": result.get("ok", False),
+                "duration_ms": round((perf_counter() - started) * 1000, 1),
+                "result_count": len(data) if isinstance(data, list) else None,
+                "top_score": max(scores) if scores else None,
+                "error_code": (error.get("code") if isinstance(error, dict)
+                               else "validation_error" if error else None),
+            }
+            traces.append(trace)
             if call["name"] == "search_notes" and result.get("ok"):
-                source_note_ids.extend(item["note_id"] for item in result["data"] if item.get("note_id"))
+                retrieved_note_ids.extend(item["note_id"] for item in result["data"] if item.get("note_id"))
+            if call["name"] == "get_note" and result.get("ok") and isinstance(data, dict):
+                if data.get("note_id"):
+                    viewed_note_ids.append(data["note_id"])
             if call["name"] == "draft_plan" and result.get("ok"):
                 data = result.get("data") or {}
                 plan = data.get("plan", data)

@@ -26,7 +26,7 @@ from .media import download_note_assets, local_file_valid, storage_path
 from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe
 from .knowledge import document_hash, split_note
 from .retrieval import search_knowledge
-from .chat_agent import run_agent_turn
+from .chat_agent import plan_requested, run_agent_turn
 from .tools import build_langchain_tools
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
@@ -305,6 +305,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             recaller=recall,
             drafter=create_draft,
         )
+        # 代码层权限控制比 Prompt 更可靠：普通咨询时模型根本看不到写入型工具。
+        if not plan_requested(body.content):
+            tools = [tool for tool in tools if tool.name != "draft_plan"]
         # 只发送最近 20 条消息：这是滑动窗口短期记忆，避免上下文无限增长。
         history = app.state.store.thread(thread_id, message_limit=20)["messages"]
         try:
@@ -316,6 +319,8 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         assistant = app.state.store.add_chat_message(
             thread_id, "assistant", result["content"], {
                 "tool_calls": result["tool_calls"],
+                "retrieved_note_ids": result["retrieved_note_ids"],
+                "cited_note_ids": result["cited_note_ids"],
                 "source_note_ids": result["source_note_ids"],
                 "plan_id": result["plan_id"],
             }, datetime.now(timezone.utc).isoformat()

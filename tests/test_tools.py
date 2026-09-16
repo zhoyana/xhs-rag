@@ -17,6 +17,15 @@ def test_draft_tool_is_explicitly_a_draft():
     async def fake(goal, ids, date):
         return {"status": "draft", "goal": goal, "source_note_ids": ids, "start_date": date}
 
-    result = asyncio.run(draft_plan_tool(fake, "准备 RAG", ["n1"], "2026-09-16"))
+    result = asyncio.run(draft_plan_tool(fake, "准备 RAG", ["n1"], "2099-09-16"))
     assert result["ok"] is True
     assert result["data"]["status"] == "draft"
+
+
+def test_draft_tool_rejects_past_date_before_calling_model():
+    async def should_not_run(*_args):
+        raise AssertionError("过期日期不应调用模型")
+
+    result = asyncio.run(draft_plan_tool(should_not_run, "准备 RAG", ["n1"], "2020-01-01"))
+    assert result["ok"] is False
+    assert result["error"]["code"] == "past_start_date"

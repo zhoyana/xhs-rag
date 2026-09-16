@@ -19,5 +19,5 @@ def test_async_draft_tool_can_be_invoked():
 
     tools = build_langchain_tools(searcher=lambda q, n: [], getter=lambda _: None,
                                   recaller=lambda q, n: [], drafter=fake)
-    result = asyncio.run(tools[3].ainvoke({"goal": "面试", "source_note_ids": ["n1"], "start_date": "2026-09-16"}))
+    result = asyncio.run(tools[3].ainvoke({"goal": "面试", "source_note_ids": ["n1"], "start_date": "2099-09-16"}))
     assert result["data"]["status"] == "draft"
