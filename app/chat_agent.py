@@ -17,15 +17,20 @@ SYSTEM_PROMPT = """你是用户的小红书知识库学习助手。当前日期�
 """
 
 
-PLAN_REQUEST_PATTERN = re.compile(
-    r"(制定|生成|创建|安排|规划).{0,8}(计划|日程|学习安排|复习安排)|"
-    r"(计划|日程).{0,8}(制定|生成|创建|安排|规划)"
+PLAN_ACTION_PATTERN = re.compile(r"制定|生成|创建|安排|规划|出一版|做一份|做一个")
+PLAN_OBJECT_PATTERN = re.compile(r"计划|日程|学习安排|复习安排|草案")
+PLAN_NEGATION_PATTERN = re.compile(
+    r"(不要|不用|无需|不需要|暂时不|先不).{0,12}(计划|日程|草案|制定|生成|创建)"
 )
 
 
 def plan_requested(text: str) -> bool:
     """只有用户明确要求制定计划时，才授权 Agent 看见 draft_plan 工具。"""
-    return bool(PLAN_REQUEST_PATTERN.search(text))
+    # 动作词和对象词可以相距较远，例如“制定一个从周三开始的一周面试准备计划”。
+    # 不能再依赖固定字符窗口，否则自然语言稍长就会漏判。
+    if PLAN_NEGATION_PATTERN.search(text):
+        return False
+    return bool(PLAN_ACTION_PATTERN.search(text) and PLAN_OBJECT_PATTERN.search(text))
 
 
 def safe_tool_error(exc: Exception) -> dict:

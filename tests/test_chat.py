@@ -68,6 +68,8 @@ def test_agent_executes_tool_then_generates_answer():
 def test_plan_tool_requires_explicit_user_intent():
     assert plan_requested("帮我检索 RAG 笔记并告诉我怎么准备") is False
     assert plan_requested("请根据这些笔记制定一周学习计划") is True
+    assert plan_requested("请根据刚才找到的笔记，制定一个从 2026-09-16 开始的一周面试准备计划") is True
+    assert plan_requested("先不用制定计划，只告诉我有哪些笔记") is False
 
 
 def test_explicit_plan_request_forces_draft_tool_when_model_only_writes_text():
