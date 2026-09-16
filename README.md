@@ -39,8 +39,8 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 分析完成后，先用 `GET /notes/{note_id}/intent` 查看模型建议。它最初显示 `pending`。
 再通过 `PUT /notes/{note_id}/intent` 提交用户选择：`confirmed` 直接采用建议，`edited`
 保存用户修改后的分类和意图，`dismissed` 表示暂不采用。确认数据和模型分析分表保存，
-后续创建提醒时只使用用户确认过的结果。确认成功后，后台会自动从这次选择里提炼长期记忆
-（`dismissed` 除外），详见后面的「长期记忆」一节。
+后续创建提醒时只使用用户确认过的结果。确认成功后，后台会尝试提炼长期记忆候选
+（`dismissed` 除外）；候选需要用户再次审阅才会生效，详见后面的「长期记忆」一节。
 
 ## 任务接口
 
@@ -188,21 +188,27 @@ Python 进程各加载一份 PyTorch/BGE 导致内存不足，同时覆盖真实
 ## 长期记忆：让建议越用越准
 
 前面的章节解决的是「把一篇笔记读懂」，这一节解决的是「把用户读懂」。系统会把用户在
-确认意图时做出的选择沉淀成长期记忆，并在后续分析时把记忆带回给模型——这是整个项目里
-唯一会随使用而变好的部分。
+确认意图时做出的选择先生成记忆候选；只有用户审阅后才成为长期记忆，后续分析才能使用。
+旧版本已保存的 active 记忆不会被迁移或删除。
 
 ### 闭环
 
-1. **沉淀**：`PUT /notes/{note_id}/intent` 确认成功后（`confirmed` / `edited`；`dismissed`
-   不触发），后台异步调用模型，从「笔记 + 用户确认的意图」里提炼 0~2 条记忆，写入
-   `memories` 表。响应新增 `memory_job` 字段（`queued` / `skipped`），原有字段保持不变。
-2. **注入**：`POST /notes/{note_id}/analyze` 和 `POST /notes/{note_id}/folder-suggestions`
+1. **提议**：`PUT /notes/{note_id}/intent` 确认成功后（`dismissed` 除外），后台从
+   「笔记 + 用户确认的意图」提炼 0~2 条，存进 `memory_candidates`，状态为 `pending`。
+   `memory_job=queued` 只表示安排提炼，不保证模型一定找到稳定偏好。
+2. **确认**：`GET /memory-candidates?status=pending` 查看候选；使用
+   `POST /memory-candidates/{id}/review` 提交 `confirmed`（可修改内容/类型）或 `dismissed`。
+   只有 confirmed 会进入 active 长期记忆。用户也可 `POST /memories` 主动保存真实偏好。
+3. **注入**：`POST /notes/{note_id}/analyze` 和 `POST /notes/{note_id}/folder-suggestions`
    会把最近 10 条生效中的记忆拼进提示词，并在提示词里明确声明"仅供参考、不要盲从"——
    记忆是先验而非硬约束，避免历史偏好压制当前内容。
-3. **管理**：记忆由模型提炼，可能不准或过时，所以留了完整的修正入口：
+4. **管理**：已生效的记忆仍可修正、停用或恢复：
 
 | 接口 | 作用 |
 |------|------|
+| `GET /memory-candidates` | 查看待确认、已确认或已忽略的 AI 候选 |
+| `POST /memory-candidates/{id}/review` | 确认/修改后确认或忽略候选 |
+| `POST /memories` | 用户主动保存自己确认的长期偏好 |
 | `GET /memories` | 查看记忆列表，默认包含已删除的（便于判断误删），可用 `status` 过滤 |
 | `GET /memories/{memory_id}` | 查看单条 |
 | `PUT /memories/{memory_id}` | 修正内容或类型；提交 `{"status": "active"}` 可恢复已删除的记忆 |
@@ -215,7 +221,8 @@ Python 进程各加载一份 PyTorch/BGE 导致内存不足，同时覆盖真实
 
 ### 设计要点
 
-- **幂等**：`content_hash` 加 `UNIQUE`，写入用 `INSERT OR IGNORE`，重复沉淀不会产生重复记忆。
+- **幂等**：同一笔记、同一内容的候选不会重复创建；active 记忆用内容指纹去重。
+- **人工确认**：候选和长期记忆分表，AI 的推测不会未经确认就影响下一次回答。
 - **可追溯**：每条记忆记下 `source_note_id`（来自哪篇笔记）与 `model`（哪次模型调用产出）。
 - **不可信输入**：笔记正文、意图、已有记忆、注入的记忆，进提示词前统一清洗
   （剥离控制字符、折叠空白、按长度截断），防止内容里的文字伪造出新的指令边界。
@@ -226,7 +233,8 @@ Python 进程各加载一份 PyTorch/BGE 导致内存不足，同时覆盖真实
 | 主题 | 位置 |
 |------|------|
 | CHECK / UNIQUE 约束做数据正确性兜底 | `app/database.py` 的 `memories` 建表语句 |
-| 幂等写入与去重的区别 | `NoteStore.save_memories` |
+| 幂等写入与去重的区别 | `NoteStore.save_memory_candidates`、`NoteStore.save_memories` |
+| Human-in-the-loop 与候选状态机 | `memory_candidates`、`NoteStore.review_memory_candidate` |
 | 软删除与可审计性 | `NoteStore.update_memory`、`DELETE /memories/{id}` |
 | 事务可见性：跨连接的读必须等提交 | `NoteStore.save_memories`（先收集 id，出事务再回读） |
 | 提示词注入防御（控制字符 / 截断 / 指令边界） | `app/ai.py` 的 `_sanitize_inline`、`_memory_block` |
@@ -240,7 +248,7 @@ Python 进程各加载一份 PyTorch/BGE 导致内存不足，同时覆盖真实
 ### 测试
 
 ```powershell
-.\.venv-local\Scripts\python.exe -m pytest tests/test_memories.py tests/test_memory_extract.py tests/test_memory_trigger.py tests/test_memory_inject.py tests/test_memory_api.py -q
+.\.venv-local\Scripts\python.exe -m pytest tests/test_memories.py tests/test_memory_extract.py tests/test_memory_trigger.py tests/test_memory_candidates.py tests/test_memory_inject.py tests/test_memory_api.py -q
 ```
 
 五个测试文件全部用替身替换真实模型调用，不联网、不产生费用：分别覆盖存储层约束、

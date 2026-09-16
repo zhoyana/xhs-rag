@@ -102,6 +102,18 @@ class NoteStore:
                 embedding BLOB, embedding_model TEXT, embedding_hash TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )""")
+            # AI 提议与用户确认分开：候选不进入 active_memories，也不会注入提示词。
+            # 老的 active 记忆原样保留；新流程只改变之后提炼出的记忆。
+            db.execute("""CREATE TABLE IF NOT EXISTS memory_candidates (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL CHECK(type IN ('preference', 'habit', 'correction')),
+                content TEXT NOT NULL, content_hash TEXT NOT NULL,
+                model TEXT NOT NULL, source_note_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'confirmed', 'dismissed')),
+                memory_id INTEGER, created_at TEXT NOT NULL, reviewed_at TEXT,
+                UNIQUE(source_note_id, content_hash)
+            )""")
             # 旧版本表的 status 只有 (active, dismissed) 两态且没有向量列。
             # SQLite 不能修改 CHECK 约束，只能“建新表 → 搬数据 → 换名”三步重建。
             # 秋招知识点：SQLite 的 ALTER TABLE 能力有限，schema 演进的惯例是
@@ -799,6 +811,89 @@ class NoteStore:
     def memory_content_hash(content):
         """内容指纹：同一句话重复沉淀时在数据库层直接被 UNIQUE 拒绝。"""
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def save_memory_candidates(self, model, records, source_note_id, now):
+        """保存 AI 候选，不激活；重复提炼同一来源和内容不会刷出新候选。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.executemany("""INSERT OR IGNORE INTO memory_candidates
+                (type, content, content_hash, model, source_note_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""", [
+                (record["type"], record["content"],
+                 self.memory_content_hash(record["content"]), model, source_note_id, now)
+                for record in records
+            ])
+        return self.memory_candidates(source_note_id=source_note_id)
+
+    def memory_candidate(self, candidate_id):
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM memory_candidates WHERE id=?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+
+    def memory_candidates(self, status=None, source_note_id=None, limit=50):
+        """按状态/来源查看待确认信息；不与长期记忆混在同一列表。"""
+        conditions, params = [], []
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if source_note_id:
+            conditions.append("source_note_id=?")
+            params.append(source_note_id)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                f"SELECT * FROM memory_candidates {where} ORDER BY id DESC LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def review_memory_candidate(self, candidate_id, decision, now, memory_type=None, content=None):
+        """确认/忽略在同一事务中完成，避免候选已确认但记忆未落库。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM memory_candidates WHERE id=?", (candidate_id,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] != "pending":
+                raise ValueError("这条候选已经处理过。")
+            if decision == "dismissed":
+                db.execute("""UPDATE memory_candidates SET status='dismissed', reviewed_at=?
+                    WHERE id=?""", (now, candidate_id))
+            else:
+                chosen_type = memory_type or row["type"]
+                chosen_content = content or row["content"]
+                content_hash = self.memory_content_hash(chosen_content)
+                existing = db.execute("SELECT id, status FROM memories WHERE content_hash=?",
+                                      (content_hash,)).fetchone()
+                if existing and existing["status"] != "active":
+                    raise ValueError("相同记忆已被停用，请在记忆管理中恢复，而非重复创建。")
+                if existing:
+                    memory_id = existing["id"]
+                else:
+                    cursor = db.execute("""INSERT INTO memories
+                        (type, content, content_hash, model, source_note_id,
+                         status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+                        (chosen_type, chosen_content, content_hash, row["model"],
+                         row["source_note_id"], now, now))
+                    memory_id = cursor.lastrowid
+                db.execute("""UPDATE memory_candidates
+                    SET status='confirmed', memory_id=?, reviewed_at=? WHERE id=?""",
+                    (memory_id, now, candidate_id))
+        return {"candidate": self.memory_candidate(candidate_id),
+                "memory": self.memory(memory_id) if decision == "confirmed" else None}
+
+    def create_user_memory(self, memory_type, content, now):
+        """用户主动提供的偏好直接视为已确认；model 标记来源，不伪装成 AI 产物。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            cursor = db.execute("""INSERT INTO memories
+                (type, content, content_hash, model, source_note_id,
+                 status, created_at, updated_at)
+                VALUES (?, ?, ?, 'user', NULL, 'active', ?, ?)""",
+                (memory_type, content, self.memory_content_hash(content), now, now))
+            memory_id = cursor.lastrowid
+        return self.memory(memory_id)
 
     def save_memories(self, model, records, source_note_id, now):
         """批量保存提取出的记忆；返回真正新建的部分（重复内容被数据库跳过）。

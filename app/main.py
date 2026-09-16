@@ -228,6 +228,17 @@ class MemoryUpdateRequest(BaseModel):
                     "superseded 是系统内部状态，手动设置会被 400 拒绝")
 
 
+class UserMemoryCreateRequest(BaseModel):
+    type: Literal["preference", "habit", "correction"]
+    content: str = Field(min_length=1, max_length=200, description="你自己确认的长期偏好或习惯")
+
+
+class MemoryCandidateReviewRequest(BaseModel):
+    decision: Literal["confirmed", "dismissed"]
+    type: Literal["preference", "habit", "correction"] | None = None
+    content: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 def create_app(db_path=DEFAULT_DB, media_root=None):
     # 从项目根目录的 .env 读取本地配置。这个文件已被 .gitignore 排除，
     # 因而不会在提交代码时意外上传 API Key。
@@ -1058,10 +1069,10 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         if not memories or not model:
             # 降级路径：safe 包装已经写过 memory_extract_failed 日志。
             return
-        saved = store.save_memories(
+        candidates = store.save_memory_candidates(
             model, memories, note_id, datetime.now(timezone.utc).isoformat()
         )
-        logger.info("memory_extracted note_id=%s saved=%d", note_id, len(saved))
+        logger.info("memory_candidates_ready note_id=%s count=%d", note_id, len(candidates))
 
     @app.put("/notes/{note_id}/intent", summary="确认、修改或忽略模型推测的收藏意图")
     def confirm_intent(note_id: str, body: IntentConfirmationRequest,
@@ -1181,6 +1192,42 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         if memory is None:
             raise HTTPException(404, detail="记忆不存在。")
         return memory
+
+    @app.get("/memory-candidates", summary="查看 AI 提议、等待你确认的记忆")
+    def list_memory_candidates(
+        status: Literal["pending", "confirmed", "dismissed"] | None = None,
+        source_note_id: str | None = None,
+        limit: int = Query(50, ge=1, le=100),
+    ):
+        return {"items": app.state.store.memory_candidates(status, source_note_id, limit)}
+
+    @app.post("/memory-candidates/{candidate_id}/review", summary="确认、修改或忽略记忆候选")
+    def review_memory_candidate(candidate_id: int, body: MemoryCandidateReviewRequest):
+        content = body.content.strip() if body.content is not None else None
+        if body.content is not None and not content:
+            raise HTTPException(400, detail="记忆内容不能为空。")
+        try:
+            result = app.state.store.review_memory_candidate(
+                candidate_id, body.decision, datetime.now(timezone.utc).isoformat(),
+                body.type, content,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from None
+        if result is None:
+            raise HTTPException(404, detail="记忆候选不存在。")
+        return result
+
+    @app.post("/memories", status_code=201, summary="主动保存你确认的长期偏好")
+    def create_user_memory(body: UserMemoryCreateRequest):
+        content = body.content.strip()
+        if not content:
+            raise HTTPException(400, detail="记忆内容不能为空。")
+        try:
+            return app.state.store.create_user_memory(
+                body.type, content, datetime.now(timezone.utc).isoformat()
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, detail="相同内容的记忆已存在。") from None
 
     @app.get("/memories", summary="查看长期记忆列表")
     def list_memories(status: Literal["active", "superseded", "dismissed"] | None = None,

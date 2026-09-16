@@ -36,8 +36,8 @@ def fake_extractor(memories, model="test-memory-model"):
     return _fake
 
 
-def test_confirm_triggers_extraction_and_saves_memory(tmp_path, monkeypatch):
-    """确认意图后台提炼并落库，接口响应新增 memory_job 字段。"""
+def test_confirm_triggers_extraction_and_creates_review_candidate(tmp_path, monkeypatch):
+    """模型只能提议；用户确认候选后才成为 active 长期记忆。"""
     db_path = tmp_path / "test.sqlite3"
     prepared_store(db_path, existing_memories=[
         {"type": "preference", "content": "用户偏好居家徒手训练"}])
@@ -59,12 +59,20 @@ def test_confirm_triggers_extraction_and_saves_memory(tmp_path, monkeypatch):
     # 提炼时带上了已有记忆，模型才能在提示词内自查重复。
     assert extractor.calls[0]["existing"] == ["用户偏好居家徒手训练"]
 
-    # 重新打开数据库，确认记忆真的落盘，并记录了模型名与来源笔记。
-    saved = NoteStore(db_path).active_memories()
-    assert len(saved) == 2                    # 预置的旧记忆 + 本次新增
-    assert saved[0]["content"] == "用户习惯把减脂餐归为健身"   # 按 updated_at 倒序
-    assert saved[0]["model"] == "test-memory-model"
-    assert saved[0]["source_note_id"] == "note1"
+    # 候选没有自动进入 active，只有用户确认后才会影响后续回答。
+    store = NoteStore(db_path)
+    assert len(store.active_memories()) == 1
+    candidates = store.memory_candidates(status="pending")
+    assert len(candidates) == 1
+    assert candidates[0]["model"] == "test-memory-model"
+    assert candidates[0]["source_note_id"] == "note1"
+    with TestClient(create_app(db_path)) as client:
+        reviewed = client.post(f"/memory-candidates/{candidates[0]['id']}/review", json={
+            "decision": "confirmed", "content": "用户习惯把减脂餐用于健身备餐"
+        })
+    assert reviewed.status_code == 200
+    assert reviewed.json()["memory"]["status"] == "active"
+    assert len(NoteStore(db_path).active_memories()) == 2
 
 
 def test_dismissed_does_not_extract(tmp_path, monkeypatch):
@@ -115,4 +123,5 @@ def test_repeated_confirmation_does_not_duplicate_memory(tmp_path, monkeypatch):
         client.put("/notes/note1/intent", json={"decision": "confirmed"})
 
     assert len(extractor.calls) == 2
-    assert len(NoteStore(db_path).memories()) == 1
+    assert NoteStore(db_path).memories() == []
+    assert len(NoteStore(db_path).memory_candidates()) == 1
