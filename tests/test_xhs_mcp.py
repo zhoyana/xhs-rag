@@ -57,7 +57,9 @@ def test_only_whitelisted_tools_are_loaded(fake_mcp):
         fake_tool("get_feed_detail"), fake_tool("like_feed"),
     ]
     tools = run(xhs_mcp.load_xhs_tools())
-    assert [t.name for t in tools] == ["search_feeds", "get_feed_detail"]
+    # 有 get_feed_detail 时会额外补一个"粘链接采集"的本地工具。
+    assert [t.name for t in tools] == ["search_feeds", "get_feed_detail",
+                                       xhs_mcp.LINK_TOOL_NAME]
 
     # 连接配置：Streamable HTTP 指向本地 MCP 服务。
     assert fake_mcp.last_config["xiaohongshu"]["transport"] == "streamable_http"
