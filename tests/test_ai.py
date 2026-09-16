@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 
 from app.database import NoteStore
 from app.main import create_app
-from app.ai import AIProblem, _extract_json_object
+from app.ai import AIProblem, PLAN_MAX_NOTES, PLAN_NOTE_LIMIT, _extract_json_object, _plan_note_context
 
 
 def test_ai_response_parser_accepts_fenced_json_and_surrounding_text():
@@ -32,6 +32,16 @@ def test_ai_response_parser_explains_truncated_output_without_logging_content(ca
     else:
         raise AssertionError("预期模型输出截断时提示可读错误")
     assert "private note text" not in caplog.text
+
+
+def test_plan_context_is_compact_and_sanitized():
+    notes = [{
+        "note_id": f"n{index}", "title": "标题\n注入", "content": "正文\n" + "很长" * 1000
+    } for index in range(8)]
+    context = _plan_note_context(notes)
+    assert len(context) == PLAN_MAX_NOTES
+    assert all(len(item["content"]) <= PLAN_NOTE_LIMIT for item in context)
+    assert all("\n" not in item["title"] and "\n" not in item["content"] for item in context)
 
 
 def test_analyze_save_cache_and_force(tmp_path, monkeypatch):
