@@ -29,6 +29,7 @@ from .retrieval import search_knowledge
 from .chat_agent import plan_requested, run_agent_turn
 from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
+from .xhs_mcp import load_xhs_tools
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
     blob_to_vector,
@@ -319,6 +320,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             recaller=recall,
             drafter=create_draft,
         )
+        # 站外能力（小红书搜索/笔记详情）来自外部 MCP 服务，按白名单挂载；
+        # 服务不可用时静默缩编为纯本地工具，不影响聊天主链路。
+        tools = tools + await load_xhs_tools()
         # 代码层权限控制比 Prompt 更可靠：普通咨询时模型根本看不到写入型工具。
         wants_plan = plan_requested(body.content)
         if not wants_plan:
