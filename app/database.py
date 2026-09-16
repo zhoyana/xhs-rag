@@ -1,6 +1,7 @@
 """持久化模块：SQLite 是本地文件数据库，无需另外安装服务。"""
 import hashlib
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -85,7 +86,10 @@ class NoteStore:
             )""")
             # 记忆层：用户确认意图后沉淀的长期偏好，供后续 AI 分析注入提示词。
             # type 用 CHECK 约束兜底：应用层校验管体验，数据库约束管数据正确性。
-            # status 软删除（active/dismissed），与 tasks/folders 的策略一致，可审计可恢复。
+            # status 三态：active 生效 / superseded 被新记忆替换（系统专用）/
+            # dismissed 用户删除。三者都保留记录，可审计可恢复。
+            # embedding 三列缓存记忆的向量：embedding_model 记录生成模型，
+            # embedding_hash 记录生成向量时的内容指纹（内容改过向量就过期）。
             db.execute("""CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY,
                 type TEXT NOT NULL CHECK(type IN ('preference', 'habit', 'correction')),
@@ -93,9 +97,36 @@ class NoteStore:
                 content_hash TEXT NOT NULL UNIQUE,
                 model TEXT NOT NULL,
                 source_note_id TEXT,
-                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'dismissed')),
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'superseded', 'dismissed')),
+                embedding BLOB, embedding_model TEXT, embedding_hash TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )""")
+            # 旧版本表的 status 只有 (active, dismissed) 两态且没有向量列。
+            # SQLite 不能修改 CHECK 约束，只能“建新表 → 搬数据 → 换名”三步重建。
+            # 秋招知识点：SQLite 的 ALTER TABLE 能力有限，schema 演进的惯例是
+            # create-new / copy / drop / rename，全程在同一事务里，要么旧要么新。
+            columns = {row[1] for row in db.execute("PRAGMA table_info(memories)").fetchall()}
+            if "embedding" not in columns:
+                db.execute("""CREATE TABLE memories_new (
+                    id INTEGER PRIMARY KEY,
+                    type TEXT NOT NULL CHECK(type IN ('preference', 'habit', 'correction')),
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    model TEXT NOT NULL,
+                    source_note_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active', 'superseded', 'dismissed')),
+                    embedding BLOB, embedding_model TEXT, embedding_hash TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                )""")
+                db.execute("""INSERT INTO memories_new
+                    (id, type, content, content_hash, model, source_note_id,
+                     status, created_at, updated_at)
+                    SELECT id, type, content, content_hash, model, source_note_id,
+                           status, created_at, updated_at FROM memories""")
+                db.execute("DROP TABLE memories")
+                db.execute("ALTER TABLE memories_new RENAME TO memories")
             # 秋招知识点：content_hash 是内容 SHA-256 指纹 + UNIQUE 约束，重复记忆在
             # 数据库层直接插不进去——幂等去重从“代码约定”升级为“硬约束”（对齐 chunks）。
             # 任务使用普通关系表保存，安卓 App 以后只需读取这些字段即可展示待办。
@@ -794,7 +825,7 @@ class NoteStore:
         with closing(sqlite3.connect(self.path)) as db:
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        return dict(row) if row else None
+        return self._memory_public(row) if row else None
 
     def memories(self, status=None, limit=50, offset=0):
         """列出记忆；默认包含 dismissed，管理接口可用 status 过滤。"""
@@ -808,7 +839,7 @@ class NoteStore:
                 rows = db.execute("""SELECT * FROM memories
                     ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
                     (limit, offset)).fetchall()
-        return [dict(row) for row in rows]
+        return [self._memory_public(row) for row in rows]
 
     def active_memories(self, limit=10):
         """注入提示词用：只取 active，按 updated_at 倒序（最近整理过的最可信）。
@@ -830,6 +861,98 @@ class NoteStore:
             db.execute(f"UPDATE memories SET {assignments} WHERE id = ?",
                        [*changes.values(), memory_id])
         return self.memory(memory_id)
+
+    # ---- 记忆召回（recall）----
+    # 统一入口：调用方（分析 / 收藏夹建议 / 未来的问答与计划）只依赖
+    # recall_memories()，内部从“时间排序”升级到“向量检索”对调用方透明。
+
+    def _memory_public(self, row):
+        """去掉向量缓存三列——它们是内部实现细节，不进入接口响应。"""
+        public = dict(row)
+        public.pop("embedding", None)
+        public.pop("embedding_model", None)
+        public.pop("embedding_hash", None)
+        return public
+
+    def memories_missing_embeddings(self, model, limit=200):
+        """active 且向量缺失或已过期的记忆（内容改过，指纹就对不上）。"""
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""SELECT * FROM memories
+                WHERE status = 'active'
+                  AND (embedding IS NULL OR embedding_model != ?
+                       OR embedding_hash != content_hash)
+                ORDER BY updated_at DESC LIMIT ?""", (model, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_memory_embeddings(self, records):
+        """把向量写回记忆行；embedding_hash 记录生成向量时的内容指纹。
+
+        秋招知识点：刻意不更新 updated_at——它是“记忆编辑时间”，
+        向量回填属于内部缓存维护，不该改变业务上的排序语义。
+        """
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.executemany("""UPDATE memories
+                SET embedding = ?, embedding_model = ?, embedding_hash = ?
+                WHERE id = ?""", [
+                (record["vector"], record["model"], record["content_hash"],
+                 record["id"])
+                for record in records
+            ])
+
+    def _active_rows_with_embeddings(self, model, limit=200):
+        """内部查询：带向量缓存列的 active 记忆（只取向量已就绪的行）。"""
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""SELECT * FROM memories
+                WHERE status = 'active' AND embedding IS NOT NULL
+                  AND embedding_model = ? AND embedding_hash = content_hash
+                ORDER BY updated_at DESC LIMIT ?""", (model, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _recall_by_similarity(self, query, limit):
+        """按相关度召回：缺失向量先补算，再与查询向量算余弦取 top-k。"""
+        # 函数内延迟 import：database 层保持不依赖 AI 模块；这里也避免了
+        # embeddings 模块将来反向引用存储层时的循环 import。
+        from . import embeddings as emb
+
+        model_name = emb.MODEL_NAME
+        # 秋招知识点：lazy backfill（惰性回填）——向量在第一次被需要时补算，
+        # 而不是写入时同步计算。写入链路保持轻快，模型加载成本分摊到读路径。
+        pending = self.memories_missing_embeddings(model_name)
+        if pending:
+            vectors = emb.embed_texts([row["content"] for row in pending])
+            self.save_memory_embeddings([
+                {"id": row["id"], "vector": emb.vector_to_blob(vector),
+                 "model": model_name, "content_hash": row["content_hash"]}
+                for row, vector in zip(pending, vectors)
+            ])
+
+        query_vector = emb.embed_query(query)
+        scored = []
+        for row in self._active_rows_with_embeddings(model_name):
+            vector = emb.blob_to_vector(row.pop("embedding"), emb.EXPECTED_DIMENSION)
+            row.pop("embedding_model")
+            row.pop("embedding_hash")
+            scored.append({**row, "score": emb.cosine_similarity(query_vector, vector)})
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:limit]
+
+    def recall_memories(self, query=None, limit=10):
+        """统一取记忆入口：query 为空按时间取最新，非空按相关度召回 top-k。
+
+        秋招知识点：接口先于实现稳定——调用方今天传 query=None 拿到时间排序，
+        明天同一签名自动升级为向量检索。向量算不了（模型缺失/推理异常）时
+        降级回时间排序并记日志：召回是增强路径，绝不能拖垮业务主链路。
+        """
+        if not query or not query.strip():
+            return self.active_memories(limit=limit)
+        try:
+            return self._recall_by_similarity(query.strip(), limit)
+        except Exception:  # noqa: BLE001 - 任何向量链路故障都降级，不向上抛
+            logging.getLogger(__name__).warning(
+                "memory_recall_fallback", exc_info=True)
+            return self.active_memories(limit=limit)
 
     @staticmethod
     def _task_dict(row):
