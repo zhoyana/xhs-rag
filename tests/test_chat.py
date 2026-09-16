@@ -10,7 +10,7 @@ from app.tools import build_langchain_tools
 
 
 def test_thread_messages_are_persisted(tmp_path, monkeypatch):
-    async def fake_agent(history, tools):
+    async def fake_agent(history, tools, **_kwargs):
         assert history[-1]["content"] == "帮我找 RAG 笔记"
         assert "draft_plan" not in {tool.name for tool in tools}
         return {"content": "找到一篇笔记。", "tool_calls": [{"name": "search_notes", "ok": True}],
@@ -68,3 +68,44 @@ def test_agent_executes_tool_then_generates_answer():
 def test_plan_tool_requires_explicit_user_intent():
     assert plan_requested("帮我检索 RAG 笔记并告诉我怎么准备") is False
     assert plan_requested("请根据这些笔记制定一周学习计划") is True
+
+
+def test_explicit_plan_request_forces_draft_tool_when_model_only_writes_text():
+    class ReluctantModel:
+        def __init__(self):
+            self.calls = 0
+            self.was_forced = False
+
+        def bind_tools(self, tools, **kwargs):
+            if kwargs.get("tool_choice") == "draft_plan":
+                self.was_forced = True
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="我直接写一份七天计划。")
+            if self.calls == 2:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "draft_plan",
+                    "args": {"goal": "准备面试", "source_note_ids": ["n1"],
+                             "start_date": "2099-09-16"},
+                    "id": "draft-1", "type": "tool_call",
+                }])
+            return AIMessage(content="草案已经保存，请确认后再创建任务。")
+
+    async def fake_draft(goal, ids, date):
+        return {"status": "draft", "plan": {"id": 12}}
+
+    model = ReluctantModel()
+    tools = build_langchain_tools(
+        searcher=lambda query, limit: [], getter=lambda note_id: None,
+        recaller=lambda query, limit: [], drafter=fake_draft,
+    )
+    result = asyncio.run(run_agent_turn(
+        [{"role": "user", "content": "制定计划", "metadata": {}}],
+        tools, model=model, required_tool="draft_plan",
+    ))
+    assert model.was_forced is True
+    assert result["plan_id"] == 12
+    assert result["tool_calls"][0]["name"] == "draft_plan"

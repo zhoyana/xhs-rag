@@ -306,12 +306,15 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             drafter=create_draft,
         )
         # 代码层权限控制比 Prompt 更可靠：普通咨询时模型根本看不到写入型工具。
-        if not plan_requested(body.content):
+        wants_plan = plan_requested(body.content)
+        if not wants_plan:
             tools = [tool for tool in tools if tool.name != "draft_plan"]
         # 只发送最近 20 条消息：这是滑动窗口短期记忆，避免上下文无限增长。
         history = app.state.store.thread(thread_id, message_limit=20)["messages"]
         try:
-            result = await run_agent_turn(history, tools)
+            result = await run_agent_turn(
+                history, tools, required_tool="draft_plan" if wants_plan else None
+            )
         except Exception as exc:
             logger.warning("chat_agent_failed thread_id=%s exception_type=%s", thread_id, type(exc).__name__)
             raise HTTPException(502, detail="知识库助手暂时无法回答，请稍后重试。") from None

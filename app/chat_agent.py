@@ -52,7 +52,10 @@ def deepseek_chat_model():
     )
 
 
-async def run_agent_turn(history: list[dict], tools: list, model=None, max_rounds: int = 6) -> dict:
+async def run_agent_turn(
+    history: list[dict], tools: list, model=None, max_rounds: int = 6,
+    required_tool: str | None = None,
+) -> dict:
     """运行一次 ReAct 风格的“模型 → 工具 → 模型”循环。
 
     max_rounds 是保险丝，防止模型反复调用工具形成无限循环。
@@ -64,13 +67,32 @@ async def run_agent_turn(history: list[dict], tools: list, model=None, max_round
     for item in history:
         message_type = HumanMessage if item["role"] == "user" else AIMessage
         messages.append(message_type(content=item["content"]))
+        # 数据库中的来源元数据比从自然语言中重新猜 ID 更可靠，供下一轮直接复用。
+        cited = item.get("metadata", {}).get("cited_note_ids", [])
+        if item["role"] == "assistant" and cited:
+            messages.append(SystemMessage(
+                content=f"上一轮已引用且可继续使用的笔记 ID：{', '.join(cited)}"
+            ))
 
     tool_map = {tool.name: tool for tool in tools}
     traces, retrieved_note_ids, viewed_note_ids, plan_id = [], [], [], None
+    attempted_tools: set[str] = set()
+    force_required_next = False
     for _ in range(max_rounds):
-        response = await model_with_tools.ainvoke(messages)
+        # 明确要求计划时，如果模型企图直接输出文字，下一轮强制它走 draft_plan。
+        # 秋招知识点：业务不变量必须由编排层保证，不能只依赖 Prompt 的软约束。
+        round_model = (llm.bind_tools(tools, tool_choice=required_tool)
+                       if force_required_next and required_tool else model_with_tools)
+        response = await round_model.ainvoke(messages)
         messages.append(response)
         if not response.tool_calls:
+            if required_tool and required_tool not in attempted_tools:
+                messages.append(HumanMessage(content=(
+                    f"用户明确要求生成可保存的计划草案。不要直接输出文字计划；"
+                    f"现在必须调用 {required_tool}，并使用已检索或上一轮引用的笔记 ID。"
+                )))
+                force_required_next = True
+                continue
             content = response.content if isinstance(response.content, str) else str(response.content)
             # cited 只记录模型最终回答中出现过，或通过 get_note 明确展开过的来源。
             cited = list(viewed_note_ids)
@@ -88,6 +110,8 @@ async def run_agent_turn(history: list[dict], tools: list, model=None, max_round
             }
 
         for call in response.tool_calls:
+            attempted_tools.add(call["name"])
+            force_required_next = False
             tool = tool_map.get(call["name"])
             started = perf_counter()
             if tool is None:
