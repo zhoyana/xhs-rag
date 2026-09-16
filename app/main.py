@@ -27,6 +27,7 @@ from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_me
 from .knowledge import document_hash, split_note
 from .retrieval import search_knowledge
 from .chat_agent import plan_requested, run_agent_turn
+from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
@@ -625,11 +626,20 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                        [*values, datetime.now(timezone.utc).isoformat(), plan_id])
         return get_plan(plan_id)
 
+    @app.get("/plans/{plan_id}/quality-check", summary="确认前检查计划时间和工作量")
+    def plan_quality_check(plan_id: int):
+        # 只读预检：草案和已经执行的计划都能查看，不会修改现有任务。
+        return check_plan_quality(get_plan(plan_id))
+
     @app.post("/plans/{plan_id}/confirm", summary="确认学习计划草案")
     def confirm_plan(plan_id: int):
         plan = get_plan(plan_id)
         if plan["status"] != "draft":
             raise HTTPException(409, detail="只有 draft 状态的计划可以确认。")
+        quality = check_plan_quality(plan)
+        if not quality["can_confirm"]:
+            # 返回结构化结果，Swagger 能直接指出哪些步骤需要改时间。
+            raise HTTPException(409, detail=quality)
         return app.state.store.update_plan_status(
             plan_id, "confirmed", datetime.now(timezone.utc).isoformat()
         )
@@ -657,7 +667,11 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         scheduled = fields.get("scheduled_at")
         reminder = fields.get("reminder_at")
         scheduled_text = utc_text(scheduled, "scheduled_at") if scheduled else current["scheduled_at"]
-        reminder_text = utc_text(reminder, "reminder_at") if reminder else current["reminder_at"]
+        # 显式传 null 表示清空提醒；完全不传才表示保持原值。
+        if "reminder_at" in fields:
+            reminder_text = utc_text(reminder, "reminder_at") if reminder is not None else None
+        else:
+            reminder_text = current["reminder_at"]
         if reminder_text and reminder_text > scheduled_text:
             raise HTTPException(400, detail="提醒时间不能晚于步骤执行时间。")
         if "scheduled_at" in fields:
