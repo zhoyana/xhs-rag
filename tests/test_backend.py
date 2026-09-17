@@ -7,15 +7,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.extractor import ImportProblem, share_url, parse_note, fetch_page
+from app import indexing
 from app.main import create_app
 
 URL = "https://www.xiaohongshu.com/explore/abc123"
 
 
-def fixture_html(content="测试正文", kind="normal"):
+def fixture_html(content="测试正文", kind="normal", note_id="abc123"):
     # 构造固定的模拟页面；可传入不同正文来测试空内容或特殊字符串。
+    # note_id 可变，批量导入要用它造出"几条不同笔记"的页面。
     return "<script>window.__INITIAL_STATE__=" + json.dumps({"note": {"noteDetailMap": {
-        "abc123": {"note": {"title": "测试标题", "desc": content, "type": kind,
+        note_id: {"note": {"title": "测试标题", "desc": content, "type": kind,
                                 "imageList": [{"urlDefault": "https://example.com/test.jpg"}]}}
     }}}) + ";</script>"
 
@@ -268,9 +270,12 @@ def test_intake_persists_job_and_downloads_images_immediately(tmp_path, monkeypa
         job = client.get(f"/jobs/{job_id}").json()
 
     assert job["status"] == "completed"
-    assert job["progress"] == {"import": "completed", "download_assets": "completed"}
+    assert job["progress"] == {"import": "completed", "download_assets": "completed",
+                               "index": "completed"}
     assert job["note_id"] == "abc123"
     assert job["result"]["assets"]["downloaded"] == 1
+    # 收件箱进来的笔记必须当场可检索，而不是等用户想起来再手动点一次建索引。
+    assert job["result"]["index"]["searchable"] is True
     assert download_calls == ["abc123"]
     assert "secret-intake-token" not in str(NoteStore(db_path).job(job_id))
 
@@ -350,6 +355,125 @@ def test_single_import_reports_its_collection_source(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["source"] == "html"
+
+
+def test_single_import_indexes_the_note_immediately(tmp_path, monkeypatch):
+    """导入完就能语义检索，是响应必须回答的问题，不能只回报"保存成功"。"""
+    async def fake_fetch(_url):
+        return fixture_html("可检索的正文"), URL
+
+    calls = []
+
+    def recording_index(_store, note_id, **_kwargs):
+        calls.append(note_id)
+        return {"status": "indexed", "note_id": note_id, "chunk_count": 2,
+                "vector_total": 2, "searchable": True}
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    monkeypatch.setattr(indexing, "DEFAULT_INDEXER", recording_index)
+
+    with TestClient(create_app(tmp_path / "import-index.sqlite3")) as client:
+        body = client.post("/notes/import", json={"share_text": URL}).json()
+
+    # 索引必须建立在保存之后，且作用在这次导入的笔记上。
+    assert calls == ["abc123"]
+    assert body["index"]["searchable"] is True
+    assert body["index"]["vector_total"] == 2
+
+
+def test_index_failure_does_not_break_the_import(tmp_path, monkeypatch):
+    """索引失败只让这篇暂时搜不到，不能把已经采到手的笔记一起丢掉。"""
+    async def fake_fetch(_url):
+        return fixture_html("索引会失败的正文"), URL
+
+    def broken_index(_store, _note_id, **_kwargs):
+        raise RuntimeError("向量模型不可用")
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    monkeypatch.setattr(indexing, "DEFAULT_INDEXER", broken_index)
+
+    with TestClient(create_app(tmp_path / "import-index-fail.sqlite3")) as client:
+        response = client.post("/notes/import", json={"share_text": URL})
+        saved = client.get("/notes/abc123")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "imported"
+    assert body["index"]["status"] == "failed"
+    assert body["index"]["searchable"] is False
+    # 笔记确实落库了——派生步骤失败不该回滚主流程。
+    assert saved.status_code == 200
+
+
+def test_batch_import_marks_each_note_searchable(tmp_path, monkeypatch):
+    """批量导入要能看出哪几条已经能搜到，而不是只回报保存成功。"""
+    urls = ["https://www.xiaohongshu.com/explore/aaa111",
+            "https://www.xiaohongshu.com/explore/bbb222"]
+
+    async def fake_fetch(url):
+        note_id = url.rstrip("/").rsplit("/", 1)[-1]
+        return fixture_html("批量正文", note_id=note_id), url
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+
+    with TestClient(create_app(tmp_path / "batch-index.sqlite3")) as client:
+        body = client.post("/notes/import-batch",
+                           json={"share_text": "\n".join(urls)}).json()
+
+    assert body["succeeded"] == 2
+    assert [item["note_id"] for item in body["items"]] == ["aaa111", "bbb222"]
+    assert all(item["searchable"] is True for item in body["items"])
+    assert all(item["index_status"] == "indexed" for item in body["items"])
+
+
+def test_intake_indexes_a_note_whose_content_lives_in_images(tmp_path, monkeypatch):
+    """正文极短、内容都在长图里的笔记，从收件箱进来也必须当场可检索。
+
+    真机验收时正是这条路径暴露过问题：收件箱不做图片转写，剥掉话题标签后
+    正文为空，索引被直接跳过，用户收完一篇却一个字都搜不到。
+    """
+    from app import xhs_source
+    from app.database import NoteStore
+    from app.embeddings import EXPECTED_DIMENSION
+    from app.indexing import index_and_embed
+
+    async def fake_fetch(_url):
+        # 正文只有"面经"两个字加话题标签——真正的内容在长图里。
+        return fixture_html("面经 #秋招[话题]# #AI[话题]#"), URL
+
+    async def fake_transcribe(images, **_kwargs):
+        return {"status": "ok", "text": "面试官问了大模型 Agent 的记忆机制如何设计。",
+                "model": "fake", "error": None, "read": len(images), "dropped": 0}
+
+    def fake_embedder(texts):
+        return [[1.0] + [0.0] * (EXPECTED_DIMENSION - 1) for _ in texts]
+
+    def fake_download(_store, _note, _root):
+        return {"status": "complete", "total": 1, "downloaded": 1, "skipped": 0, "failed": 0}
+
+    # 用真实索引实现、只替换向量计算：这里要验证的正是"图片文字真的进了索引正文"。
+    def real_index(store, note_id, **_kwargs):
+        return index_and_embed(store, note_id, embedder=fake_embedder)
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    monkeypatch.setattr("app.main.download_note_assets", fake_download)
+    monkeypatch.setattr(xhs_source, "DEFAULT_TRANSCRIBE", fake_transcribe)
+    monkeypatch.setattr(indexing, "DEFAULT_INDEXER", real_index)
+
+    db_path = tmp_path / "image-content.sqlite3"
+    with TestClient(create_app(db_path)) as client:
+        queued = client.post("/notes/intake", json={"share_text": URL})
+        job = client.get(f"/jobs/{queued.json()['job_id']}").json()
+
+    assert job["status"] == "completed"
+    assert job["result"]["index"]["status"] == "indexed"
+    assert job["result"]["index"]["searchable"] is True
+
+    store = NoteStore(db_path)
+    document = store.document_for_note("abc123")
+    assert document is not None
+    indexed_text = "\n".join(chunk["content"] for chunk in store.document_chunks(document["id"]))
+    assert "记忆机制" in indexed_text
 
 
 def test_jobs_left_running_are_marked_interrupted_after_restart(tmp_path):

@@ -214,4 +214,28 @@ async def transcribe_images(images, *, title: str = "", max_images: int = MAX_IM
     return result
 
 
-__all__ = ["MAX_IMAGES", "TRANSCRIBE_PROMPT", "allowed_image_url", "transcribe_images"]
+def apply_image_text(note: dict, vision: dict) -> None:
+    """把读图结果并进 note，并同步修正 warnings。
+
+    警告必须跟着事实走：图片一旦被识别成功，"内容在图片里"这句就不再成立，
+    留着反而会误导模型声称自己看不到内容。
+
+    放在视觉模块而不是某个采集通道里：MCP 通道（Agent 收藏）和收件箱通道
+    （统一收件、批量导入）都要用，转写结果的落地格式只该有一份定义。
+    """
+    warnings = [w for w in note.get("warnings", []) if "主要内容在图片里" not in w
+                and "需及时下载" not in w]
+    text = str(vision.get("text") or "").strip()
+    if text:
+        note["image_text"] = text
+        note["image_count"] = vision.get("read")
+        warnings.append(
+            f"已用视觉模型识别 {vision.get('read')} 张图片，完整内容见 image_text，可直接引用。")
+    else:
+        warnings.append(
+            f"图片识别未取得文字（{vision.get('error') or '未知原因'}），只能依据文字正文回答。")
+    note["warnings"] = warnings
+
+
+__all__ = ["MAX_IMAGES", "TRANSCRIBE_PROMPT", "allowed_image_url", "transcribe_images",
+           "apply_image_text"]

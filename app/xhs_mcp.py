@@ -17,7 +17,7 @@ from langchain_core.tools import StructuredTool
 
 from .media import download_note_assets
 from .xhs_link import XhsLinkError, expand_short_link, note_from_feed_detail, parse_xhs_link
-from .xhs_vision import transcribe_images
+from .xhs_vision import apply_image_text, transcribe_images
 from . import indexing
 
 logger = logging.getLogger(__name__)
@@ -56,8 +56,6 @@ SAVE_TOOL_DESCRIPTION = (
 _cache: list | None = None
 DEFAULT_TRANSCRIBE = transcribe_images
 DEFAULT_DOWNLOAD = download_note_assets
-# 收藏后自动建索引：默认是"建文档 + 分块 + 生成向量"一步到位，收藏完即可语义检索。
-DEFAULT_INDEXER = indexing.index_and_embed
 
 
 class XhsMcpUnavailable(Exception):
@@ -149,26 +147,6 @@ async def _call_detail(detail_tool, args: dict) -> dict:
         raise XhsLinkError("采集失败，链接可能已过期或笔记不可见。", "collect_failed") from None
 
 
-def _apply_image_text(note: dict, vision: dict) -> None:
-    """把读图结果并进 note，并同步修正 warnings。
-
-    警告必须跟着事实走：图片一旦被识别成功，"内容在图片里"这句就不再成立，
-    留着反而会误导模型声称自己看不到内容。
-    """
-    warnings = [w for w in note.get("warnings", []) if "主要内容在图片里" not in w
-                and "需及时下载" not in w]
-    text = str(vision.get("text") or "").strip()
-    if text:
-        note["image_text"] = text
-        note["image_count"] = vision.get("read")
-        warnings.append(
-            f"已用视觉模型识别 {vision.get('read')} 张图片，完整内容见 image_text，可直接引用。")
-    else:
-        warnings.append(
-            f"图片识别未取得文字（{vision.get('error') or '未知原因'}），只能依据文字正文回答。")
-    note["warnings"] = warnings
-
-
 async def _collect_note_for_link(link: str, detail_tool, *, read_images: bool,
                                  transcribe, with_comments: bool = False) -> dict:
     """链接 → note（含图片文字）。失败抛 XhsLinkError / XhsMcpUnavailable。
@@ -207,7 +185,7 @@ async def _collect_note_for_link(link: str, detail_tool, *, read_images: bool,
         except Exception:  # noqa: BLE001 - 读图失败只降级成"只有文字正文"
             logger.warning("xhs_note_transcribe_failed", exc_info=True)
             vision = {"status": "failed", "text": "", "error": "视觉识别异常。"}
-        _apply_image_text(note, vision)
+        apply_image_text(note, vision)
     return note
 
 
@@ -238,20 +216,6 @@ def build_link_collect_tool(detail_tool, transcribe=None) -> StructuredTool:
     )
 
 
-def _index_safely(indexer, store, note_id: str) -> dict:
-    """建索引 + 生成向量；失败只降级，绝不牵连已经成功的收藏。
-
-    秋招知识点（派生数据可以重建）：索引和向量都能从 notes 原文重算，
-    所以它们的失败不该把"笔记与图片已经存好"这件事一起回滚——用户真正
-    要的东西已经拿到了，只是暂时搜不到。
-    """
-    try:
-        return indexer(store, note_id)
-    except Exception:  # noqa: BLE001 - 派生步骤失败不影响主流程
-        logger.warning("xhs_note_index_failed note_id=%s", note_id, exc_info=True)
-        return {"status": "failed", "reason": "建索引失败，笔记已保存，可稍后重建索引。"}
-
-
 def _index_summary(index: dict) -> dict:
     """只把对用户有意义的字段交给模型，别把整份内部结构塞进上下文。
 
@@ -272,13 +236,13 @@ def _persist_note(store, media_root, note: dict, downloader=None,
 
     与收件箱 process_intake 用同一条入库管线：新建走 save，重复收藏走
     refresh_note_source（刷新带签名的临时图片地址，已下载的文件保持不变）。
-    downloader / indexer 均可注入，单测里换成不联网的替身。
+    downloader / indexer 均可注入，单测里换成不联网的替身；降级语义由
+    indexing.index_safely 统一负责，这里不再各自兜底。
 
     秋招知识点（顺序有意义）：向量化的输入是**入库后**的正文（含 image_text），
     所以索引必须排在 save 之后，不能反过来。
     """
     downloader = downloader or DEFAULT_DOWNLOAD
-    indexer = indexer or DEFAULT_INDEXER
     now = datetime.now(timezone.utc).isoformat()
     if store.get(note["note_id"]) is None:
         note["created_at"] = now
@@ -291,7 +255,7 @@ def _persist_note(store, media_root, note: dict, downloader=None,
     # 下载是同步的阻塞 IO（httpx + Pillow），由调用方放进线程执行。
     assets = downloader(store, saved, media_root)
     # 索引同样是阻塞的（切分 + 模型推理），和下载一起留在同一个线程里。
-    index = _index_safely(indexer, store, saved["note_id"])
+    index = indexing.index_safely(store, saved["note_id"], indexer=indexer)
     return saved, status, assets, index
 
 
@@ -306,7 +270,6 @@ def build_save_note_tool(detail_tool, store, media_root, *, transcribe=None,
     transcribe = transcribe or DEFAULT_TRANSCRIBE
     downloader = downloader or DEFAULT_DOWNLOAD
     collector = collector or _collect_note_for_link
-    indexer = indexer or DEFAULT_INDEXER
 
     async def save(link: str) -> dict:
         try:

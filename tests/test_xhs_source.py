@@ -60,6 +60,89 @@ def patch_detail(monkeypatch, *, payload=None, error=None, delay=0.0):
     return calls
 
 
+# ---------------- 采集层补图片文字 ----------------
+
+IMAGE_ONLY_FEED = {"feed_id": "6aa3c6ff0000000025036dd4", "data": {"note": {
+    "noteId": "6aa3c6ff0000000025036dd4",
+    "title": "",
+    # 剥掉话题标签后没有实义文字——真正的内容在长图里。
+    "desc": "#秋招[话题]# #面试[话题]#",
+    "type": "normal",
+    "imageList": [{"urlDefault": "https://sns-webpic-qc.xhscdn.com/image-only.webp"}],
+}}}
+
+TEXT_AND_IMAGE_FEED = {"feed_id": "6aa3c6ff0000000025036dd4", "data": {"note": {
+    "noteId": "6aa3c6ff0000000025036dd4",
+    "title": "有正文也有配图",
+    "desc": "一面问了 ReAct 和 Function Calling 的执行链路，二面考多 Agent 协作与评测。",
+    "type": "normal",
+    "imageList": [{"urlDefault": "https://sns-webpic-qc.xhscdn.com/text-and-image.webp"}],
+}}}
+
+
+def transcriber(text="图片里识别出的面试题", calls=None):
+    async def fake(images, **_kwargs):
+        if calls is not None:
+            calls.append(list(images))
+        return {"status": "ok", "text": text, "model": "fake", "error": None,
+                "read": len(images), "dropped": 0}
+
+    return fake
+
+
+def test_image_text_is_filled_when_content_lives_in_images(monkeypatch):
+    """正文只剩话题标签时，采集必须补上图片文字。
+
+    否则这条笔记入库后剥掉标签就没有可索引正文，用户收藏完一个字都搜不到。
+    """
+    patch_detail(monkeypatch, payload=IMAGE_ONLY_FEED)
+    calls = []
+
+    note, source = run(xhs_source.collect_note(PC_LINK, transcribe=transcriber(calls=calls)))
+
+    assert source == xhs_source.SOURCE_MCP
+    assert note["image_text"] == "图片里识别出的面试题"
+    assert len(calls) == 1
+
+
+def test_no_vision_call_when_the_text_body_is_long_enough(monkeypatch):
+    """正文够长的笔记不该触发读图：省一次视觉调用，也省几秒等待。"""
+    patch_detail(monkeypatch, payload=TEXT_AND_IMAGE_FEED)
+    calls = []
+
+    note, _source = run(xhs_source.collect_note(PC_LINK, transcribe=transcriber(calls=calls)))
+
+    assert calls == []
+    assert not note.get("image_text")
+
+
+def test_read_images_false_skips_transcription(monkeypatch):
+    """调用方显式关掉读图时不调视觉模型（批量导入想省成本时用得上）。"""
+    patch_detail(monkeypatch, payload=IMAGE_ONLY_FEED)
+    calls = []
+
+    note, _source = run(xhs_source.collect_note(
+        PC_LINK, read_images=False, transcribe=transcriber(calls=calls)))
+
+    assert calls == []
+    assert not note.get("image_text")
+
+
+def test_transcribe_failure_only_degrades_the_note(monkeypatch):
+    """读图失败只损失一段文字，绝不能让采集本身失败。"""
+    patch_detail(monkeypatch, payload=IMAGE_ONLY_FEED)
+
+    async def broken(_images, **_kwargs):
+        raise RuntimeError("视觉服务不可用")
+
+    note, source = run(xhs_source.collect_note(PC_LINK, transcribe=broken))
+
+    assert source == xhs_source.SOURCE_MCP
+    assert note["note_id"] == "6aa3c6ff0000000025036dd4"
+    assert not note.get("image_text")
+    assert any("图片识别未取得文字" in warning for warning in note["warnings"])
+
+
 # ---------------- 通道选择 ----------------
 
 def test_mcp_is_preferred_when_available(monkeypatch):

@@ -6,7 +6,7 @@ xiaohongshu-mcp 在跑，也不依赖小红书页面当前长什么样。站外�
 """
 import pytest
 
-from app import xhs_mcp, xhs_source
+from app import indexing, xhs_mcp, xhs_source
 
 
 @pytest.fixture(autouse=True)
@@ -31,13 +31,33 @@ def _offline_mcp_channel(monkeypatch):
 def _offline_indexer(monkeypatch):
     """默认不加载真实的 Embedding 模型。
 
-    收藏流程会在保存后自动"建索引 + 生成向量"，而真实模型要下载权重、推理耗时
-    数秒，单测必须离线且秒级完成。这里替换的是收藏工具的默认索引器；需要验证
-    真实索引逻辑的用例直接测 app.indexing（注入假向量函数），或自己传 indexer。
+    所有写路径（收件箱导入、批量导入、刷新正文、Agent 收藏）保存后都会
+    "建索引 + 生成向量"，而真实模型要下载权重、推理耗时数秒，单测必须离线
+    且秒级完成。这里替换的是 app.indexing 里的可替换默认索引器——替换点只有
+    一个，所以四条路径一次全覆盖，不会出现某条路径漏了替身而偷偷加载模型。
+
+    需要验证真实索引逻辑的用例直接测 app.indexing（注入假向量函数），
+    或自己给工具传 indexer。
     """
     def fake_index(store, note_id, **_kwargs):
         return {"status": "indexed", "note_id": note_id, "chunk_count": 1,
                 "vector_total": 1, "searchable": True}
 
-    monkeypatch.setattr(xhs_mcp, "DEFAULT_INDEXER", fake_index)
+    monkeypatch.setattr(indexing, "DEFAULT_INDEXER", fake_index)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _offline_transcriber(monkeypatch):
+    """默认不调用视觉模型。
+
+    采集层会给"内容全在图片里"的笔记补上图片文字，那要调真实视觉 API 并下载
+    图片。单测必须离线，这里换成固定替身；需要验证转写落地格式的用例直接测
+    xhs_vision.apply_image_text，或自己给 collect_note 传 transcribe。
+    """
+    async def fake_transcribe(images, **_kwargs):
+        return {"status": "ok", "text": "图片里识别出的文字", "model": "fake",
+                "error": None, "read": len(images), "dropped": 0}
+
+    monkeypatch.setattr(xhs_source, "DEFAULT_TRANSCRIBE", fake_transcribe)
     yield

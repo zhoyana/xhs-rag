@@ -1,9 +1,10 @@
 """索引 + 向量一步到位：验证收藏后能立刻语义检索，且失败可降级。"""
 import pytest
 
+from app import indexing
 from app.database import NoteStore
 from app.embeddings import EXPECTED_DIMENSION
-from app.indexing import index_and_embed, index_note, embed_document
+from app.indexing import index_and_embed, index_note, embed_document, index_safely
 from app.indexing import EmptyContent
 
 
@@ -68,6 +69,40 @@ def test_index_and_embed_skips_note_without_indexable_text(tmp_path):
     assert result["status"] == "skipped"
     assert result["searchable"] is False
     assert result["reason"]
+
+
+def test_index_safely_degrades_instead_of_raising(tmp_path):
+    """索引是派生数据：它失败不该牵连已经存好的笔记，也不该让导入报错。"""
+    store = NoteStore(tmp_path / "safe.sqlite3")
+    store.save(sample_note())
+
+    def broken(_store, _note_id):
+        raise MemoryError("模型加载失败")
+
+    result = index_safely(store, "auto-index", indexer=broken)
+
+    assert result["status"] == "failed"
+    assert result["searchable"] is False
+    assert result["reason"]
+    # 用户真正要的东西（笔记本身）必须完好，没有被一起回滚。
+    assert store.get("auto-index") is not None
+
+
+def test_index_safely_uses_the_replaceable_default(tmp_path, monkeypatch):
+    """写路径不传 indexer 时走模块默认值——单测正是靠替换它才不用加载模型。"""
+    store = NoteStore(tmp_path / "default.sqlite3")
+    store.save(sample_note())
+    seen = []
+
+    def recording(_store, note_id, **_kwargs):
+        seen.append(note_id)
+        return {"status": "indexed", "searchable": True}
+
+    monkeypatch.setattr(indexing, "DEFAULT_INDEXER", recording)
+    result = index_safely(store, "auto-index")
+
+    assert seen == ["auto-index"]
+    assert result["searchable"] is True
     assert store.document_for_note("auto-index") is None
 
 

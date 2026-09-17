@@ -452,22 +452,30 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         秋招知识点（降级链路）：MCP 更准但依赖本地服务与登录态，网页解析更独立
         但怕页面改版。两条通道产出同一个 note 结构，谁成功都能继续走入库和下载，
         调用方不需要分支处理。
+
+        采集层顺带补齐图片文字：内容全在长图里的笔记正文只剩话题标签，不读图
+        的话入库后索引是空的、收藏完搜不到。正文够长的笔记不会触发读图。
         """
         return await xhs_source.collect_note(url, html_note=_html_note)
 
     async def import_from_url(url: str):
-        """单条与批量接口共用的核心步骤：采集、保存。"""
+        """单条与批量接口共用的核心步骤：采集、保存、建索引。"""
         note, source = await collect_note(url)
         note["created_at"] = datetime.now(timezone.utc).isoformat()
         saved, created = app.state.store.save(note)
+        # 索引读的是入库后的正文（含图片转写文字），所以必须排在 save 之后；
+        # 它是阻塞的模型推理，放进线程避免堵住事件循环。
+        index = await asyncio.to_thread(
+            indexing.index_safely, app.state.store, saved["note_id"]
+        )
         return {"status": "imported" if created else "existing", "note": saved,
-                "source": source}
+                "source": source, "index": index}
 
     async def process_intake(job_id: str, url: str):
         """后台执行导入和图片下载，并在每个阶段写入 SQLite 进度。"""
         store = app.state.store
         now = datetime.now(timezone.utc).isoformat()
-        progress = {"import": "running", "download_assets": "pending"}
+        progress = {"import": "running", "download_assets": "pending", "index": "pending"}
         store.update_job(job_id, status="running", current_step="import",
                          progress=progress, now=now)
         try:
@@ -497,11 +505,21 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             progress["download_assets"] = (
                 "completed" if download_result["failed"] == 0 else "partial"
             )
+            progress["index"] = "running"
+            store.update_job(job_id, status="running", current_step="index",
+                             progress=progress, now=datetime.now(timezone.utc).isoformat())
+            # 入库后立即建索引并生成向量，收件箱进来的笔记马上可被语义检索。
+            index = await asyncio.to_thread(
+                indexing.index_safely, store, saved["note_id"]
+            )
+            # skipped（纯图片且未识别出文字）不是故障，只有 failed 才算这一步失败。
+            progress["index"] = "failed" if index.get("status") == "failed" else "completed"
             final_status = "completed" if download_result["failed"] == 0 else "partial"
             store.update_job(
                 job_id, status=final_status, current_step="completed",
                 progress=progress,
-                result={"import_status": import_status, "source": source, "assets": {
+                result={"import_status": import_status, "source": source,
+                        "index": index, "assets": {
                     "total": download_result["total"],
                     "downloaded": download_result["downloaded"],
                     "skipped": download_result["skipped"],
@@ -545,7 +563,7 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         now = datetime.now(timezone.utc).isoformat()
         app.state.store.create_job(
             job_id, "note_intake", now,
-            {"import": "pending", "download_assets": "pending"},
+            {"import": "pending", "download_assets": "pending", "index": "pending"},
         )
         # URL 只存在于当前进程的任务参数中，不写入 jobs 表或日志。
         background_tasks.add_task(process_intake, job_id, url)
@@ -612,6 +630,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                     "status": result["status"],
                     "note_id": result["note"]["note_id"],
                     "title": result["note"]["title"],
+                    # 批量导入最关心的就是"哪几条现在能搜到"，直接放在每条结果里。
+                    "searchable": bool(result["index"].get("searchable")),
+                    "index_status": result["index"].get("status"),
                     "error": None,
                 })
             except ImportProblem as exc:
@@ -844,12 +865,15 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         except httpx.HTTPError as exc:
             _error_code, message = classify_network_error(exc)
             raise HTTPException(502, detail=message) from None
+        # 正文变了，旧的分块与向量就过期了；刷新后立刻重建，
+        # 避免"刷新过正文反而搜不到"——用户刚从来源页更新过内容。
+        index = await asyncio.to_thread(indexing.index_safely, app.state.store, note_id)
         return {
             "status": "refreshed",
             "note": refreshed,
+            "index": index,
             "next_steps": [
                 f"POST /notes/{note_id}/assets/download",
-                f"POST /notes/{note_id}/index",
                 f"POST /notes/{note_id}/analyze?force=true",
             ],
         }
