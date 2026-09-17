@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>小红书知识库 · 工作台</title>
+  <link rel="stylesheet" href="/ui/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">小红书知识库 · 工作台</div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-view="notes">笔记库</button>
+      <button class="tab" data-view="folders">收藏夹</button>
+      <button class="tab" data-view="search">检索</button>
+      <button class="tab" data-view="chat">对话</button>
+      <button class="tab" data-view="tasks">待办</button>
+    </nav>
+    <div class="health" id="health" title="后端状态">…</div>
+  </header>
+
+  <main class="content">
+    <!-- 笔记库 -->
+    <section class="view active" id="view-notes">
+      <div class="toolbar">
+        <textarea id="import-box" placeholder="粘贴小红书分享链接，每行一个，批量导入到收件箱…"></textarea>
+        <div class="toolbar-actions">
+          <button id="btn-import" class="primary">批量导入</button>
+          <button id="btn-read-all" class="ghost" title="为所有已下载图片的笔记补读图（会消耗视觉模型额度）">全部补读图</button>
+          <button id="btn-refresh-notes" class="ghost">刷新</button>
+        </div>
+        <div id="import-result" class="hint"></div>
+      </div>
+      <div class="split">
+        <ul class="note-list" id="note-list"></ul>
+        <div class="note-detail" id="note-detail">
+          <p class="muted">从左侧选择一篇笔记查看详情。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 收藏夹 -->
+    <section class="view" id="view-folders">
+      <div class="toolbar">
+        <input id="folder-name" placeholder="新收藏夹名称" />
+        <input id="folder-desc" placeholder="一句话用途（可选）" />
+        <button id="btn-new-folder" class="primary">新建收藏夹</button>
+        <button id="btn-refresh-folders" class="ghost">刷新</button>
+      </div>
+      <div class="split">
+        <ul class="note-list" id="folder-list"></ul>
+        <div class="note-detail" id="folder-notes">
+          <p class="muted">选择收藏夹查看其中笔记。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 检索 -->
+    <section class="view" id="view-search">
+      <div class="toolbar">
+        <input id="search-box" placeholder="用自然语言提问，例如：面经里提到哪些公司的笔试？" />
+        <select id="search-mode">
+          <option value="vector">纯向量</option>
+          <option value="hybrid" selected>混合检索</option>
+          <option value="weighted">加权</option>
+        </select>
+        <button id="btn-search" class="primary">检索</button>
+      </div>
+      <ul class="result-list" id="search-results"></ul>
+    </section>
+
+    <!-- 对话 -->
+    <section class="view" id="view-chat">
+      <div class="toolbar">
+        <button id="btn-new-thread" class="primary">新建对话</button>
+        <span id="thread-id" class="muted"></span>
+      </div>
+      <div class="chat-box" id="chat-box"></div>
+      <div class="chat-input">
+        <textarea id="chat-text" placeholder="向知识库助手提问…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button id="btn-send" class="primary">发送</button>
+      </div>
+    </section>
+
+    <!-- 待办 -->
+    <section class="view" id="view-tasks">
+      <div class="toolbar">
+        <button id="btn-refresh-tasks" class="primary">刷新待办</button>
+        <select id="task-filter">
+          <option value="">全部</option>
+          <option value="pending">待办</option>
+          <option value="completed">已完成</option>
+          <option value="cancelled">已取消</option>
+        </select>
+      </div>
+      <ul class="result-list" id="task-list"></ul>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

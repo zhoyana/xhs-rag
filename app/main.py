@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -30,6 +31,7 @@ from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
 from . import indexing, xhs_source
+from .xhs_vision import apply_image_text, transcribe_local_files
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
     blob_to_vector,
@@ -92,6 +94,15 @@ class BatchImportRequest(BaseModel):
         max_length=100000,
         description="批量粘贴内容，可每行一个链接，也可包含小红书分享文案",
     )
+
+
+class ReadImagesRequest(BaseModel):
+    # 批量补读图：指定 note_ids 处理这几篇，all=true 处理全部已入库笔记。
+    # 两种都不给则报错——避免"all=true 误触"把整库笔记都拿去读图烧钱。
+    note_ids: list[str] | None = Field(
+        default=None, max_length=100, description="只补读这些笔记；与 all 二选一")
+    all: bool = Field(default=False, description="为 True 时处理全部已入库笔记")
+    force: bool = Field(default=False, description="即使已有图片文字也重新读图")
 
 
 class RefreshSourceRequest(BaseModel):
@@ -1096,6 +1107,90 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return FileResponse(storage_path(app.state.media_root, asset["storage_key"]),
                             media_type=asset["mime_type"], headers={"X-Content-Type-Options": "nosniff"})
 
+    def _local_image_paths(note_id: str) -> list:
+        # 只收集本机已落盘、指纹校验通过的图片，避免拿损坏或缺失文件去读图。
+        paths = []
+        for asset in app.state.store.assets(note_id):
+            if local_file_valid(app.state.media_root, asset):
+                paths.append(storage_path(app.state.media_root, asset["storage_key"]))
+        return paths
+
+    @app.post("/notes/{note_id}/read-images",
+              summary="为已入库笔记补读本地图片，识别文字并重建索引")
+    async def read_note_images(note_id: str,
+                               force: bool = Query(False, description="即使已有图片文字也重新读图")):
+        note = get_note(note_id)
+        # 默认不重复烧钱：已经有图片文字的笔记直接跳过，除非显式 force。
+        if not force and str(note.get("image_text") or "").strip():
+            return {"status": "skipped", "reason": "已有图片文字，使用 force=true 可重读",
+                    "note_id": note_id, "read": 0}
+        local_paths = _local_image_paths(note_id)
+        if not local_paths:
+            # 没有本地图就补不了：先下载图片再来，避免假装读图成功。
+            return {"status": "no_local_images",
+                    "reason": "这篇笔记还没有可读取的本地图片，请先下载图片。",
+                    "note_id": note_id, "read": 0}
+        try:
+            vision = await transcribe_local_files(local_paths, title=note.get("title", ""))
+        except AIProblem as exc:
+            raise HTTPException(502, detail=str(exc)) from None
+        except Exception:  # noqa: BLE001 - 视觉调用异常只映射到 502，不泄露细节
+            logger.warning("read_images_failed note_id=%s", note_id, exc_info=True)
+            raise HTTPException(502, detail="视觉模型调用失败，请确认 DEEPSEEK_API_KEY 已配置。") from None
+        apply_image_text(note, vision)
+        # 图已在本机，写回 payload 即可，不必再联网；save 是 INSERT OR IGNORE，
+        # 对已有笔记无效，所以用 update_note_fields 就地更新这几个派生字段。
+        app.state.store.update_note_fields(note_id, {
+            "image_text": note.get("image_text"),
+            "image_count": note.get("image_count"),
+            "warnings": note.get("warnings", []),
+        })
+        # 图片文字并入正文后，旧分块与向量过期，重建索引让笔记可被检索到。
+        index = await asyncio.to_thread(indexing.index_safely, app.state.store, note_id)
+        return {"status": "ok" if vision["status"] in ("ok", "partial") else vision["status"],
+                "note_id": note_id, "read": vision.get("read"), "vision": vision, "index": index}
+
+    @app.post("/notes/read-images", summary="批量补读已入库笔记的本地图片")
+    async def read_images_batch(body: ReadImagesRequest):
+        store = app.state.store
+        if body.all:
+            note_ids = [n["note_id"] for n in store.list(limit=1000)]
+        elif body.note_ids:
+            note_ids = body.note_ids
+        else:
+            raise HTTPException(400, detail="请提供 note_ids 或设置 all=true。")
+        results = []
+        for note_id in note_ids:
+            note = store.get(note_id)
+            if note is None:
+                results.append({"note_id": note_id, "status": "not_found"}); continue
+            if not body.force and str(note.get("image_text") or "").strip():
+                results.append({"note_id": note_id, "status": "skipped",
+                                "reason": "已有图片文字"}); continue
+            local_paths = _local_image_paths(note_id)
+            if not local_paths:
+                results.append({"note_id": note_id, "status": "no_local_images"}); continue
+            try:
+                vision = await transcribe_local_files(local_paths, title=note.get("title", ""))
+            except Exception:  # noqa: BLE001
+                logger.warning("read_images_batch_failed note_id=%s", note_id, exc_info=True)
+                results.append({"note_id": note_id, "status": "vision_failed"}); continue
+            apply_image_text(note, vision)
+            store.update_note_fields(note_id, {
+                "image_text": note.get("image_text"),
+                "image_count": note.get("image_count"),
+                "warnings": note.get("warnings", []),
+            })
+            index = await asyncio.to_thread(indexing.index_safely, store, note_id)
+            results.append({
+                "note_id": note_id,
+                "status": "ok" if vision["status"] in ("ok", "partial") else vision["status"],
+                "read": vision.get("read"),
+                "searchable": bool(index.get("searchable")),
+            })
+        succeeded = sum(1 for r in results if r["status"] in ("ok", "partial"))
+        return {"total": len(results), "succeeded": succeeded, "items": results}
+
     @app.post("/notes/{note_id}/analyze", summary="用 DeepSeek 分析文字和图片")
     async def analyze(note_id: str, force: bool = Query(False, description="是否忽略缓存并重新付费分析")):
         note = get_note(note_id)
@@ -1368,6 +1463,15 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return app.state.store.update_memory(
             memory_id, {"status": "dismissed"}, datetime.now(timezone.utc).isoformat()
         )
+
+    # 单页前端：由后端直接托管，与 API 同源，免去跨域与额外构建步骤。
+    # html=True 让 /ui/ 直接返回 index.html；子路径（/ui/app.js 等）按文件返回。
+    # 开发时也可把 app/web 软链到任意静态服务器，只要同源即可调用下面这些接口。
+    web_dir = Path(__file__).resolve().parent / "web"
+    if web_dir.is_dir():
+        app.mount("/ui", StaticFiles(directory=str(web_dir), html=True), name="web")
+    else:
+        logger.warning("web_dir_missing path=%s", web_dir)
 
     return app
 

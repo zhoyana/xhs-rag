@@ -236,6 +236,25 @@ class NoteStore:
         # 返回数据库实际保存的内容和“是否新建”；重复时读回原来的记录。
         return self.get(note["note_id"]), created
 
+    def update_note_fields(self, note_id, fields):
+        """就地更新已存在笔记的部分字段并写回。
+
+        save() 是 INSERT OR IGNORE，对已经入库的笔记无效——这正是"补读图"
+        这类事后修正需要的入口：读回 payload、改几个字段、整体写回，保证
+        图片文字、警告、图片计数这些派生数据跟原文一起留在同一份 JSON 里。
+        字段缺失时跳过，不强制调用方补齐整篇笔记。
+        """
+        note = self.get(note_id)
+        if note is None:
+            return None
+        for key, value in fields.items():
+            if value is not None:
+                note[key] = value
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE notes SET payload = ? WHERE note_id = ?",
+                       (json.dumps(note, ensure_ascii=False), note_id))
+        return note
+
     def create_plan(self, title, goal, source_note_ids, items, now):
         """在一个事务中创建计划和所有步骤，避免只保存半个计划。"""
         with closing(sqlite3.connect(self.path)) as db, db:

@@ -17,6 +17,7 @@
 import base64
 import logging
 import os
+from pathlib import Path
 
 import httpx
 
@@ -214,6 +215,77 @@ async def transcribe_images(images, *, title: str = "", max_images: int = MAX_IM
     return result
 
 
+async def transcribe_local_files(paths, *, title: str = "", max_images: int = MAX_IMAGES,
+                                  call_model=None) -> dict:
+    """读本地已落盘图片并转写，返回与 transcribe_images 同结构的字典。
+
+    用于"已入库笔记补读图"：图片已经下载到本机 media 目录，不需要再走 URL
+    下载（原始图床地址可能已失效，且重新下载既慢又可能触发限流）。本地文件
+    直接读字节、转 Base64 交给视觉模型，逻辑与 transcribe_images 完全对称，
+    只是把"下载"换成"读盘"。单张失败不牵连其余，与在线版保持同一稳定性策略。
+    """
+    call_model = call_model or _default_complete
+    # 只保留真实存在且未超体积上限的文件；drop 计数用于结果里提示跳过了几张。
+    usable, dropped = [], 0
+    for path in paths or []:
+        if len(usable) >= max_images:
+            dropped += 1
+            continue
+        p = Path(path)
+        if p.is_file():
+            usable.append(p)
+        else:
+            dropped += 1
+    result = {"status": "empty", "text": "", "model": "", "error": None,
+              "read": 0, "dropped": dropped}
+
+    if not usable:
+        return result
+
+    total = len(usable)
+    sections, failed = [], []
+    for index, path in enumerate(usable, 1):
+        try:
+            data = path.read_bytes()
+            if len(data) > MAX_IMAGE_BYTES:
+                logger.warning("xhs_vision_local_too_large index=%d", index)
+                failed.append(index)
+                continue
+            suffix = path.suffix.lower().lstrip(".")
+            mime = _MIME_BY_EXT.get(suffix) or "image/jpeg"
+        except OSError:
+            logger.warning("xhs_vision_local_read_failed index=%d", index, exc_info=True)
+            failed.append(index)
+            continue
+        content = [
+            {"type": "text", "text": TRANSCRIBE_PROMPT.format(index=index, total=total)
+             + (f"\n笔记标题：{title}" if title else "")},
+            {"type": "image_url", "image_url": {
+                "url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
+                "detail": "original",
+            }},
+        ]
+        text = await _transcribe_one(index, content, call_model)
+        if text:
+            sections.append(f"【第 {index} 张图】\n{text}")
+        else:
+            failed.append(index)
+
+    if not sections:
+        result["status"] = "failed"
+        result["error"] = "所有图片都没有读出文字。"
+        return result
+
+    result.update({
+        "status": "ok" if not failed else "partial",
+        "text": "\n\n".join(sections),
+        "model": os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip(),
+        "read": len(sections),
+        "failed": failed,
+    })
+    return result
+
+
 def apply_image_text(note: dict, vision: dict) -> None:
     """把读图结果并进 note，并同步修正 warnings。
 
@@ -238,4 +310,4 @@ def apply_image_text(note: dict, vision: dict) -> None:
 
 
 __all__ = ["MAX_IMAGES", "TRANSCRIBE_PROMPT", "allowed_image_url", "transcribe_images",
-           "apply_image_text"]
+           "transcribe_local_files", "apply_image_text"]
