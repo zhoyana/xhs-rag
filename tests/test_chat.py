@@ -111,3 +111,53 @@ def test_explicit_plan_request_forces_draft_tool_when_model_only_writes_text():
     assert model.was_forced is True
     assert result["plan_id"] == 12
     assert result["tool_calls"][0]["name"] == "draft_plan"
+
+
+def test_normalize_tool_result_flattens_mcp_content_blocks():
+    """MCP 工具返回 content blocks 列表，本地工具返回自研 dict，编排层要抹平。"""
+    from app.chat_agent import normalize_tool_result
+
+    blocks = [{"type": "text", "text": '{"title":'}, {"type": "text", "text": '"面经"}'}]
+    result = normalize_tool_result(blocks)
+    assert result["ok"] is True
+    # 分块是同一份内容的切片，必须直接相连，不能插入换行。
+    assert result["data"] == '{"title":"面经"}'
+
+    already = {"ok": True, "data": 1, "error": None}
+    assert normalize_tool_result(already) is already
+    assert normalize_tool_result("纯文本")["data"] == "纯文本"
+
+
+def test_agent_survives_tool_returning_content_blocks():
+    """真机 bug 回归：站外 MCP 工具返回列表时，旧代码在下游 .get() 直接崩。"""
+    from langchain_core.tools import StructuredTool
+
+    class ToolCallingModel:
+        def __init__(self):
+            self.calls = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "collect_note_by_link", "args": {"link": "https://x/1"},
+                    "id": "call-1", "type": "tool_call",
+                }])
+            return AIMessage(content="这篇笔记讲的是多 Agent 协作。")
+
+    async def remote_tool(link: str) -> list:
+        # langchain-mcp-adapters 包装后的真实返回形态。
+        return [{"type": "text", "text": '{"title": "面经"}'}]
+
+    tool = StructuredTool.from_function(coroutine=remote_tool,
+                                        name="collect_note_by_link", description="测试")
+    result = asyncio.run(run_agent_turn(
+        [{"role": "user", "content": "帮我把这个链接收藏进来"}],
+        [tool], model=ToolCallingModel(),
+    ))
+    assert result["tool_calls"][0]["name"] == "collect_note_by_link"
+    assert result["tool_calls"][0]["ok"] is True
+    assert "多 Agent 协作" in result["content"]

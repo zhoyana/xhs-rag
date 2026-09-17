@@ -253,6 +253,68 @@ def test_intake_failure_is_visible_in_persistent_job(tmp_path, monkeypatch):
     assert job["error"] == "无法连接来源站点。"
 
 
+async def _no_mcp(_url):
+    """模拟"这条通道用不了"，用来验证收件箱的降级链路。"""
+    return None
+
+
+def test_intake_prefers_mcp_and_records_source(tmp_path, monkeypatch):
+    """统一收件优先走 MCP 采集，并把采集来源写进任务，便于排查空壳笔记。"""
+    async def fake_collect(_url, **_kwargs):
+        return {"note_id": "abc123", "title": "MCP 标题", "content": "MCP 采到的正文内容",
+                "source_url": URL, "images": [], "kind": "normal",
+                "warnings": []}, "mcp"
+
+    async def exploding_fetch(_url):
+        raise AssertionError("MCP 已采到时不应再请求网页")
+
+    monkeypatch.setattr("app.xhs_source.collect_note", fake_collect)
+    monkeypatch.setattr("app.main.fetch_page", exploding_fetch)
+
+    with TestClient(create_app(tmp_path / "intake-mcp.sqlite3")) as client:
+        response = client.post("/notes/intake", json={"share_text": URL})
+        job = client.get(f"/jobs/{response.json()['job_id']}").json()
+
+    assert job["status"] == "completed"
+    assert job["result"]["source"] == "mcp"
+    assert job["note_id"] == "abc123"
+
+
+def test_intake_falls_back_to_html_when_mcp_is_unusable(tmp_path, monkeypatch):
+    """MCP 用不了时必须继续用网页解析，收件箱不能因此整单失败。"""
+    async def fake_fetch(_url):
+        return fixture_html("回退正文"), URL
+
+    def fake_download(_store, _note, _root):
+        return {"status": "complete", "total": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+
+    monkeypatch.setattr("app.xhs_source.collect_via_mcp", _no_mcp)
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    monkeypatch.setattr("app.main.download_note_assets", fake_download)
+
+    with TestClient(create_app(tmp_path / "intake-fallback.sqlite3")) as client:
+        response = client.post("/notes/intake", json={"share_text": URL})
+        job = client.get(f"/jobs/{response.json()['job_id']}").json()
+
+    assert job["status"] == "completed"
+    assert job["result"]["source"] == "html"
+    assert job["note_id"] == "abc123"
+
+
+def test_single_import_reports_its_collection_source(tmp_path, monkeypatch):
+    """单条导入接口同样回报来源，方便前端和日志对照。"""
+    async def fake_fetch(_url):
+        return fixture_html("导入正文"), URL
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+
+    with TestClient(create_app(tmp_path / "import-source.sqlite3")) as client:
+        response = client.post("/notes/import", json={"share_text": URL})
+
+    assert response.status_code == 200
+    assert response.json()["source"] == "html"
+
+
 def test_jobs_left_running_are_marked_interrupted_after_restart(tmp_path):
     from app.database import NoteStore
 
