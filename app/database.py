@@ -424,6 +424,50 @@ class NoteStore:
             message_id = cursor.lastrowid
         return next(item for item in self.thread(thread_id)["messages"] if item["id"] == message_id)
 
+    def list_threads(self, limit=50):
+        """列出会话，附消息条数与最后一条消息预览，供前端侧边栏展示历史。
+
+        侧边栏要一眼看出"这个会话聊到哪了"，所以预览压成一行并截断到 80 字；
+        用相关子查询取最后一条消息，避免把所有消息都读进内存。
+        """
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""
+                SELECT t.id, t.title, t.created_at, t.updated_at,
+                    (SELECT COUNT(*) FROM chat_messages m
+                      WHERE m.thread_id = t.id) AS message_count,
+                    (SELECT m.role FROM chat_messages m
+                      WHERE m.thread_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_role,
+                    (SELECT m.content FROM chat_messages m
+                      WHERE m.thread_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message
+                FROM chat_threads t
+                ORDER BY t.updated_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            preview = item.pop("last_message") or ""
+            item["last_message"] = " ".join(preview.split())[:80]
+            items.append(item)
+        return items
+
+    def rename_thread(self, thread_id, title, now):
+        """改标题只动 chat_threads；顺便刷新 updated_at，让侧边栏顺序跟手。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            cursor = db.execute("UPDATE chat_threads SET title=?, updated_at=? WHERE id=?",
+                                (title, now, thread_id))
+            updated = cursor.rowcount
+        return self.thread(thread_id) if updated else None
+
+    def delete_thread(self, thread_id):
+        """删除会话及其消息，返回是否真的删到了记录（接口层据此决定 404）。"""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("DELETE FROM chat_messages WHERE thread_id=?", (thread_id,))
+            cursor = db.execute("DELETE FROM chat_threads WHERE id=?", (thread_id,))
+            deleted = cursor.rowcount
+        return deleted > 0
+
     def create_job(self, job_id, job_type, now, progress):
         """先持久化 queued 记录，再安排后台工作，避免任务没有可查询的 ID。"""
         with closing(sqlite3.connect(self.path)) as db, db:

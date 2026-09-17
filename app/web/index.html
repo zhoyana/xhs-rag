@@ -69,16 +69,51 @@
       <ul class="result-list" id="search-results"></ul>
     </section>
 
-    <!-- 对话 -->
+    <!-- 对话（Codex 风格：左侧会话历史 + 右侧消息流 + 底部输入区） -->
     <section class="view" id="view-chat">
-      <div class="toolbar">
-        <button id="btn-new-thread" class="primary">新建对话</button>
-        <span id="thread-id" class="muted"></span>
-      </div>
-      <div class="chat-box" id="chat-box"></div>
-      <div class="chat-input">
-        <textarea id="chat-text" placeholder="向知识库助手提问…（Enter 发送，Shift+Enter 换行）"></textarea>
-        <button id="btn-send" class="primary">发送</button>
+      <div class="chat-shell">
+        <aside class="chat-side">
+          <div class="chat-side-head">
+            <button id="btn-new-thread" class="primary block">＋ 新建对话</button>
+            <input id="thread-filter" placeholder="搜索会话标题…" />
+          </div>
+          <div class="chat-thread-list" id="thread-list"></div>
+          <div class="chat-side-foot">
+            <span id="thread-count" class="muted"></span>
+            <button id="btn-toggle-theme" class="ghost">切换主题</button>
+          </div>
+        </aside>
+
+        <div class="chat-main">
+          <header class="chat-head">
+            <div class="chat-title-wrap">
+              <input id="thread-title" class="chat-title" placeholder="未命名对话" />
+              <span id="thread-meta" class="muted"></span>
+            </div>
+            <div class="chat-head-actions">
+              <button id="btn-consolidate" class="ghost" title="把这段对话里暴露的长期偏好提炼成记忆候选，供你审核">提炼记忆</button>
+              <button id="btn-delete-thread" class="ghost danger">删除对话</button>
+            </div>
+          </header>
+
+          <div class="chat-scroll" id="chat-scroll">
+            <div class="chat-stream" id="chat-stream"></div>
+          </div>
+
+          <button id="btn-jump-bottom" class="jump-bottom">↓ 回到最新</button>
+
+          <div class="composer">
+            <div class="composer-box">
+              <textarea id="chat-text" rows="1"
+                placeholder="问点什么…例如：我收藏的面经里笔试都考什么？（Enter 发送，Shift+Enter 换行）"></textarea>
+              <button id="btn-send" class="send" title="发送（Enter）">↑</button>
+            </div>
+            <div class="composer-hint">
+              <span>Enter 发送 · Shift+Enter 换行 · 回答只依据你收藏的笔记，并标注出处</span>
+              <span id="composer-status" class="muted"></span>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 

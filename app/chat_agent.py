@@ -88,6 +88,50 @@ def deepseek_chat_model():
     )
 
 
+def seed_messages(history: list[dict]) -> list:
+    """把库里的历史消息还原成模型消息，并补上“上一轮引用过的笔记 ID”。
+
+    数据库中的来源元数据比从自然语言里重新猜 ID 更可靠，所以引用的笔记直接作为
+    系统消息注入，供下一轮复用。流式与非流式两条链路共用这段铺垫，避免逻辑漂移。
+    """
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    messages = [SystemMessage(content=SYSTEM_PROMPT.format(today=today))]
+    for item in history:
+        message_type = HumanMessage if item["role"] == "user" else AIMessage
+        messages.append(message_type(content=item["content"]))
+        cited = item.get("metadata", {}).get("cited_note_ids", [])
+        if item["role"] == "assistant" and cited:
+            messages.append(SystemMessage(
+                content=f"上一轮已引用且可继续使用的笔记 ID：{', '.join(cited)}"
+            ))
+    return messages
+
+
+def cited_ids_for(content: str, viewed_note_ids: list, retrieved_note_ids: list) -> list:
+    """引用来源只认“模型真的用过”的：展开过全文的，或回答里点名 ID 的。"""
+    cited = list(viewed_note_ids)
+    cited.extend(note_id for note_id in retrieved_note_ids
+                 if note_id in content or note_id[:8] in content)
+    return list(dict.fromkeys(cited))
+
+
+def build_trace(call: dict, result: dict, duration_ms: float) -> dict:
+    """把一次工具调用压成可展示、可回归的轨迹记录（不含工具返回的正文）。"""
+    data = result.get("data")
+    error = result.get("error")
+    scores = ([item.get("score") for item in data
+               if isinstance(item.get("score"), (int, float))]
+              if isinstance(data, list) else [])
+    return {
+        "name": call["name"], "args": call["args"], "ok": result.get("ok", False),
+        "duration_ms": duration_ms,
+        "result_count": len(data) if isinstance(data, list) else None,
+        "top_score": max(scores) if scores else None,
+        "error_code": (error.get("code") if isinstance(error, dict)
+                       else "validation_error" if error else None),
+    }
+
+
 async def run_agent_turn(
     history: list[dict], tools: list, model=None, max_rounds: int = 6,
     required_tool: str | None = None,
@@ -98,17 +142,7 @@ async def run_agent_turn(
     """
     llm = model or deepseek_chat_model()
     model_with_tools = llm.bind_tools(tools)
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    messages = [SystemMessage(content=SYSTEM_PROMPT.format(today=today))]
-    for item in history:
-        message_type = HumanMessage if item["role"] == "user" else AIMessage
-        messages.append(message_type(content=item["content"]))
-        # 数据库中的来源元数据比从自然语言中重新猜 ID 更可靠，供下一轮直接复用。
-        cited = item.get("metadata", {}).get("cited_note_ids", [])
-        if item["role"] == "assistant" and cited:
-            messages.append(SystemMessage(
-                content=f"上一轮已引用且可继续使用的笔记 ID：{', '.join(cited)}"
-            ))
+    messages = seed_messages(history)
 
     tool_map = {tool.name: tool for tool in tools}
     traces, retrieved_note_ids, viewed_note_ids, plan_id = [], [], [], None
@@ -131,10 +165,7 @@ async def run_agent_turn(
                 continue
             content = response.content if isinstance(response.content, str) else str(response.content)
             # cited 只记录模型最终回答中出现过，或通过 get_note 明确展开过的来源。
-            cited = list(viewed_note_ids)
-            cited.extend(note_id for note_id in retrieved_note_ids
-                         if note_id in content or note_id[:8] in content)
-            cited = list(dict.fromkeys(cited))
+            cited = cited_ids_for(content, viewed_note_ids, retrieved_note_ids)
             return {
                 "content": content,
                 "tool_calls": traces,
@@ -159,18 +190,7 @@ async def run_agent_turn(
                 except Exception as exc:  # 工具失败应回传给模型，让它解释或换策略。
                     result = {"ok": False, "data": None, "error": safe_tool_error(exc)}
             data = result.get("data")
-            error = result.get("error")
-            scores = ([item.get("score") for item in data
-                       if isinstance(item.get("score"), (int, float))]
-                      if isinstance(data, list) else [])
-            trace = {
-                "name": call["name"], "args": call["args"], "ok": result.get("ok", False),
-                "duration_ms": round((perf_counter() - started) * 1000, 1),
-                "result_count": len(data) if isinstance(data, list) else None,
-                "top_score": max(scores) if scores else None,
-                "error_code": (error.get("code") if isinstance(error, dict)
-                               else "validation_error" if error else None),
-            }
+            trace = build_trace(call, result, round((perf_counter() - started) * 1000, 1))
             traces.append(trace)
             if call["name"] == "search_notes" and result.get("ok"):
                 retrieved_note_ids.extend(item["note_id"] for item in result["data"] if item.get("note_id"))
@@ -186,3 +206,98 @@ async def run_agent_turn(
                 tool_call_id=call["id"],
             ))
     raise RuntimeError("Agent 工具调用次数过多，请缩小问题范围后重试。")
+
+
+async def run_agent_turn_stream(
+    history: list[dict], tools: list, model=None, max_rounds: int = 6,
+    required_tool: str | None = None,
+):
+    """与 run_agent_turn 同一套策略，但把过程作为事件流吐给前端。
+
+    一次性版本要等模型全部说完才返回，界面上只能干等；流式版把“检索 → 读原文 →
+    逐字作答”的过程暴露出来，才有看得见过程的对话体验。事件类型：
+
+    - delta      文本增量（逐字追加到当前气泡）
+    - reset      丢弃本段草稿：模型该调工具却想直接作答，编排层要求它重来
+    - tool_start 工具开始执行（名字 + 参数，可展示成一行步骤）
+    - tool_end   工具执行结束（耗时 / 命中条数 / 错误码）
+    - done       本轮收尾（附引用笔记、计划 ID 等元数据，前端据此处落库结果）
+    - error      失败（前端据此提示，不必再等回复）
+
+    工具失败照样回传给模型、仍由 max_rounds 兜住死循环——安全策略与一次性版本一致。
+    """
+    llm = model or deepseek_chat_model()
+    model_with_tools = llm.bind_tools(tools)
+    messages = seed_messages(history)
+
+    tool_map = {tool.name: tool for tool in tools}
+    traces, retrieved_note_ids, viewed_note_ids, plan_id = [], [], [], None
+    attempted_tools: set[str] = set()
+    force_required_next = False
+    for _ in range(max_rounds):
+        round_model = (llm.bind_tools(tools, tool_choice=required_tool)
+                       if force_required_next and required_tool else model_with_tools)
+        gathered = None
+        # AIMessageChunk 支持累加：只有拼回完整消息才能进下一轮上下文，
+        # 否则模型会看不见自己刚才发起的 tool_calls。
+        async for chunk in round_model.astream(messages):
+            gathered = chunk if gathered is None else gathered + chunk
+            piece = chunk.content if isinstance(chunk.content, str) else ""
+            if piece:
+                yield {"type": "delta", "text": piece}
+        messages.append(gathered)
+
+        if not gathered.tool_calls:
+            if required_tool and required_tool not in attempted_tools:
+                messages.append(HumanMessage(content=(
+                    f"用户明确要求生成可保存的计划草案。不要直接输出文字计划；"
+                    f"现在必须调用 {required_tool}，并使用已检索或上一轮引用的笔记 ID。"
+                )))
+                force_required_next = True
+                # 刚吐出去的只是模型的“口头答应”，不是答案，通知前端丢弃这段草稿。
+                yield {"type": "reset"}
+                continue
+            content = gathered.content if isinstance(gathered.content, str) else str(gathered.content)
+            yield {
+                "type": "done",
+                "content": content,
+                "tool_calls": traces,
+                "retrieved_note_ids": list(dict.fromkeys(retrieved_note_ids)),
+                "cited_note_ids": cited_ids_for(content, viewed_note_ids, retrieved_note_ids),
+                "plan_id": plan_id,
+            }
+            return
+
+        for call in gathered.tool_calls:
+            attempted_tools.add(call["name"])
+            force_required_next = False
+            tool = tool_map.get(call["name"])
+            yield {"type": "tool_start", "name": call["name"], "args": call["args"]}
+            started = perf_counter()
+            if tool is None:
+                result = {"ok": False, "data": None,
+                          "error": {"code": "unknown_tool", "message": "工具不存在"}}
+            else:
+                try:
+                    result = normalize_tool_result(await tool.ainvoke(call["args"]))
+                except Exception as exc:
+                    result = {"ok": False, "data": None, "error": safe_tool_error(exc)}
+            data = result.get("data")
+            trace = build_trace(call, result, round((perf_counter() - started) * 1000, 1))
+            traces.append(trace)
+            if call["name"] == "search_notes" and result.get("ok"):
+                retrieved_note_ids.extend(item["note_id"] for item in result["data"] if item.get("note_id"))
+            if call["name"] == "get_note" and result.get("ok") and isinstance(data, dict):
+                if data.get("note_id"):
+                    viewed_note_ids.append(data["note_id"])
+            if call["name"] == "draft_plan" and result.get("ok"):
+                data = result.get("data") or {}
+                plan = data.get("plan", data)
+                plan_id = plan.get("id") if isinstance(plan, dict) else None
+            yield {"type": "tool_end", **trace}
+            messages.append(ToolMessage(
+                content=json.dumps(result, ensure_ascii=False, default=str),
+                tool_call_id=call["id"],
+            ))
+    yield {"type": "error",
+           "message": "Agent 工具调用次数过多，请缩小问题范围后重试。"}

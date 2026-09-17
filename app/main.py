@@ -10,13 +10,14 @@ import os
 import re
 import sqlite3
 import asyncio
+import json
 from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -26,7 +27,7 @@ from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
 from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe, extract_chat_memories_safe
 from .retrieval import search_knowledge
-from .chat_agent import plan_requested, run_agent_turn
+from .chat_agent import plan_requested, run_agent_turn, run_agent_turn_stream
 from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
@@ -194,6 +195,10 @@ class ThreadCreateRequest(BaseModel):
     title: str = Field(default="新对话", min_length=1, max_length=100)
 
 
+class ThreadRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=100, description="新的会话标题")
+
+
 class ChatMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000, description="用户发送给知识库助手的消息")
 
@@ -304,26 +309,50 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         # 返回 Python 字典后，FastAPI 会将它转换为客户端能读取的 JSON。
         return {"status": "ok"}
 
+    @app.get("/threads", summary="列出全部会话（含消息数与最后一条消息预览）")
+    def list_threads(limit: int = Query(default=50, ge=1, le=200)):
+        # 侧边栏要按活跃时间倒序列出历史会话，所以列表里直接带上预览，
+        # 前端不必为每条会话再打一次详情接口。
+        return {"items": app.state.store.list_threads(limit=limit)}
+
     @app.post("/threads", status_code=201, summary="创建知识库对话")
     def create_thread(body: ThreadCreateRequest):
         now = datetime.now(timezone.utc).isoformat()
         return app.state.store.create_thread(str(uuid4()), body.title.strip(), now)
 
-    @app.get("/threads/{thread_id}", summary="查看对话及最近消息")
-    def get_thread(thread_id: str):
-        thread = app.state.store.thread(thread_id)
+    @app.patch("/threads/{thread_id}", summary="重命名会话")
+    def rename_thread(thread_id: str, body: ThreadRenameRequest):
+        thread = app.state.store.rename_thread(
+            thread_id, body.title.strip(), datetime.now(timezone.utc).isoformat()
+        )
         if thread is None:
             raise HTTPException(404, detail="对话不存在。")
         return thread
 
-    @app.post("/threads/{thread_id}/messages", summary="与知识库 Agent 对话")
-    async def send_chat_message(thread_id: str, body: ChatMessageRequest,
-                                background_tasks: BackgroundTasks):
-        if app.state.store.thread(thread_id) is None:
+    @app.delete("/threads/{thread_id}", summary="删除会话及其消息")
+    def delete_thread(thread_id: str):
+        if not app.state.store.delete_thread(thread_id):
             raise HTTPException(404, detail="对话不存在。")
-        now = datetime.now(timezone.utc).isoformat()
-        app.state.store.add_chat_message(thread_id, "user", body.content.strip(), {}, now)
+        return {"deleted": thread_id}
 
+    @app.get("/threads/{thread_id}", summary="查看对话及最近消息")
+    def get_thread(thread_id: str,
+                   message_limit: int | None = Query(default=None, ge=1, le=500)):
+        # 不传 message_limit 时保持原有默认（最近 20 条）；前端要看完整历史时
+        # 才显式加大窗口，避免脚本调用方被动改变语义。
+        store = app.state.store
+        thread = (store.thread(thread_id, message_limit=message_limit)
+                  if message_limit else store.thread(thread_id))
+        if thread is None:
+            raise HTTPException(404, detail="对话不存在。")
+        return thread
+
+    async def chat_tools(wants_plan: bool):
+        """装配一次对话可用的工具：本地知识库工具 + 白名单内的站外 MCP 工具。
+
+        流式与非流式两个入口共用，保证"模型能看见哪些工具"在两处完全一致——
+        工具面一旦分叉，同一条提问会出现两种行为，排查成本极高。
+        """
         def recall(query, limit):
             # Workbuddy 完成向量记忆召回后会自动走新版；当前版本安全退化为最近记忆。
             if hasattr(app.state.store, "recall_memories"):
@@ -336,7 +365,7 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                 goal=goal, source_note_ids=source_note_ids, start_date=start_date
             ))
 
-        tools = build_langchain_tools(
+        built = build_langchain_tools(
             searcher=lambda query, limit: search_knowledge(
                 app.state.store, query, limit, query_embedder=embed_search_query
             ),
@@ -347,13 +376,23 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         # 站外能力（小红书搜索/笔记详情/按链接采集/按链接收藏）来自外部 MCP 服务，
         # 按白名单挂载；服务不可用时静默缩编为纯本地工具，不影响聊天主链路。
         # 传入 store 才会多出"收藏进知识库"这个写工具：没有库就没有写入口。
-        tools = tools + await load_xhs_tools(
+        built = built + await load_xhs_tools(
             store=app.state.store, media_root=app.state.media_root
         )
         # 代码层权限控制比 Prompt 更可靠：普通咨询时模型根本看不到写入型工具。
-        wants_plan = plan_requested(body.content)
         if not wants_plan:
-            tools = [tool for tool in tools if tool.name != "draft_plan"]
+            built = [tool for tool in built if tool.name != "draft_plan"]
+        return built
+
+    @app.post("/threads/{thread_id}/messages", summary="与知识库 Agent 对话")
+    async def send_chat_message(thread_id: str, body: ChatMessageRequest,
+                                background_tasks: BackgroundTasks):
+        if app.state.store.thread(thread_id) is None:
+            raise HTTPException(404, detail="对话不存在。")
+        now = datetime.now(timezone.utc).isoformat()
+        app.state.store.add_chat_message(thread_id, "user", body.content.strip(), {}, now)
+        wants_plan = plan_requested(body.content)
+        tools = await chat_tools(wants_plan)
         # 只发送最近 20 条消息：这是滑动窗口短期记忆，避免上下文无限增长。
         history = app.state.store.thread(thread_id, message_limit=20)["messages"]
         try:
@@ -377,6 +416,66 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         if memory_triggered(body.content):
             background_tasks.add_task(consolidate_thread_memories, thread_id)
         return {"thread_id": thread_id, "message": assistant}
+
+    @app.post("/threads/{thread_id}/messages/stream",
+              summary="与知识库 Agent 对话（SSE 流式，逐字返回并推送工具步骤）")
+    async def stream_chat_message(thread_id: str, body: ChatMessageRequest,
+                                  background_tasks: BackgroundTasks):
+        """SSE 版本的对话入口：边想边推，前端才能显示"正在检索 / 正在读原文"。
+
+        与一次性接口的分工：一次性接口保持原样供脚本与安卓端使用，本接口专供
+        前端工作台。两者共用 chat_tools 与记忆沉淀逻辑，行为不会分叉。
+        """
+        if app.state.store.thread(thread_id) is None:
+            raise HTTPException(404, detail="对话不存在。")
+
+        def sse(payload: dict) -> str:
+            # 每条事件一行 data:，空行结尾——SSE 的帧格式就是这么规定的。
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        async def event_source():
+            # 用户消息先落库：即便模型随后失败，这轮提问也不会凭空消失。
+            app.state.store.add_chat_message(
+                thread_id, "user", body.content.strip(), {},
+                datetime.now(timezone.utc).isoformat(),
+            )
+            wants_plan = plan_requested(body.content)
+            yield sse({"type": "start", "thread_id": thread_id})
+            try:
+                tools = await chat_tools(wants_plan)
+                # 只发送最近 20 条消息：滑动窗口短期记忆，控制上下文成本。
+                history = app.state.store.thread(thread_id, message_limit=20)["messages"]
+                async for event in run_agent_turn_stream(
+                    history, tools, required_tool="draft_plan" if wants_plan else None
+                ):
+                    if event["type"] != "done":
+                        # 中间事件原样透传：delta / tool_start / tool_end / reset。
+                        yield sse(event)
+                        continue
+                    # 落库放在流结束处，保证"界面看到的"和"库里存的"是同一条内容。
+                    assistant = app.state.store.add_chat_message(
+                        thread_id, "assistant", event["content"], {
+                            "tool_calls": event["tool_calls"],
+                            "retrieved_note_ids": event["retrieved_note_ids"],
+                            "cited_note_ids": event["cited_note_ids"],
+                            "source_note_ids": event["cited_note_ids"],
+                            "plan_id": event["plan_id"],
+                        }, datetime.now(timezone.utc).isoformat()
+                    )
+                    if memory_triggered(body.content):
+                        background_tasks.add_task(consolidate_thread_memories, thread_id)
+                    yield sse({"type": "done", "message": assistant})
+            except Exception as exc:
+                # 流已经开始，改不了状态码，只能把失败作为一条事件告诉前端。
+                logger.warning("chat_stream_failed thread_id=%s exception_type=%s",
+                               thread_id, type(exc).__name__)
+                yield sse({"type": "error",
+                           "message": "知识库助手暂时无法回答，请稍后重试。"})
+
+        return StreamingResponse(
+            event_source(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     async def consolidate_thread_memories(thread_id: str):
         """会话 → 长期记忆的沉淀通道（episodic → semantic 固化）。
