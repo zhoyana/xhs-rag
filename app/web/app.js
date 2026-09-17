@@ -472,7 +472,10 @@ async function deleteNote(note) {
   if (!confirm(`彻底删除${title ? `《${title}》` : "这篇笔记"}？\n\n${NOTE_DELETE_WARNING}`)) return;
   try {
     const result = await api("DELETE", `/notes/${noteId}`);
-    toast(`已删除${result.tasks ? `（含 ${result.tasks} 条待办）` : ""}`);
+    const stuck = (result.failed_files && result.failed_files.length) || 0;
+    toast(stuck
+      ? `已删除${result.tasks ? `（含 ${result.tasks} 条待办）` : ""}，但有 ${stuck} 个图片文件没能删除`
+      : `已删除${result.tasks ? `（含 ${result.tasks} 条待办）` : ""}`, stuck > 0);
     selection.notes.delete(noteId);
     clearNoteDetail();
     await refreshAfterNoteDelete();
@@ -496,7 +499,12 @@ async function deletePickedNotes() {
     if (result.tasks_removed) message += `（含 ${result.tasks_removed} 条待办）`;
     // 部分失败用红字提示：整批"看起来成功"而实际少删了，比直接报错更危险。
     if (result.failed.length) message += `；${result.failed.length} 篇没删掉`;
-    toast(message, result.failed.length > 0);
+    // 库删掉了、磁盘上的图片却没删掉时也要说：这类残留不会自己消失，
+    // 不说的话用户以为删干净了，实际 media 目录在慢慢攒孤儿文件。
+    const stuck = result.deleted.reduce(
+      (total, item) => total + ((item.failed_files && item.failed_files.length) || 0), 0);
+    if (stuck) message += `；${stuck} 个图片文件没能删除`;
+    toast(message, result.failed.length > 0 || stuck > 0);
     selection.notes.clear();
     if (ids.includes(currentNoteId)) clearNoteDetail();
     await refreshAfterNoteDelete();
