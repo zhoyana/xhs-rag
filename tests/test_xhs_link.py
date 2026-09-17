@@ -5,9 +5,14 @@ import json
 import pytest
 
 from app import xhs_mcp
+from app.knowledge import note_document
 from app.xhs_link import (
+    MAX_COMMENTS,
+    MAX_REPLIES_PER_COMMENT,
+    MAX_REPLY_CHARS,
     XhsLinkError,
     expand_short_link,
+    extract_comments,
     note_from_feed_detail,
     parse_xhs_link,
 )
@@ -113,10 +118,14 @@ def test_link_without_token_is_reported_not_silently_accepted():
 # ---------------- 返回结构转换 ----------------
 
 def test_note_from_feed_detail_matches_knowledge_base_shape():
-    """产出的 note 必须与 extractor.parse_note 同字段，才能直接入库。"""
+    """产出的 note 必须与 extractor.parse_note 同字段，才能直接入库。
+
+    唯一的例外是 comments：评论区只有 MCP 通道拿得到，网页解析通道不产生这个键，
+    采集侧正是按「有没有 comments」来判断这次采集有没有带上评论。
+    """
     note = note_from_feed_detail(feed_detail_payload())
     assert set(note) == {"note_id", "title", "content", "source_url",
-                         "images", "kind", "warnings"}
+                         "images", "kind", "warnings", "comments"}
     assert note["note_id"] == "6aa3c6ff0000000025036dd4"
     assert note["title"] == "淘宝AI Agent开发面经"
     assert note["kind"] == "normal"
@@ -157,6 +166,103 @@ def test_missing_desc_is_rejected():
 def test_payload_without_note_is_rejected():
     with pytest.raises(XhsLinkError):
         note_from_feed_detail({"data": {"comments": {"list": []}}})
+
+
+# ---------------- 评论 ----------------
+# 字段名全部按 2026-09 的真机实测结果构造，不是照 MCP 文档猜的。
+
+
+def real_comment(**overrides):
+    """一条一级评论；结构照抄真机返回（含那些用不上的冗余字段）。
+
+    `likeCount` 是热度字符串（"1千+"）而不是数字，`userInfo.nickName` 实测是空串——
+    这两个是最容易取错的字段，所以 fixture 里保留原样。
+    """
+    comment = {
+        "id": "6a86aca1000000000200f4ac",
+        "noteId": "6aa3c6ff0000000025036dd4",
+        "content": "真正的泡泡馄饨没有视频里面肉馅那么多[捂脸R]",
+        "likeCount": "1千+",
+        "createTime": 1787210914000,
+        "ipLocation": "江苏",
+        "liked": False,
+        "userInfo": {"userId": "62beb7a6000000001902b56b", "nickname": "流失在外雅门教主",
+                     "nickName": "", "avatar": ""},
+        "subCommentCount": "10+",
+        "subComments": [],
+        "showTags": [],
+    }
+    comment.update(overrides)
+    return comment
+
+
+def payload_with_comments(comments, has_more=False):
+    payload = feed_detail_payload()
+    payload["data"]["comments"] = {"cursor": "abc", "hasMore": has_more, "list": comments}
+    return payload
+
+
+def test_note_keeps_comments():
+    """评论要跟着 note 一起出来，并且取对字段。"""
+    reply = real_comment(id="6a86b7c4", content="喔哦……", likeCount="10+", ipLocation="安徽",
+                         userInfo={"userId": "6895aeb5", "nickname": "一只小夜灯",
+                                   "nickName": "", "avatar": ""},
+                         subComments=None)
+    note = note_from_feed_detail(payload_with_comments([real_comment(subComments=[reply])]))
+
+    assert len(note["comments"]) == 1
+    first = note["comments"][0]
+    assert first["content"].startswith("真正的泡泡馄饨")
+    assert first["author"] == "流失在外雅门教主"     # 取 nickname，不是空串 nickName
+    assert first["like_count"] == "1千+"            # 热度表示原样保留
+    assert first["ip_location"] == "江苏"
+    assert first["replies"][0]["author"] == "一只小夜灯"
+    assert first["replies"][0]["content"] == "喔哦……"
+
+
+def test_missing_or_empty_comments_degrade_to_empty_list():
+    """网页解析通道不产生 comments 键；缺键时必须是空列表，不能报错。"""
+    assert note_from_feed_detail(feed_detail_payload())["comments"] == []
+    assert extract_comments({}) == []
+    assert extract_comments({"note": {}}) == []
+
+
+def test_comments_are_cleaned_and_capped():
+    """空内容评论丢弃；一级评论有条数上限。"""
+    payload = payload_with_comments(
+        [real_comment(content="   ")] + [real_comment(id=f"c{i}") for i in range(MAX_COMMENTS + 5)])
+    comments = note_from_feed_detail(payload)["comments"]
+    assert len(comments) == MAX_COMMENTS
+    assert all(c["content"].strip() for c in comments)
+
+
+def test_replies_are_limited_and_truncated():
+    """二级回复只留前几条，过长的截断——否则工具返回值会被长尾撑大。"""
+    subs = [real_comment(id=f"s{i}", content="回" * (MAX_REPLY_CHARS + 50)) for i in range(5)]
+    replies = note_from_feed_detail(payload_with_comments([real_comment(subComments=subs)]))
+    replies = replies["comments"][0]["replies"]
+    assert len(replies) == MAX_REPLIES_PER_COMMENT
+    assert len(replies[0]["content"]) == MAX_REPLY_CHARS + 1
+    assert replies[0]["content"].endswith("…")
+
+
+def test_extract_comments_tolerates_odd_shapes():
+    """外部返回不可信：不是预期结构时一律退化成空列表，不能抛异常。"""
+    assert extract_comments({"comments": [real_comment()]})      # 直接给数组也认
+    assert extract_comments({"comments": "??"}) == []
+    assert extract_comments({"comments": {"list": None}}) == []
+    assert extract_comments({"comments": {"list": ["不是字典", 123]}}) == []
+
+
+def test_comments_stay_out_of_searchable_text():
+    """评论只落库、不进检索正文——这是刻意选择，别被后来人顺手并进去。
+
+    评论一旦并进正文，一次收藏就会多切出好几个 chunk，检索时可能命中评论而不是
+    笔记本身。要改这个决定，请连同这里一起改。
+    """
+    note = note_from_feed_detail(payload_with_comments([real_comment(content="这段评论不该被检索到")]))
+    assert note["comments"][0]["content"] == "这段评论不该被检索到"
+    assert "这段评论不该被检索到" not in note_document(note).page_content
 
 
 # ---------------- 采集工具 ----------------

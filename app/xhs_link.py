@@ -29,6 +29,14 @@ _TOPIC_PATTERN = re.compile(r"#[^#\s]{1,40}#?")
 # 去掉话题标签后正文短于这个长度，就认为内容主要不在文字里。
 MIN_TEXT_CONTENT = 40
 
+# 评论：MCP 的 get_feed_detail **不传任何参数**就会带回前 10 条一级评论（实测 2026-09），
+# 所以评论是"白拿"的。这里的上限只是防止开了 load_all_comments 之后把上百条评论灌进 note。
+MAX_COMMENTS = 20
+# 每条一级评论最多留几条二级回复，避免"长尾回复"把工具返回值撑大。
+MAX_REPLIES_PER_COMMENT = 3
+# 二级回复多数很短；超过这个长度的基本是复制粘贴的长评，截断即可。
+MAX_REPLY_CHARS = 200
+
 
 def text_body_length(content: str) -> int:
     """去掉话题标签后的正文长度。
@@ -118,11 +126,80 @@ async def expand_short_link(url: str, *, client=None) -> str:
             await client.aclose()
 
 
+def _comment_entry(item) -> dict | None:
+    """把 MCP 的一条评论清洗成紧凑字段；没有正文的评论直接丢弃。"""
+    if not isinstance(item, dict):
+        return None
+    content = str(item.get("content") or "").strip()
+    if not content:
+        return None
+    user = item.get("userInfo") if isinstance(item.get("userInfo"), dict) else {}
+    return {
+        # 昵称在 userInfo.nickname；同一结构里的 nickName 实测是空串，别取错。
+        "author": str(user.get("nickname") or "").strip(),
+        "content": content,
+        # 小红书给的是热度表示（"1千+"）而不是数字，原样保留比硬转成数字更诚实。
+        "like_count": str(item.get("likeCount") or "").strip(),
+        "ip_location": str(item.get("ipLocation") or "").strip(),
+    }
+
+
+def extract_comments(data) -> list[dict]:
+    """从 get_feed_detail 的 payload 里抽出评论（一级 + 精简的二级回复）。
+
+    实测（2026-09）确认的两件事，直接决定了这里怎么写：
+
+    1. 容器与 note **平级**：``data.comments = {"cursor", "hasMore", "list"}``，
+       而且**没有 count/total 字段**，别按总数写代码。
+    2. **不传任何参数，MCP 也会返回前 10 条一级评论**，二级回复也已经带了一部分。
+       所以评论不需要额外开关、不额外耗时——它此前完全是"白拿没要"，
+       payload 里一直都有，只是这里没读 `data.comments` 就丢掉了。
+
+    秋招知识点（外部数据的清洗边界）：评论是不可信输入，只做白名单式取字段，
+    不认识的结构直接忽略，别把整个 dict 原样存进知识库。
+    """
+    if not isinstance(data, dict):
+        return []
+    box = data.get("comments")
+    if isinstance(box, dict):
+        raw = box.get("list")
+    elif isinstance(box, list):
+        raw = box
+    else:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    comments = []
+    for item in raw:
+        entry = _comment_entry(item)
+        if entry is None:
+            continue
+        replies = []
+        subs = item.get("subComments") if isinstance(item, dict) else None
+        if isinstance(subs, list):
+            for sub in subs[:MAX_REPLIES_PER_COMMENT]:
+                reply = _comment_entry(sub)
+                if reply is None:
+                    continue
+                if len(reply["content"]) > MAX_REPLY_CHARS:
+                    reply["content"] = reply["content"][:MAX_REPLY_CHARS] + "…"
+                replies.append(reply)
+        if replies:
+            entry["replies"] = replies
+        comments.append(entry)
+        if len(comments) >= MAX_COMMENTS:
+            break
+    return comments
+
+
 def note_from_feed_detail(payload) -> dict:
     """把 MCP get_feed_detail 的返回转成知识库标准 note。
 
     字段与 extractor.parse_note 对齐，因此产出的 note 可以直接交给
     NoteStore.save() 走原有的入库、素材下载与切分管线。
+
+    比网页解析通道多一个 `comments` 字段（评论区内容），由 extract_comments 抽取。
     """
     if not isinstance(payload, dict):
         raise XhsLinkError("采集返回不是预期的结构。", "payload_invalid")
@@ -175,4 +252,8 @@ def note_from_feed_detail(payload) -> dict:
         "images": images,
         "kind": kind,
         "warnings": warnings,
+        # 评论随笔记一起落库（存进 notes.payload，无需改表结构）。
+        # 这里**始终**带上这个键：采集侧用 `.get("comments")` 判断"这条通道能不能给评论"，
+        # 而网页解析通道不产生该键，于是刷新正文时它会保留上一次采到的评论而不是清空。
+        "comments": extract_comments(data),
     }

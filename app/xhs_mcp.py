@@ -36,6 +36,8 @@ LINK_TOOL_DESCRIPTION = (
     "按小红书链接采集笔记原文，并自动识别图片里的文字。用户直接粘贴小红书链接或分享文案时用它，"
     "比 search_feeds 更准确。小红书很多笔记把正文写在长图里，此时返回值中的 image_text 才是真正的"
     "内容——只要它非空，就必须以它为准来回答，不要再声称无法识别图片。"
+    "返回值里的 comments 是这篇笔记的评论区（一级评论，含部分回复），"
+    "用户问「评论区怎么说」「大家怎么看」这类问题时依据它回答，不要凭正文推测评论。"
     "本工具只读取、不写入知识库；用户要求收藏时改用 save_note_by_link。"
     "链接必须带 xsec_token（从 App 或网页复制的分享链接都带），令牌会过期，"
     "失败就说明链接已失效，应请用户重新复制，不要反复重试。"
@@ -49,6 +51,8 @@ SAVE_TOOL_DESCRIPTION = (
     "收藏时会自动建立语义索引并生成向量，返回的 index.searchable 为 true 表示"
     "这篇笔记现在就能被语义检索到；index.status 为 skipped 说明它没有可检索的正文"
     "（纯图片且未识别出文字），failed 说明索引失败但笔记与图片已经保存好了。"
+    "笔记的评论区（前 10 条一级评论）也会一起存下来，但**评论不参与语义检索**"
+    "——不要对用户说「可以搜到评论」。"
     "返回 note_id、status（imported 新建 / existing 已存在）、图片落盘数量和 index 摘要，"
     "必须按返回值如实汇报，不要编造保存结果。"
 )
@@ -74,7 +78,11 @@ class CollectNoteInput(BaseModel):
     read_images: bool = Field(
         default=True,
         description="是否识别图片里的文字（默认开启）。关闭可更快返回，但图文笔记会拿不到正文。")
-    with_comments: bool = Field(default=False, description="是否加载更多评论，会更慢")
+    with_comments: bool = Field(
+        default=False,
+        description="是否滚动加载更多评论。默认就会带回前 10 条一级评论，"
+                    "这个开关只决定「要不要更多」——会明显变慢，"
+                    "只有用户明确想看评论区时才开启。")
 
 
 class SaveNoteInput(BaseModel):
