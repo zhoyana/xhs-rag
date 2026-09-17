@@ -867,6 +867,79 @@ class NoteStore:
                  json.dumps(actions, ensure_ascii=False), updated_at))
         return self.intent_confirmation(note_id)
 
+    # ---- 收件箱（Inbox）：导入之后的整理队列 ----
+
+    def inbox_notes(self, limit=20):
+        """列出还没有整理结论的笔记。
+
+        判据是"intent_confirmations 里有没有记录"，而不是新增一个队列状态字段：
+        确认、修改、忽略三种结果都会留下记录，所以"有没有记录"天然等价于
+        "用户处理过没有"，不需要再维护第二份状态、也就不会和它不同步。
+        """
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""
+                SELECT n.payload,
+                       (a.note_id IS NOT NULL) AS has_analysis,
+                       (fs.note_id IS NOT NULL) AS has_suggestion
+                FROM notes n
+                LEFT JOIN intent_confirmations ic ON ic.note_id = n.note_id
+                LEFT JOIN analyses a ON a.note_id = n.note_id
+                LEFT JOIN folder_suggestions fs ON fs.note_id = n.note_id
+                WHERE ic.note_id IS NULL
+                ORDER BY n.rowid DESC LIMIT ?""", (limit,)).fetchall()
+        items = []
+        for row in rows:
+            note = json.loads(row["payload"])
+            items.append({
+                "note_id": note.get("note_id"),
+                "title": note.get("title") or "",
+                "created_at": note.get("created_at"),
+                "excerpt": " ".join((note.get("content") or "").split())[:200],
+                "has_analysis": bool(row["has_analysis"]),
+                # 有分析不一定有建议：可能建收藏夹之前就分析过了。
+                "has_suggestion": bool(row["has_suggestion"]),
+            })
+        return items
+
+    def inbox_count(self):
+        """待整理条数，供前端在标签上显示徽标。"""
+        with sqlite3.connect(self.path) as db:
+            row = db.execute("""
+                SELECT COUNT(*) FROM notes n
+                LEFT JOIN intent_confirmations ic ON ic.note_id = n.note_id
+                WHERE ic.note_id IS NULL""").fetchone()
+        return int(row[0])
+
+    def apply_triage(self, note_id, decision, category, intent, actions,
+                     folder_ids, now):
+        """在一个事务里落定整理结论：意图确认 + 归档关系。
+
+        拆成两次写会留下"意图确认了、笔记却没进任何收藏夹"的半成品——卡片从
+        收件箱消失，用户以为整理好了，实际笔记不在任何收藏夹里，且没有任何
+        界面能暴露这件事。同连接同事务提交，要么都成，要么都不变。
+        """
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("""INSERT INTO intent_confirmations
+                (note_id, decision, category, intent, selected_actions, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(note_id) DO UPDATE SET decision=excluded.decision,
+                    category=excluded.category, intent=excluded.intent,
+                    selected_actions=excluded.selected_actions, updated_at=excluded.updated_at""",
+                (note_id, decision, category, intent,
+                 json.dumps(actions, ensure_ascii=False), now))
+            if folder_ids:
+                # 建议行可能不存在（用户直接确认而不走 AI 推荐），UPDATE 落空也没关系：
+                # 归档关系本身写在 note_folders 里，那才是检索收藏夹内容时的数据源。
+                db.execute("""UPDATE folder_suggestions SET status='confirmed',
+                    selected_folder_ids=?, confirmed_at=? WHERE note_id=?""",
+                    (json.dumps(folder_ids), now, note_id))
+                db.executemany("""INSERT OR IGNORE INTO note_folders
+                    (note_id, folder_id, assigned_by, created_at)
+                    VALUES (?, ?, 'ai_confirmed', ?)""",
+                    [(note_id, folder_id, now) for folder_id in folder_ids])
+        return self.intent_confirmation(note_id)
+
     # ---- 记忆层（Memory Layer）----
     # 记忆是意图确认的副产品：确认是主链路，沉淀失败不影响确认接口。
 
@@ -1156,3 +1229,14 @@ class NoteStore:
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", values)
         return self.task(task_id)
+
+    def delete_task(self, task_id):
+        """彻底删除任务行（硬删除）。
+
+        与 update_task(status='cancelled') 是两种不同语义：取消表示"这事我不做了"，
+        记录本身有意义，要留着；删除表示"这条记录本来就是错的"，留下只会污染列表。
+        误建的任务（例如调试时刷出来的空标题）只能靠删除清掉。
+        """
+        with closing(sqlite3.connect(self.path)) as db, db:
+            cursor = db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount == 1

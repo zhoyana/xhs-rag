@@ -4,9 +4,47 @@ import asyncio
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 
-from app.chat_agent import plan_requested, run_agent_turn
+from app.chat_agent import build_hits, plan_requested, run_agent_turn
 from app.main import create_app
 from app.tools import build_langchain_tools
+
+
+def test_build_hits_keeps_display_fields_and_trims_noise():
+    """命中原片是给界面看的，只留必要字段，正文压成单行并截断。"""
+    hits = build_hits([
+        {"note_id": "n1", "title": "面经", "score": 0.83,
+         "content": "第一行\n第二行\t带制表符" + "x" * 400},
+        {"title": "缺少 note_id，无法跳转"},   # 没有 ID 就没法点开，直接丢
+        "不是字典",
+    ])
+    assert len(hits) == 1
+    assert hits[0]["note_id"] == "n1" and hits[0]["score"] == 0.83
+    assert "\n" not in hits[0]["snippet"] and "\t" not in hits[0]["snippet"]
+    assert len(hits[0]["snippet"]) == 240
+    assert build_hits([], limit=3) == []
+    assert build_hits(None) == []
+
+
+def test_build_hits_respects_limit():
+    items = [{"note_id": f"n{i}", "content": "内容"} for i in range(20)]
+    assert len(build_hits(items, limit=5)) == 5
+
+
+def test_one_shot_endpoint_also_persists_retrieved_hits(tmp_path, monkeypatch):
+    """一次性接口（脚本 / 安卓端）也要带上命中片段，两条链路的元数据不能分叉。"""
+
+    async def fake_agent(history, tools, **_kwargs):
+        return {"content": "找到 1 篇。", "tool_calls": [],
+                "retrieved_note_ids": ["n1"], "retrieved_hits": [
+                    {"note_id": "n1", "title": "面经", "score": 0.7, "snippet": "笔试考了什么"}],
+                "cited_note_ids": ["n1"], "source_note_ids": ["n1"], "plan_id": None}
+
+    monkeypatch.setattr("app.main.run_agent_turn", fake_agent)
+    with TestClient(create_app(tmp_path / "hits.sqlite3")) as client:
+        thread_id = client.post("/threads", json={"title": "命中"}).json()["id"]
+        client.post(f"/threads/{thread_id}/messages", json={"content": "笔试考什么"})
+        meta = client.get(f"/threads/{thread_id}").json()["messages"][-1]["metadata"]
+        assert meta["retrieved_hits"][0]["note_id"] == "n1"
 
 
 def test_thread_messages_are_persisted(tmp_path, monkeypatch):

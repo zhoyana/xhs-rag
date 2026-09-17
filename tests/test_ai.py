@@ -52,7 +52,9 @@ def test_analyze_save_cache_and_force(tmp_path, monkeypatch):
     })
 
     calls = []
-    async def fake_analyze(note, assets, media_root, memories=None):
+    # 替身的签名要跟着真实 analyze_note 走：少了 category_hints 就会在接口层
+    # TypeError，而那看起来像是生产代码坏了。
+    async def fake_analyze(note, assets, media_root, memories=None, category_hints=None):
         calls.append(note["note_id"])
         return {
             "summary": "学习 Python 的方法",

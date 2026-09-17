@@ -10,9 +10,9 @@
   <header class="topbar">
     <div class="brand">小红书知识库 · 工作台</div>
     <nav class="tabs" id="tabs">
-      <button class="tab active" data-view="notes">笔记库</button>
+      <button class="tab" data-view="inbox">收件箱<span class="tab-badge" id="inbox-badge" hidden></span></button>
+      <button class="tab" data-view="notes">笔记库</button>
       <button class="tab" data-view="folders">收藏夹</button>
-      <button class="tab" data-view="search">检索</button>
       <button class="tab" data-view="chat">对话</button>
       <button class="tab" data-view="tasks">待办</button>
     </nav>
@@ -20,8 +20,19 @@
   </header>
 
   <main class="content">
+    <!-- 收件箱：导入之后的整理队列。AI 先读、先猜意图、先挑收藏夹，你只需要确认 -->
+    <section class="view" id="view-inbox">
+      <div class="toolbar">
+        <button id="btn-prepare-all" class="primary">让 AI 整理剩余</button>
+        <button id="btn-stop-prepare" class="ghost" hidden>停止分析</button>
+        <span id="inbox-progress" class="hint"></span>
+        <button id="btn-refresh-inbox" class="ghost">刷新</button>
+      </div>
+      <div class="inbox-list" id="inbox-list"></div>
+    </section>
+
     <!-- 笔记库 -->
-    <section class="view active" id="view-notes">
+    <section class="view" id="view-notes">
       <div class="toolbar">
         <textarea id="import-box" placeholder="粘贴小红书分享链接，每行一个，批量导入到收件箱…"></textarea>
         <div class="toolbar-actions">
@@ -55,21 +66,9 @@
       </div>
     </section>
 
-    <!-- 检索 -->
-    <section class="view" id="view-search">
-      <div class="toolbar">
-        <input id="search-box" placeholder="用自然语言提问，例如：面经里提到哪些公司的笔试？" />
-        <select id="search-mode">
-          <option value="vector">纯向量</option>
-          <option value="hybrid" selected>混合检索</option>
-          <option value="weighted">加权</option>
-        </select>
-        <button id="btn-search" class="primary">检索</button>
-      </div>
-      <ul class="result-list" id="search-results"></ul>
-    </section>
-
-    <!-- 对话（Codex 风格：左侧会话历史 + 右侧消息流 + 底部输入区） -->
+    <!-- 对话（Codex 风格：左侧会话历史 + 右侧消息流 + 底部输入区）
+         原来的「检索」视图已并入这里：回答下方可展开「原始命中」看这一轮到底
+         检索到了哪些原文片段，不用再在"检索/对话"两个入口之间做选择。 -->
     <section class="view" id="view-chat">
       <div class="chat-shell">
         <aside class="chat-side">
@@ -127,6 +126,7 @@
           <option value="completed">已完成</option>
           <option value="cancelled">已取消</option>
         </select>
+        <span class="hint">取消＝不打算做了，记录留在「已取消」可追溯；删除＝从数据库彻底移除，不可恢复</span>
       </div>
       <ul class="result-list" id="task-list"></ul>
     </section>

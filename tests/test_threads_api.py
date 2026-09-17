@@ -127,7 +127,10 @@ def test_stream_endpoint_emits_events_and_persists_reply(tmp_path, monkeypatch):
          "tool_calls": [{"name": "search_notes", "args": {"query": "面试"}, "ok": True,
                          "duration_ms": 12.0, "result_count": 3, "top_score": 0.81,
                          "error_code": None}],
-         "retrieved_note_ids": ["n1"], "cited_note_ids": ["n1"], "plan_id": None},
+         "retrieved_note_ids": ["n1"], "cited_note_ids": ["n1"], "plan_id": None,
+         # 「检索」视图并进对话后，前端展开的「原始命中」就靠这份片段。
+         "retrieved_hits": [{"note_id": "n1", "title": "面经", "score": 0.81,
+                             "snippet": "一面问了 RAG 的召回策略。"}]},
     ]
     captured = {}
     monkeypatch.setattr("app.main.run_agent_turn_stream", fake_stream(events, captured))
@@ -153,6 +156,10 @@ def test_stream_endpoint_emits_events_and_persists_reply(tmp_path, monkeypatch):
         assert [m["role"] for m in thread["messages"]] == ["user", "assistant"]
         assert thread["messages"][1]["metadata"]["cited_note_ids"] == ["n1"]
         assert thread["messages"][1]["metadata"]["tool_calls"][0]["result_count"] == 3
+        # 命中片段随回答一起落库：重新打开会话时「原始命中」还能展开，
+        # 不需要为此再跑一次检索（也就不会再产生一次 embedding 费用）。
+        assert thread["messages"][1]["metadata"]["retrieved_hits"][0]["snippet"] == \
+            "一面问了 RAG 的召回策略。"
 
 
 def test_stream_plan_request_grants_draft_tool(tmp_path, monkeypatch):

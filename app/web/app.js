@@ -181,13 +181,15 @@ function renderMarkdown(text) {
 }
 
 // ----------------------------- 标签切换 -----------------------------
+// 抽成函数是为了让"导入完成 → 跳到收件箱"这类跳转复用同一段逻辑，
+// 而不是各自去改一遍 class。
+function switchView(name) {
+  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
+  $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
+}
+
 $$(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    $$(".tab").forEach((t) => t.classList.remove("active"));
-    $$(".view").forEach((v) => v.classList.remove("active"));
-    tab.classList.add("active");
-    $(`#view-${tab.dataset.view}`).classList.add("active");
-  });
+  tab.addEventListener("click", () => switchView(tab.dataset.view));
 });
 
 // ----------------------------- 笔记库 -----------------------------
@@ -208,9 +210,22 @@ async function loadNotes() {
     const hasImg = (n.image_text || "").trim() ? '<span class="badge img">图</span>' : "";
     li.innerHTML = `<div class="note-title">${escapeHtml(n.title || "(无标题)")}</div>
       <div class="note-sub">${fmtTime(n.created_at)} ${hasImg}</div>`;
+    // 记住归属的 note_id：对话里的「出处」「原始命中」靠它定位到具体某一行。
+    li.dataset.note = n.note_id;
     li.addEventListener("click", () => openNote(n.note_id, li));
     list.appendChild(li);
   }
+}
+
+// 从对话里的出处/原始命中跳到笔记详情：先切回笔记库，再定位并打开那一篇。
+// 之前只有调用没有实现，点出处会在控制台报 ReferenceError 而界面毫无反应。
+async function gotoNote(noteId) {
+  if (!noteId) return;
+  switchView("notes");
+  await loadNotes();
+  const li = Array.from($$("#note-list li")).find((el) => el.dataset.note === noteId);
+  if (li) li.scrollIntoView({ block: "nearest" });
+  await openNote(noteId, li);
 }
 
 async function openNote(noteId, li) {
@@ -329,8 +344,22 @@ async function importBatch() {
     const r = await api("POST", "/notes/import-batch", { share_text: text });
     $("#import-result").textContent =
       `成功 ${r.succeeded} · 失败 ${r.failed} · 重复 ${r.duplicates}`;
-    toast(`导入成功 ${r.succeeded} 条`);
     loadNotes();
+    // 导入只是把内容存下来；真正决定知识库好不好用的是"这篇为什么被收藏、
+    // 该放进哪个收藏夹"。所以导入一结束就把这几篇交给 AI 读一遍并给出建议，
+    // 用户只需要在收件箱里确认——而不是自己去笔记详情里一项项点。
+    const fresh = (r.items || [])
+      .filter((it) => it.note_id && it.status !== "failed" && it.status !== "duplicate")
+      .map((it) => it.note_id);
+    $("#import-box").value = "";
+    switchView("inbox");
+    await loadInbox();
+    if (fresh.length) {
+      toast(`导入 ${r.succeeded} 条，AI 开始整理…`);
+      enqueuePrepare(fresh);
+    } else {
+      toast(`导入成功 ${r.succeeded} 条`);
+    }
   } catch (e) { toast(e.message, true); }
   finally { $("#btn-import").disabled = false; }
 }
@@ -385,27 +414,477 @@ async function newFolder() {
   } catch (e) { toast(e.message, true); }
 }
 
-// ----------------------------- 检索 -----------------------------
-async function doSearch() {
-  const query = $("#search-box").value.trim();
-  if (!query) { toast("请输入检索问题", true); return; }
-  const mode = $("#search-mode").value;
-  const list = $("#search-results");
-  list.innerHTML = `<li class="muted">检索中…</li>`;
+// ----------------------------- 收件箱（导入后的整理队列） -----------------------------
+// 每张卡片自己记住"AI 说了什么 + 我改成了什么"，重渲染时从这份状态出发，
+// 避免反复请求后端也避免把用户的编辑丢失。
+const inboxState = {
+  cards: new Map(),     // note_id → card 状态
+  queue: [],            // 待 prepare 的 note_id
+  running: false,
+  stop: false,
+  total: 0,
+};
+
+const TZ = "Asia/Shanghai";
+
+// 待办时间只给三个够用的选项：整理笔记时不该被"选个精确时间"卡住。
+function scheduleIso(daysAhead) {
+  const d = new Date();
+  d.setDate(d.getDate() + daysAhead);
+  const pad = (n) => String(n).padStart(2, "0");
+  const offsetMin = -d.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  // 后端要求时间必须带时区，偏移量从本机取，手拼字符串比 toISOString 更好读。
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    + `T20:00:00${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
+function cardFromItem(item) {
+  return {
+    note_id: item.note_id,
+    title: item.title || "(无标题)",
+    created_at: item.created_at,
+    excerpt: item.excerpt || "",
+    analysis: null,
+    folders: [],
+    selected: new Set(),
+    suggestionReasons: [],
+    actions: [],          // {text, on}
+    category: "",
+    intent: "",
+    proposal: { category: "", intent: "" },
+    editing: false,
+    createTasks: false,
+    scheduleDays: 0,
+    touched: false,       // 用户是否动过分类/意图/收藏夹，动过就不再被 AI 结果覆盖
+    // 分析和建议都齐了的笔记，进页面就能直接渲染（prepare 命中缓存，不花模型钱）；
+    // 缺任何一项都先停在 idle，由用户决定什么时候花这次调用。
+    autoReady: !!(item.has_analysis && item.has_suggestion),
+    state: "idle",        // idle | loading | ready | error
+    blockers: [],
+  };
+}
+
+async function loadInbox() {
+  const box = $("#inbox-list");
+  let d;
   try {
-    const r = await api("POST", "/search", { query, mode, top_k: 8 });
-    list.innerHTML = "";
-    if (!r.items.length) { list.innerHTML = `<li class="muted">没有命中，换个问法试试。</li>`; return; }
-    for (const it of r.items) {
-      const li = document.createElement("li");
-      li.innerHTML = `<div class="note-title">${escapeHtml(it.title || it.note_id)}</div>
-        <div class="note-sub">相关度 ${it.score != null ? it.score.toFixed(3) : "?"}</div>
-        <pre class="pre">${escapeHtml(it.content || "")}</pre>
-        <button class="ghost open-note">打开笔记</button>`;
-      li.querySelector(".open-note").onclick = () => gotoNote(it.note_id);
-      list.appendChild(li);
+    d = await api("GET", "/inbox?limit=50");
+  } catch (e) {
+    box.innerHTML = `<p class="error">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  inboxState.total = d.total || 0;
+  renderInboxBadge();
+  const keep = new Set();
+  for (const item of d.items || []) {
+    keep.add(item.note_id);
+    if (!inboxState.cards.has(item.note_id)) inboxState.cards.set(item.note_id, cardFromItem(item));
+  }
+  // 已经被整理掉的卡片要清出本地状态，否则重新拉取后会挂在列表里。
+  for (const id of Array.from(inboxState.cards.keys())) {
+    if (!keep.has(id)) inboxState.cards.delete(id);
+  }
+  renderInbox();
+  // 已有完整结果的卡片直接补齐显示，不占用用户的点击、也不触发模型调用。
+  const cached = Array.from(inboxState.cards.values())
+    .filter((c) => c.autoReady && c.state === "idle")
+    .map((c) => c.note_id);
+  if (cached.length) enqueuePrepare(cached);
+}
+
+function renderInboxBadge() {
+  const badge = $("#inbox-badge");
+  const n = inboxState.total;
+  badge.textContent = n > 99 ? "99+" : String(n);
+  badge.hidden = n === 0;
+}
+
+function renderInbox() {
+  const box = $("#inbox-list");
+  box.innerHTML = "";
+  const cards = Array.from(inboxState.cards.values());
+  // 按钮上直接写清"还剩几篇"和"会调模型"：分析是要花钱的，不该点下去才发现。
+  const remaining = cards.filter((c) => c.state === "idle" || c.state === "error").length;
+  const btn = $("#btn-prepare-all");
+  btn.hidden = remaining === 0;
+  btn.textContent = `让 AI 整理剩余 ${remaining} 篇`;
+  btn.title = `会为这 ${remaining} 篇各调用一次模型做分析`;
+  if (!cards.length) {
+    box.innerHTML = `<div class="inbox-empty">
+      <div class="ie-mark">✓</div>
+      <h3>收件箱空了</h3>
+      <p>没有待整理的笔记。新导入的笔记会自动出现在这里，由 AI 先读一遍并给出分类、意图和收藏夹建议。</p>
+    </div>`;
+    return;
+  }
+  for (const card of cards) box.appendChild(inboxCardEl(card));
+}
+
+function inboxCardEl(card) {
+  const el = document.createElement("article");
+  el.className = "icard";
+  el.dataset.note = card.note_id;
+
+  const head = document.createElement("header");
+  head.className = "icard-head";
+  head.innerHTML = `<div class="icard-title" title="${escapeHtml(card.note_id)}">${escapeHtml(card.title)}</div>
+    <div class="icard-sub">${fmtTime(card.created_at)}</div>`;
+  el.appendChild(head);
+
+  if (card.excerpt) {
+    const ex = document.createElement("p");
+    ex.className = "icard-excerpt";
+    ex.textContent = card.excerpt;
+    el.appendChild(ex);
+  }
+
+  el.appendChild(inboxAiEl(card));
+
+  const actions = document.createElement("div");
+  actions.className = "icard-actions";
+  el.appendChild(actions);
+  renderCardActions(actions, card);
+  return el;
+}
+
+function inboxAiEl(card) {
+  const box = document.createElement("div");
+  box.className = "icard-ai";
+
+  if (card.state === "loading") {
+    box.classList.add("busy");
+    box.innerHTML = `<span class="pulse"></span><span>AI 正在读这篇笔记，推断你的收藏意图…</span>`;
+    return box;
+  }
+  if (card.state === "idle") {
+    box.innerHTML = `<div class="icard-idle">
+      <span>这篇还没整理过。</span>
+      <button class="ghost act-prepare">让 AI 看看</button>
+    </div>`;
+    box.querySelector(".act-prepare").onclick = () => enqueuePrepare([card.note_id]);
+    return box;
+  }
+  if (card.state === "error") {
+    box.innerHTML = `<div class="icard-blocked">
+      <b>没能整理：</b>${escapeHtml(card.blockers.join("；") || "模型暂时不可用")}
+      <button class="ghost act-prepare">重试</button>
+    </div>`;
+    box.querySelector(".act-prepare").onclick = () => enqueuePrepare([card.note_id], true);
+    return box;
+  }
+
+  // ready：展示 AI 推断 + 可编辑项。收藏夹芯片始终可点，改归档不必先进入编辑态。
+  const a = card.analysis || {};
+  const conf = a.intent_confidence;
+  const confText = typeof conf === "number" ? `（置信度 ${conf.toFixed(2)}）` : "";
+
+  const catRow = document.createElement("div");
+  catRow.className = "ikv";
+  catRow.innerHTML = `<span class="ik">分类</span>`;
+  if (card.editing) {
+    const input = document.createElement("input");
+    input.className = "iv-input";
+    input.value = card.category;
+    input.oninput = () => { card.category = input.value; card.touched = true; };
+    catRow.appendChild(input);
+  } else {
+    catRow.insertAdjacentHTML("beforeend",
+      `<span class="iv">${escapeHtml(card.category || "未分类")}</span>`);
+  }
+  box.appendChild(catRow);
+
+  const intRow = document.createElement("div");
+  intRow.className = "ikv";
+  intRow.innerHTML = `<span class="ik">收藏意图</span>`;
+  if (card.editing) {
+    const ta = document.createElement("textarea");
+    ta.className = "iv-input";
+    ta.rows = 2;
+    ta.value = card.intent;
+    ta.oninput = () => { card.intent = ta.value; card.touched = true; };
+    intRow.appendChild(ta);
+  } else {
+    intRow.insertAdjacentHTML("beforeend",
+      `<span class="iv">${escapeHtml(card.intent || "未推断")}<span class="muted">${escapeHtml(confText)}</span></span>`);
+  }
+  box.appendChild(intRow);
+
+  const foldRow = document.createElement("div");
+  foldRow.className = "ikv";
+  foldRow.innerHTML = `<span class="ik">归档到</span>`;
+  const chips = document.createElement("span");
+  chips.className = "ifolders";
+  if (!card.folders.length) {
+    chips.innerHTML = `<span class="muted">还没有收藏夹，先去「收藏夹」建一个</span>`;
+  }
+  for (const f of card.folders) {
+    const on = card.selected.has(f.id);
+    const chip = document.createElement("button");
+    chip.className = `fchip${on ? " on" : ""}`;
+    chip.textContent = `${on ? "✓ " : ""}${f.name}`;
+    chip.title = f.description || "";
+    chip.onclick = () => {
+      // 最多 3 个：和后端 folder_ids 的上限保持一致，先在这里挡住比让请求 422 好。
+      if (card.selected.has(f.id)) card.selected.delete(f.id);
+      else if (card.selected.size < 3) card.selected.add(f.id);
+      else { toast("最多只能放进 3 个收藏夹", true); return; }
+      card.touched = true;
+      renderInbox();
+    };
+    chips.appendChild(chip);
+  }
+  foldRow.appendChild(chips);
+  box.appendChild(foldRow);
+
+  if (card.suggestionReasons.length) {
+    const det = document.createElement("details");
+    det.className = "ireasons";
+    det.innerHTML = `<summary>AI 为什么这么放</summary><ul>${
+      card.suggestionReasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`;
+    box.appendChild(det);
+  }
+
+  if (card.actions.length) {
+    const det = document.createElement("details");
+    det.className = "iactions";
+    det.open = true;
+    det.innerHTML = `<summary>建议行动（${card.actions.filter((x) => x.on).length}/${card.actions.length}）</summary>`;
+    const ul = document.createElement("div");
+    for (let i = 0; i < card.actions.length; i += 1) {
+      const act = card.actions[i];
+      const row = document.createElement("label");
+      row.className = "iact";
+      row.innerHTML = `<input type="checkbox" ${act.on ? "checked" : ""}>`;
+      const span = document.createElement("span");
+      span.textContent = act.text;
+      row.appendChild(span);
+      row.querySelector("input").onchange = (e) => { act.on = e.target.checked; renderInbox(); };
+      ul.appendChild(row);
     }
-  } catch (e) { list.innerHTML = `<li class="error">${escapeHtml(e.message)}</li>`; }
+    det.appendChild(ul);
+    box.appendChild(det);
+  }
+
+  if (card.blockers.length) {
+    box.insertAdjacentHTML("beforeend",
+      `<div class="icard-blocked">${escapeHtml(card.blockers.join("；"))}</div>`);
+  }
+  return box;
+}
+
+function renderCardActions(bar, card) {
+  bar.innerHTML = "";
+  if (card.state === "loading") {
+    bar.innerHTML = `<span class="muted">AI 正在处理…</span>`;
+    return;
+  }
+  if (card.state === "idle" || card.state === "error") {
+    bar.innerHTML = `<span class="muted">整理后才能确认归档。</span>`;
+    return;
+  }
+
+  if (card.editing) {
+    const taskWrap = document.createElement("label");
+    taskWrap.className = "itask";
+    taskWrap.innerHTML = `<input type="checkbox" ${card.createTasks ? "checked" : ""}>
+      <span>顺手把勾选的行动建成待办</span>`;
+    taskWrap.querySelector("input").onchange = (e) => {
+      card.createTasks = e.target.checked;
+      renderInbox();
+    };
+    bar.appendChild(taskWrap);
+    if (card.createTasks) {
+      const sel = document.createElement("select");
+      sel.className = "isel";
+      for (const [i, label] of [[0, "今晚 20:00"], [1, "明晚 20:00"], [2, "后天 20:00"]]) {
+        sel.insertAdjacentHTML("beforeend", `<option value="${i}">${label}</option>`);
+      }
+      sel.value = String(card.scheduleDays ?? 0);
+      sel.onchange = (e) => { card.scheduleDays = Number(e.target.value); };
+      bar.appendChild(sel);
+    }
+  }
+
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = card.editing ? "保存并归档" : "确认并归档";
+  // 没选收藏夹就没法归档，先禁用；真要"什么都不做"用右边的忽略。
+  save.disabled = card.selected.size === 0;
+  save.onclick = () => triageCard(card);
+  bar.appendChild(save);
+
+  const edit = document.createElement("button");
+  edit.className = "ghost";
+  edit.textContent = card.editing ? "取消修改" : "改一下";
+  edit.onclick = () => {
+    if (card.editing) {
+      // 放弃编辑：分类和意图回到 AI 原话，其余选择保留。
+      card.category = card.proposal.category;
+      card.intent = card.proposal.intent;
+    }
+    card.editing = !card.editing;
+    renderInbox();
+  };
+  bar.appendChild(edit);
+
+  const dismiss = document.createElement("button");
+  dismiss.className = "ghost danger";
+  dismiss.textContent = "忽略";
+  dismiss.title = "这篇不需要归档，直接移出收件箱";
+  dismiss.onclick = async () => {
+    if (!confirm("忽略这篇笔记？它会移出收件箱，不再提示整理。")) return;
+    await sendTriage(card, "dismissed");
+  };
+  bar.appendChild(dismiss);
+}
+
+function setCardReady(card, data) {
+  card.title = data.title || card.title;
+  card.created_at = data.created_at || card.created_at;
+  card.excerpt = data.excerpt || card.excerpt;
+  card.folders = data.folders || [];
+  card.blockers = data.blockers || [];
+
+  const a = data.analysis || null;
+  if (!a) {
+    card.state = "error";
+    if (!card.blockers.length) card.blockers = ["模型没能给出分析结果"];
+    return;
+  }
+  card.analysis = a;
+  card.proposal = {
+    category: a.category || "其他",
+    intent: a.inferred_intent || "",
+  };
+  // 用户已经改过就别覆盖，只有第一次填充时才用 AI 的原话。
+  if (!card.touched) {
+    card.category = card.proposal.category;
+    card.intent = card.proposal.intent;
+  }
+
+  const sug = data.suggestion || null;
+  const suggested = (sug && Array.isArray(sug.suggestions)) ? sug.suggestions : [];
+  const names = new Map(card.folders.map((f) => [f.id, f.name]));
+  card.suggestionReasons = suggested
+    .filter((s) => names.has(s.folder_id))
+    .map((s) => `放进「${names.get(s.folder_id)}」：${s.reason}`);
+  if (!card.touched) {
+    card.selected = new Set(suggested.map((s) => s.folder_id).filter((id) => names.has(id)));
+  }
+  if (!card.selected.size && card.folders.length) card.selected.add(card.folders[0].id);
+
+  if (!card.actions.length) {
+    card.actions = (a.suggested_actions || []).map((text) => ({ text, on: false }));
+  }
+  card.state = "ready";
+}
+
+async function prepareCard(noteId, force = false) {
+  const card = inboxState.cards.get(noteId);
+  if (!card) return;
+  card.state = "loading";
+  renderInbox();
+  try {
+    const data = await api("POST", `/notes/${noteId}/prepare${force ? "?force=true" : ""}`);
+    setCardReady(card, data);
+  } catch (e) {
+    card.state = "error";
+    card.blockers = [e.message];
+  }
+  renderInbox();
+}
+
+async function sendTriage(card, decision) {
+  const payload = {
+    decision,
+    folder_ids: decision === "dismissed" ? [] : Array.from(card.selected),
+    action_indexes: card.actions.map((a, i) => (a.on ? i : -1)).filter((i) => i >= 0),
+    create_tasks: decision !== "dismissed" && !!card.createTasks,
+    timezone: TZ,
+  };
+  if (payload.create_tasks) payload.scheduled_at = scheduleIso(card.scheduleDays || 0);
+  if (decision === "edited") {
+    payload.category = card.category.trim();
+    payload.intent = card.intent.trim();
+  }
+  try {
+    const r = await api("POST", `/notes/${card.note_id}/triage`, payload);
+    if (decision === "dismissed") {
+      toast("已忽略，移出收件箱");
+    } else {
+      const where = (r.folders || []).map((f) => f.name).join("、");
+      const n = (r.tasks || []).length;
+      toast(`已归档到「${where || "所选收藏夹"}」${n ? `，并建了 ${n} 条待办` : ""}`);
+    }
+    inboxState.cards.delete(card.note_id);
+    inboxState.total = Math.max(0, inboxState.total - 1);
+    renderInboxBadge();
+    renderInbox();
+    loadFolders();
+    loadTasks();
+    loadNotes();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function triageCard(card) {
+  if (!card.selected.size) { toast("请至少选择一个收藏夹", true); return; }
+  const edited = card.category.trim() !== card.proposal.category
+    || card.intent.trim() !== card.proposal.intent;
+  if (edited && (!card.category.trim() || !card.intent.trim())) {
+    toast("分类和收藏意图都不能为空", true);
+    return;
+  }
+  await sendTriage(card, edited ? "edited" : "confirmed");
+}
+
+function enqueuePrepare(noteIds, force = false) {
+  for (const id of noteIds) {
+    const card = inboxState.cards.get(id);
+    if (force && card) card.touched = false;
+    if (!inboxState.queue.includes(id)) inboxState.queue.push(id);
+  }
+  runPrepareQueue();
+}
+
+function setInboxBusy(running) {
+  $("#btn-prepare-all").disabled = running;
+  $("#btn-stop-prepare").hidden = !running;
+}
+
+function updateInboxProgress() {
+  const done = inboxState.queue.length;
+  $("#inbox-progress").textContent = inboxState.running
+    ? `正在整理，还剩 ${done} 篇…`
+    : "";
+}
+
+async function runPrepareQueue() {
+  if (inboxState.running) return;
+  inboxState.running = true;
+  inboxState.stop = false;
+  setInboxBusy(true);
+  while (inboxState.queue.length && !inboxState.stop) {
+    updateInboxProgress();
+    // 串行而不是并发：模型侧有速率限制，而且用户在界面上也是从上往下读的。
+    await prepareCard(inboxState.queue.shift());
+  }
+  inboxState.running = false;
+  setInboxBusy(false);
+  updateInboxProgress();
+  if (inboxState.stop) toast("已停止分析");
+}
+
+function prepareAllRemaining() {
+  const pending = Array.from(inboxState.cards.values())
+    .filter((c) => c.state === "idle" || c.state === "error")
+    .map((c) => c.note_id);
+  if (!pending.length) { toast("没有需要分析的笔记"); return; }
+  toast(`开始整理 ${pending.length} 篇…`);
+  enqueuePrepare(pending, true);
 }
 
 // ----------------------------- 对话（Codex 风格） -----------------------------
@@ -515,6 +994,36 @@ function refsEl(meta) {
   return box;
 }
 
+// 「原始命中」：原来单独占一个 tab 的检索视图并进对话后，能力落在这里。
+// 用的是这一轮真正喂给模型的片段（落库时一并存的），不是重新检索一遍的结果。
+function hitsEl(meta) {
+  const hits = (meta && meta.retrieved_hits) || [];
+  if (!hits.length) return null;
+  const det = document.createElement("details");
+  det.className = "hits";
+  det.innerHTML = `<summary>原始命中 ${hits.length} 条</summary>`;
+  const box = document.createElement("div");
+  box.className = "hits-body";
+  for (const h of hits) {
+    const row = document.createElement("div");
+    row.className = "hit";
+    const score = typeof h.score === "number" ? h.score.toFixed(3) : "?";
+    row.innerHTML = `<div class="hit-head">
+      <button class="hit-title"></button>
+      <span class="hit-score">相关度 ${escapeHtml(score)}</span>
+    </div>
+    <div class="hit-snippet"></div>`;
+    const title = row.querySelector(".hit-title");
+    title.textContent = h.title || `笔记 ${String(h.note_id).slice(0, 8)}`;
+    title.title = h.note_id;
+    title.onclick = () => gotoNote(h.note_id);
+    row.querySelector(".hit-snippet").textContent = h.snippet || "（无正文片段）";
+    box.appendChild(row);
+  }
+  det.appendChild(box);
+  return det;
+}
+
 function footEl(msg) {
   const div = document.createElement("div");
   div.className = "turn-foot";
@@ -555,6 +1064,8 @@ function turnEl(msg) {
   wrap.appendChild(body);
   const refs = refsEl(meta);
   if (refs) wrap.appendChild(refs);
+  const hits = hitsEl(meta);
+  if (hits) wrap.appendChild(hits);
   wrap.appendChild(footEl(msg));
   return wrap;
 }
@@ -674,6 +1185,8 @@ function createLiveTurn() {
       if (!body.parentNode) wrap.appendChild(body);
       const refs = refsEl(meta);
       if (refs) wrap.appendChild(refs);
+      const hits = hitsEl(meta);
+      if (hits) wrap.appendChild(hits);
       wrap.appendChild(footEl(message || {
         role: "assistant", content: finalText, created_at: new Date().toISOString(),
       }));
@@ -913,17 +1426,37 @@ async function loadTasks() {
   if (!d.items.length) { list.innerHTML = `<li class="muted">没有待办。</li>`; return; }
   for (const t of d.items) {
     const li = document.createElement("li");
-    li.innerHTML = `<div class="note-title">${escapeHtml(t.title)}</div>
+    // 三个动作语义不同，不能合成一个：
+    //   完成 = 做完了；取消 = 我不做了（留痕，历史可追溯）；删除 = 这条记录本身就是错的。
+    // 之前只有"完成/取消"，误建的任务（比如调试刷出来的空标题）只能一直挂在列表里。
+    li.innerHTML = `<div class="note-title">${escapeHtml(t.title || "(无标题)")}</div>
       <div class="task-meta">${fmtTime(t.scheduled_at)} · <span class="status-${t.status}">${t.status}</span></div>
       ${t.details ? `<div class="note-sub">${escapeHtml(t.details)}</div>` : ""}
       <div class="task-actions">
-        ${t.status !== "completed" ? '<button class="ghost act-complete">完成</button>' : ""}
-        ${t.status !== "cancelled" ? '<button class="ghost act-cancel">取消</button>' : ""}
+        ${t.status === "pending" ? '<button class="ghost act-complete">完成</button>' : ""}
+        ${t.status === "pending" ? '<button class="ghost act-cancel">取消</button>' : ""}
+        <button class="ghost danger act-delete">删除</button>
       </div>`;
     const comp = li.querySelector(".act-complete");
     const canc = li.querySelector(".act-cancel");
-    if (comp) comp.onclick = async () => { await api("POST", `/tasks/${t.id}/complete`); loadTasks(); };
-    if (canc) canc.onclick = async () => { await api("DELETE", `/tasks/${t.id}`); loadTasks(); };
+    const del = li.querySelector(".act-delete");
+    if (comp) comp.onclick = async () => {
+      try { await api("POST", `/tasks/${t.id}/complete`); loadTasks(); }
+      catch (e) { toast(e.message, true); }
+    };
+    if (canc) canc.onclick = async () => {
+      if (!confirm("取消这条待办？记录会保留在「已取消」里，之后仍可彻底删除。")) return;
+      try { await api("DELETE", `/tasks/${t.id}`); loadTasks(); }
+      catch (e) { toast(e.message, true); }
+    };
+    del.onclick = async () => {
+      if (!confirm("彻底删除这条待办？会从数据库中移除，无法恢复。")) return;
+      try {
+        await api("DELETE", `/tasks/${t.id}?hard=true`);
+        toast("已删除");
+        loadTasks();
+      } catch (e) { toast(e.message, true); }
+    };
     list.appendChild(li);
   }
 }
@@ -934,8 +1467,9 @@ $("#btn-read-all").onclick = readAllImages;
 $("#btn-refresh-notes").onclick = loadNotes;
 $("#btn-new-folder").onclick = newFolder;
 $("#btn-refresh-folders").onclick = loadFolders;
-$("#btn-search").onclick = doSearch;
-$("#search-box").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+$("#btn-refresh-inbox").onclick = loadInbox;
+$("#btn-prepare-all").onclick = prepareAllRemaining;
+$("#btn-stop-prepare").onclick = () => { inboxState.stop = true; };
 
 $("#btn-new-thread").onclick = newThread;
 $("#btn-delete-thread").onclick = deleteThread;
@@ -987,6 +1521,10 @@ async function init() {
   loadNotes();
   loadFolders();
   loadTasks();
+  // 有东西要整理就先落在收件箱（那是唯一需要用户动手的地方）；
+  // 空的就直接进笔记库，别让用户打开页面先看到一块"什么都没"。
+  await loadInbox();
+  switchView(inboxState.total > 0 ? "inbox" : "notes");
   await loadThreads();
   if (chatState.threadId) {
     openThread(chatState.threadId);

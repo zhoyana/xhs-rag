@@ -236,6 +236,30 @@ class FolderSuggestionConfirmRequest(BaseModel):
     )
 
 
+class TriageRequest(BaseModel):
+    """收件箱里的"一次确认"：意图 + 归档（可选建待办）。
+
+    刻意做成单个请求而不是让前端依次调 intent / folder-suggestions / tasks：
+    三次调用之间任何一步失败都会留下半成品，而且用户会看到卡片消失、数据却没落全。
+    """
+
+    decision: Literal["confirmed", "edited", "dismissed"] = Field(
+        description="confirmed 采用 AI 推断；edited 用你改过的内容；dismissed 忽略并移出收件箱")
+    category: str | None = Field(default=None, max_length=50,
+                                 description="decision=edited 时的分类")
+    intent: str | None = Field(default=None, max_length=500,
+                               description="decision=edited 时的收藏意图")
+    folder_ids: list[int] = Field(default_factory=list, max_length=3,
+                                  description="最终放入的收藏夹；忽略时可以为空")
+    action_indexes: list[int] = Field(
+        default_factory=list, max_length=8,
+        description="保留哪些建议行动（按下标）；留空表示全部保留")
+    create_tasks: bool = Field(default=False, description="是否把保留的行动建成待办")
+    scheduled_at: datetime | None = Field(
+        default=None, description="建待办时的执行时间，必须带时区")
+    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+
+
 class MemoryUpdateRequest(BaseModel):
     """修正长期记忆：请求模型本身就是字段白名单。
 
@@ -407,6 +431,8 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             thread_id, "assistant", result["content"], {
                 "tool_calls": result["tool_calls"],
                 "retrieved_note_ids": result["retrieved_note_ids"],
+                # 命中原片一并落库：前端「原始命中」靠它展开，不必再检索一次。
+                "retrieved_hits": result.get("retrieved_hits", []),
                 "cited_note_ids": result["cited_note_ids"],
                 "source_note_ids": result["source_note_ids"],
                 "plan_id": result["plan_id"],
@@ -457,6 +483,8 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                         thread_id, "assistant", event["content"], {
                             "tool_calls": event["tool_calls"],
                             "retrieved_note_ids": event["retrieved_note_ids"],
+                            # 命中原片一并落库：前端「原始命中」靠它展开，不必再检索一次。
+                            "retrieved_hits": event.get("retrieved_hits", []),
                             "cited_note_ids": event["cited_note_ids"],
                             "source_note_ids": event["cited_note_ids"],
                             "plan_id": event["plan_id"],
@@ -1303,6 +1331,8 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                 # 注入用户确认过的长期记忆：同一篇笔记，带记忆的分析会更贴近
                 # 这位用户自己的分类习惯；没有记忆时该参数为空列表，提示词不变。
                 app.state.store.active_memories(),
+                # 用用户自己的收藏夹名当分类体系，避免分类落在写死的通用标签上。
+                category_hints=[f["name"] for f in app.state.store.folders()],
             )
         except AIProblem as exc:
             raise HTTPException(502, detail=str(exc)) from None
@@ -1424,6 +1454,167 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             reminder_at, body.timezone, body.source_action, now
         )
 
+    # ------------------------------ 收件箱（Inbox） ------------------------------
+    # 导入只是"存下来了"，真正让知识库变得可用的是"知道这篇为什么被收藏、
+    # 该放进哪个收藏夹"。这条链本来就有（分析 → 意图 → 收藏夹建议 → 确认），
+    # 缺的只是把它们按顺序串起来、并给用户一个能逐条确认的地方。
+
+    @app.get("/inbox", summary="待整理的笔记队列")
+    def list_inbox(limit: int = Query(20, ge=1, le=100)):
+        store = app.state.store
+        return {"items": store.inbox_notes(limit), "total": store.inbox_count()}
+
+    @app.post("/notes/{note_id}/prepare",
+              summary="收件箱：让 Agent 读这篇笔记并给出整理建议")
+    async def prepare_note(note_id: str, force: bool = Query(
+        False, description="true 表示忽略已有分析/建议，重新调用模型")):
+        """把"分析 + 推荐收藏夹"合成一步，已有结果就直接复用。
+
+        为什么要合成一个接口：前端逐条整理时，如果让浏览器自己按顺序调两个接口，
+        每一步都要处理"上一步失败则中断"的分支，而失败点又都在模型侧。放在服务端
+        一次编排，前端只需要渲染一个结果 + 一组 blockers，逻辑简单得多。
+
+        失败不抛 502：这是队列里的批量操作，一条失败不该让整个整理流程断掉。
+        错误如实放进 blockers 交给界面显示，用户能看见，也能单独重试。
+        """
+        note = get_note(note_id)
+        store = app.state.store
+        steps: list[str] = []
+        blockers: list[str] = []
+
+        analysis_record = store.analysis(note_id)
+        if analysis_record is None or force:
+            try:
+                result, model = await analyze_note(
+                    note, store.assets(note_id), app.state.media_root,
+                    store.active_memories(),
+                    # 用用户自己的收藏夹名当分类体系，分出来的 category 才能直接用。
+                    category_hints=[f["name"] for f in store.folders()],
+                )
+            except AIProblem as exc:
+                blockers.append(f"分析失败：{exc}")
+            else:
+                analysis_record = store.save_analysis(
+                    note_id, model, result, datetime.now(timezone.utc).isoformat()
+                )
+                steps.append("analyzed")
+
+        folders = store.folders(include_archived=False)
+        suggestion = store.folder_suggestion(note_id)
+        if analysis_record is not None and (suggestion is None or force):
+            if not folders:
+                blockers.append("还没有启用中的收藏夹，无法推荐；请先在「收藏夹」里建一个。")
+            else:
+                try:
+                    result, model = await suggest_folders(
+                        note, analysis_record["analysis"],
+                        store.intent_confirmation(note_id), folders,
+                        store.active_memories(),
+                    )
+                except AIProblem as exc:
+                    blockers.append(f"推荐收藏夹失败：{exc}")
+                else:
+                    suggestion = store.save_folder_suggestion(
+                        note_id, model, result, datetime.now(timezone.utc).isoformat()
+                    )
+                    steps.append("suggested")
+
+        return {
+            "note_id": note_id,
+            "title": note.get("title") or "",
+            "created_at": note.get("created_at"),
+            "excerpt": " ".join((note.get("content") or "").split())[:200],
+            "analysis": analysis_record["analysis"] if analysis_record else None,
+            "analysis_model": analysis_record["model"] if analysis_record else None,
+            # 建议里存的是 folder_id，前端要显示名字，所以候选收藏夹一并回传。
+            "suggestion": suggestion["suggestion"] if suggestion else None,
+            "folders": [{"id": f["id"], "name": f["name"], "description": f["description"]}
+                        for f in folders],
+            "steps": steps,
+            "blockers": blockers,
+        }
+
+    @app.post("/notes/{note_id}/triage", summary="确认整理结果：意图 + 收藏夹（可选建待办）")
+    def triage_note(note_id: str, body: TriageRequest,
+                    background_tasks: BackgroundTasks):
+        state = get_intent(note_id)   # 没分析过就没有提案，这里先 404 挡住
+        proposal = state["proposal"]
+
+        if body.decision == "edited" and not ((body.category or "").strip()
+                                              and (body.intent or "").strip()):
+            raise HTTPException(400, detail="修改后确认时，category 和 intent 都不能为空。")
+        if body.decision != "dismissed" and not body.folder_ids:
+            raise HTTPException(400, detail="请至少选择一个收藏夹，或选择忽略这篇笔记。")
+
+        # 先把所有校验做完再写库：宁可在入口 400，也不要在库里留半成品。
+        folder_ids = list(dict.fromkeys(body.folder_ids))
+        for folder_id in folder_ids:
+            require_folder(folder_id, active_only=True)
+        if body.create_tasks:
+            if body.scheduled_at is None:
+                raise HTTPException(400, detail="创建待办时必须提供 scheduled_at。")
+            valid_timezone(body.timezone)
+            scheduled_at = utc_text(body.scheduled_at, "scheduled_at")
+        else:
+            scheduled_at = None
+
+        suggested = proposal.get("suggested_actions") or []
+        if body.decision == "dismissed":
+            # 忽略 = 这篇我不打算做任何事，不保留行动。
+            actions = []
+        elif body.action_indexes:
+            actions = [suggested[i] for i in body.action_indexes
+                       if 0 <= i < len(suggested)]
+        else:
+            actions = list(suggested)
+
+        if body.decision == "confirmed":
+            # 与 /intent 保持一致：confirmed 永远采用模型原话，不读请求体里的文字，
+            # 否则 Swagger 自动填的 "string" 会被当成用户输入存进去。
+            category = proposal["category"].strip()
+            intent = proposal["intent"].strip()
+        elif body.decision == "edited":
+            category = body.category.strip()
+            intent = body.intent.strip()
+        else:
+            category = proposal["category"].strip()
+            intent = proposal["intent"].strip()
+
+        if not category or not intent:
+            raise HTTPException(400, detail="分类或收藏意图为空，请填写后再确认。")
+        actions = [action.strip()[:500] for action in actions if action.strip()]
+
+        now = datetime.now(timezone.utc).isoformat()
+        confirmation = app.state.store.apply_triage(
+            note_id, body.decision, category, intent, actions,
+            folder_ids if body.decision != "dismissed" else [], now,
+        )
+
+        created_tasks = []
+        if body.create_tasks and scheduled_at:
+            # 待办最多 3 条：建议行动是"该做什么"，不是"今天要干完什么"，
+            # 一次确认刷出十几条待办只会让清单失去意义。
+            note_title = (app.state.store.get(note_id) or {}).get("title") or "收藏的笔记"
+            for action in actions[:3]:
+                created_tasks.append(app.state.store.create_task(
+                    note_id, action, f"来自笔记《{note_title}》的整理建议",
+                    scheduled_at, None, body.timezone, action, now,
+                ))
+
+        # 与 /intent 同一套策略：dismissed 说明模型猜错了，没有可复用的偏好可学。
+        memory_job = "queued" if body.decision != "dismissed" else "skipped"
+        if memory_job == "queued":
+            background_tasks.add_task(extract_memory_after_confirmation, note_id)
+
+        return {
+            "note_id": note_id,
+            "status": body.decision,
+            "confirmation": confirmation,
+            "folders": app.state.store.folders_for_note(note_id),
+            "tasks": created_tasks,
+            "memory_job": memory_job,
+        }
+
     @app.get("/tasks", summary="查看任务列表")
     def list_tasks(status: Literal["pending", "completed", "cancelled"] | None = None,
                    limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
@@ -1468,9 +1659,20 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             task_id, {"status": "completed"}, datetime.now(timezone.utc).isoformat()
         )
 
-    @app.delete("/tasks/{task_id}", summary="取消任务（保留记录，可追溯）")
-    def cancel_task(task_id: int):
+    @app.delete("/tasks/{task_id}", summary="取消任务（默认保留记录），hard=true 时彻底删除")
+    def cancel_task(task_id: int, hard: bool = Query(
+        False, description="true 表示从数据库彻底删除，无法恢复；默认 false 只标记为 cancelled")):
+        """两种删除语义刻意分开。
+
+        取消：任务本身是真实的，只是不打算做了 —— 记录要留着，以后回看能知道
+        当时做过什么决定。删除：任务行本身就是错的（误建、调试刷出来的空标题），
+        留着只会一直污染列表 —— 这种才需要真的从库里抹掉。默认保持软取消，
+        避免任何一次误点就不可逆；真删必须由调用方显式要求。
+        """
         require_task(task_id)
+        if hard:
+            app.state.store.delete_task(task_id)
+            return {"id": task_id, "status": "deleted", "hard": True}
         return app.state.store.update_task(
             task_id, {"status": "cancelled"}, datetime.now(timezone.utc).isoformat()
         )

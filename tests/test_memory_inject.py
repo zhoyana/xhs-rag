@@ -103,7 +103,7 @@ def test_analyze_injects_active_memories(tmp_path, monkeypatch):
     prepared_store(db_path)
     calls = []
 
-    async def fake_analyze(note, assets, media_root, memories=None):
+    async def fake_analyze(note, assets, media_root, memories=None, category_hints=None):
         calls.append(list(memories or []))
         return {"category": "健身"}, "test-model"
 
@@ -124,7 +124,7 @@ def test_analyze_skips_dismissed_memories(tmp_path, monkeypatch):
     store.update_memory(store.memories()[0]["id"], {"status": "dismissed"}, NOW)
     calls = []
 
-    async def fake_analyze(note, assets, media_root, memories=None):
+    async def fake_analyze(note, assets, media_root, memories=None, category_hints=None):
         calls.append(list(memories or []))
         return {"category": "做饭"}, "test-model"
 

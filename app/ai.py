@@ -91,7 +91,23 @@ def _image_data_url(path: Path, mime_type: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def _prompt(note: dict, memories: list[dict] | None = None) -> str:
+def category_rule(category_hints: list[str] | None = None) -> str:
+    """分类字段的取值规则。
+
+    有收藏夹时优先让模型按用户自己的分类体系来分：写死的那套通用标签
+    （健身/学习/做饭…）和用户实际建的收藏夹（秋招与面试/AI 应用工程…）对不上，
+    分出来的 category 在意图确认界面上毫无用处，用户还得手动改。
+    """
+    names = [name.strip() for name in (category_hints or []) if str(name).strip()]
+    if not names:
+        return "category: 从 健身、学习、做饭、工作、旅行、购物、其他 中选一个；"
+    return (f"category: 从 {('、'.join(names))} 中选一个；"
+            f"这些是用户自己建的收藏夹名称，优先按它们的语义归类，"
+            f"确实都不合适时才填「其他」；")
+
+
+def _prompt(note: dict, memories: list[dict] | None = None,
+            category_hints: list[str] | None = None) -> str:
     # 明确限定 JSON 字段，方便后端稳定保存，手机端也不必解析一大段自由文本。
     # memories 是用户确认过的长期偏好（active 记忆），由 _memory_block 渲染成
     # 提示词片段；没有记忆时渲染为空串，提示词与加入记忆功能之前完全一致。
@@ -101,7 +117,7 @@ def _prompt(note: dict, memories: list[dict] | None = None) -> str:
 {note_inline(note, include_image_text=False)}
 {_memory_block(memories)}JSON 必须包含以下字段：
 summary: 中文摘要字符串；
-category: 从 健身、学习、做饭、工作、旅行、购物、其他 中选一个；
+{category_rule(category_hints)}
 tags: 3到8个中文标签组成的数组；
 knowledge_points: 重要知识点字符串数组；
 suggested_actions: 可实际执行的行动字符串数组；
@@ -115,11 +131,15 @@ uncertainties: 无法确认或需要用户核实的信息数组。
 
 
 async def analyze_note(note: dict, assets: list[dict], media_root: Path,
-                       memories: list[dict] | None = None) -> tuple[dict, str]:
+                       memories: list[dict] | None = None,
+                       category_hints: list[str] | None = None) -> tuple[dict, str]:
     """调用 DeepSeek，并返回（结构化分析结果，实际模型名）。
 
     memories 为可选的长期记忆列表：带上它，分类与意图推测会参考用户以往的
     确认结果；不传则退化成无记忆的单篇分析（保持调用方向后兼容）。
+
+    category_hints 是用户现有的收藏夹名称，用于把 category 拉到用户自己的
+    分类体系上；不传则沿用内置的通用标签，行为与之前完全一致。
     """
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
@@ -129,7 +149,7 @@ async def analyze_note(note: dict, assets: list[dict], media_root: Path,
     base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 
     # content 是一个有顺序的列表：先放说明文字，再按小红书原顺序加入图片。
-    content: list[dict] = [{"type": "text", "text": _prompt(note, memories)}]
+    content: list[dict] = [{"type": "text", "text": _prompt(note, memories, category_hints)}]
     valid_count = 0
     for asset in assets:
         if not local_file_valid(media_root, asset):

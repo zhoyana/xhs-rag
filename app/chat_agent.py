@@ -115,6 +115,32 @@ def cited_ids_for(content: str, viewed_note_ids: list, retrieved_note_ids: list)
     return list(dict.fromkeys(cited))
 
 
+HIT_LIMIT = 8            # 单轮最多留存多少条命中原片
+HIT_SNIPPET_CHARS = 240  # 单条片段字符上限
+
+
+def build_hits(items, limit: int = HIT_LIMIT) -> list[dict]:
+    """把一次 search_notes 的命中压成可展示的原始片段。
+
+    「检索」视图并进对话后，前端要在回答下方按需展开"这一轮到底命中了什么"。
+    真到了展开那一刻再去重新检索，既慢又白付一次 embedding 费用，所以在编排层
+    顺手留存影本。这里只留展示必需的字段，正文截断，避免整轮结果灌进消息表。
+    """
+    hits = []
+    for item in (items if isinstance(items, list) else []):
+        if not isinstance(item, dict) or not item.get("note_id"):
+            continue
+        hits.append({
+            "note_id": item["note_id"],
+            "title": str(item.get("title") or ""),
+            "score": item.get("score"),
+            "snippet": " ".join(str(item.get("content") or "").split())[:HIT_SNIPPET_CHARS],
+        })
+        if len(hits) == limit:
+            break
+    return hits
+
+
 def build_trace(call: dict, result: dict, duration_ms: float) -> dict:
     """把一次工具调用压成可展示、可回归的轨迹记录（不含工具返回的正文）。"""
     data = result.get("data")
@@ -146,6 +172,7 @@ async def run_agent_turn(
 
     tool_map = {tool.name: tool for tool in tools}
     traces, retrieved_note_ids, viewed_note_ids, plan_id = [], [], [], None
+    retrieved_hits: list[dict] = []
     attempted_tools: set[str] = set()
     force_required_next = False
     for _ in range(max_rounds):
@@ -170,6 +197,7 @@ async def run_agent_turn(
                 "content": content,
                 "tool_calls": traces,
                 "retrieved_note_ids": list(dict.fromkeys(retrieved_note_ids)),
+                "retrieved_hits": retrieved_hits,
                 "cited_note_ids": cited,
                 # 兼容旧客户端；新代码应优先读取 cited_note_ids。
                 "source_note_ids": cited,
@@ -194,6 +222,9 @@ async def run_agent_turn(
             traces.append(trace)
             if call["name"] == "search_notes" and result.get("ok"):
                 retrieved_note_ids.extend(item["note_id"] for item in result["data"] if item.get("note_id"))
+                # 只留第一批命中的片段：多轮检索时越靠前的越接近用户原问。
+                if not retrieved_hits:
+                    retrieved_hits = build_hits(result["data"])
             if call["name"] == "get_note" and result.get("ok") and isinstance(data, dict):
                 if data.get("note_id"):
                     viewed_note_ids.append(data["note_id"])
@@ -232,6 +263,7 @@ async def run_agent_turn_stream(
 
     tool_map = {tool.name: tool for tool in tools}
     traces, retrieved_note_ids, viewed_note_ids, plan_id = [], [], [], None
+    retrieved_hits: list[dict] = []
     attempted_tools: set[str] = set()
     force_required_next = False
     for _ in range(max_rounds):
@@ -263,6 +295,7 @@ async def run_agent_turn_stream(
                 "content": content,
                 "tool_calls": traces,
                 "retrieved_note_ids": list(dict.fromkeys(retrieved_note_ids)),
+                "retrieved_hits": retrieved_hits,
                 "cited_note_ids": cited_ids_for(content, viewed_note_ids, retrieved_note_ids),
                 "plan_id": plan_id,
             }
@@ -287,6 +320,9 @@ async def run_agent_turn_stream(
             traces.append(trace)
             if call["name"] == "search_notes" and result.get("ok"):
                 retrieved_note_ids.extend(item["note_id"] for item in result["data"] if item.get("note_id"))
+                # 只留第一批命中的片段：多轮检索时越靠前的越接近用户原问。
+                if not retrieved_hits:
+                    retrieved_hits = build_hits(result["data"])
             if call["name"] == "get_note" and result.get("ok") and isinstance(data, dict):
                 if data.get("note_id"):
                     viewed_note_ids.append(data["note_id"])
