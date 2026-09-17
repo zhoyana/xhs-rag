@@ -30,6 +30,7 @@ from .chat_agent import plan_requested, run_agent_turn
 from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
+from . import xhs_source
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
     blob_to_vector,
@@ -320,9 +321,12 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             recaller=recall,
             drafter=create_draft,
         )
-        # 站外能力（小红书搜索/笔记详情）来自外部 MCP 服务，按白名单挂载；
-        # 服务不可用时静默缩编为纯本地工具，不影响聊天主链路。
-        tools = tools + await load_xhs_tools()
+        # 站外能力（小红书搜索/笔记详情/按链接采集/按链接收藏）来自外部 MCP 服务，
+        # 按白名单挂载；服务不可用时静默缩编为纯本地工具，不影响聊天主链路。
+        # 传入 store 才会多出"收藏进知识库"这个写工具：没有库就没有写入口。
+        tools = tools + await load_xhs_tools(
+            store=app.state.store, media_root=app.state.media_root
+        )
         # 代码层权限控制比 Prompt 更可靠：普通咨询时模型根本看不到写入型工具。
         wants_plan = plan_requested(body.content)
         if not wants_plan:
@@ -359,13 +363,31 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         }
 
-    async def import_from_url(url: str):
-        """单条与批量接口共用的核心步骤：下载、解析、保存。"""
+    async def _html_note(url: str) -> dict:
+        """网页解析通道。
+
+        刻意引用模块级 fetch_page / parse_note（而不是从别的模块导入函数对象），
+        这样接口测试替换 app.main.fetch_page 依旧生效，不必联网。
+        """
         html, final_url = await fetch_page(url)
-        note = parse_note(html, final_url)
+        return xhs_source.parse_html_note(parse_note, html, final_url, url)
+
+    async def collect_note(url: str) -> tuple[dict, str]:
+        """统一采集入口：优先 MCP（真实浏览器，结构完整），失败回退网页解析。
+
+        秋招知识点（降级链路）：MCP 更准但依赖本地服务与登录态，网页解析更独立
+        但怕页面改版。两条通道产出同一个 note 结构，谁成功都能继续走入库和下载，
+        调用方不需要分支处理。
+        """
+        return await xhs_source.collect_note(url, html_note=_html_note)
+
+    async def import_from_url(url: str):
+        """单条与批量接口共用的核心步骤：采集、保存。"""
+        note, source = await collect_note(url)
         note["created_at"] = datetime.now(timezone.utc).isoformat()
         saved, created = app.state.store.save(note)
-        return {"status": "imported" if created else "existing", "note": saved}
+        return {"status": "imported" if created else "existing", "note": saved,
+                "source": source}
 
     async def process_intake(job_id: str, url: str):
         """后台执行导入和图片下载，并在每个阶段写入 SQLite 进度。"""
@@ -375,8 +397,8 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         store.update_job(job_id, status="running", current_step="import",
                          progress=progress, now=now)
         try:
-            html, final_url = await fetch_page(url)
-            note = parse_note(html, final_url)
+            note, source = await collect_note(url)
+            logger.info("intake_collected job_id=%s source=%s", job_id, source)
             existing = store.get(note["note_id"])
             if existing is None:
                 note["created_at"] = datetime.now(timezone.utc).isoformat()
@@ -405,7 +427,7 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             store.update_job(
                 job_id, status=final_status, current_step="completed",
                 progress=progress,
-                result={"import_status": import_status, "assets": {
+                result={"import_status": import_status, "source": source, "assets": {
                     "total": download_result["total"],
                     "downloaded": download_result["downloaded"],
                     "skipped": download_result["skipped"],
