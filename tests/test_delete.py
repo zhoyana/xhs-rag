@@ -278,3 +278,84 @@ def test_bulk_delete_tasks_removes_only_existing(tmp_path):
 
         left = client.get("/tasks").json()["items"]
         assert [t["id"] for t in left] == [ids[2]]
+
+
+def register_local_image(store, media_root, note_id="n1", name="1.jpg"):
+    """在 media 目录里放一个真文件，并把它登记成这篇笔记的图片。"""
+    target = media_root / note_id / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"fake-jpeg-bytes")
+    asset = store.assets(note_id)[0]
+    store.complete_asset(asset["id"], {
+        "storage_key": f"{note_id}/{name}", "mime_type": "image/jpeg", "size_bytes": 15,
+        "width": 10, "height": 10, "sha256": "x" * 64,
+    })
+    return asset, target
+
+
+def test_image_delete_blocked_by_outer_layer_still_returns_200(tmp_path, monkeypatch):
+    """外层删除拦截层抛 SystemExit 时，接口必须返回 200，而不是 500。
+
+    真实事故（2026-09-17，批量删 8 篇）：图片清理那一步被运行环境的"安全删除"
+    拦截层拒绝，它抛的是 SystemExit——**不是 Exception**，所以 `except OSError` 完全
+    兜不住，一路穿过 FastAPI 变成 500。而此刻数据库里那几行**已经删掉且提交了**
+    （purge_note 是先删库、再删文件），于是用户看到"请求失败"，以为没删成功，
+    界面也因为没刷新一直显示着已经不存在的笔记。
+
+    所以这里钉两件事：① 返回 200 并把残留文件如实列进 failed_files；
+    ② 库里那行确实删了，不能让 500 把"已经完成的事"说成失败。
+    """
+    import pathlib
+
+    db_path = tmp_path / "del.sqlite3"
+    media_root = tmp_path / "media"
+    store, _, _ = seed_derived(db_path)
+    asset, target = register_local_image(store, media_root)
+    assert target.exists()
+
+    original = pathlib.Path.unlink
+
+    def deny(self, *args, **kwargs):
+        if self.exists() and self.name == "1.jpg":
+            raise SystemExit(1)      # 拦截层的拒绝方式：非 Exception，且不做任何删除
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", deny)
+
+    with TestClient(create_app(db_path, media_root=media_root)) as client:
+        response = client.delete("/notes/n1")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["notes"] == 1                 # 库里那行确实删掉了
+        assert body["removed_files"] == 0
+        assert body["failed_files"] == ["n1/1.jpg"]   # 没删成的文件如实上报
+        assert client.get("/notes/n1").status_code == 404
+
+    # 文件还在——不假装删掉了。残留由用户可见地列出来，而不是静默虚报。
+    assert target.exists()
+
+
+def test_bulk_delete_marks_unexpected_failure_without_dropping_the_rest(tmp_path, monkeypatch):
+    """某篇在存储层炸了（不是 404）时，剩下那些已经删掉的结果不能被一起丢掉。"""
+    db_path = tmp_path / "del.sqlite3"
+    for note_id in ("n1", "n2", "n3"):
+        seed_derived(db_path, note_id=note_id, with_images=False)
+
+    original = NoteStore.delete_note
+
+    def boom(self, note_id, delete_tasks=True):
+        if note_id == "n2":
+            raise RuntimeError("storage exploded")
+        return original(self, note_id, delete_tasks)
+
+    monkeypatch.setattr(NoteStore, "delete_note", boom)
+
+    with TestClient(create_app(db_path)) as client:
+        response = client.post("/notes/bulk-delete", json={"note_ids": ["n1", "n2", "n3"]})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["deleted_count"] == 2
+        assert body["failed"] == [{"note_id": "n2", "reason": "删除失败：RuntimeError"}]
+        # 失败那篇原样留着（不是被删一半），成功的两篇真没了。
+        assert counts(db_path, "n2")["notes"] == 1
+        assert [n["note_id"] for n in client.get("/notes").json()["items"]] == ["n2"]

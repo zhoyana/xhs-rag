@@ -476,7 +476,12 @@ async function deleteNote(note) {
     selection.notes.delete(noteId);
     clearNoteDetail();
     await refreshAfterNoteDelete();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    // 失败也要刷新：后端是"先删库（事务提交）→ 再删图片"，图片那步炸了同样会返回 500，
+    // 但数据库里那几行已经删掉了。不刷新的话界面还留着已经不存在的行，用户会反复重试。
+    await refreshAfterNoteDelete();
+  }
 }
 
 async function deletePickedNotes() {
@@ -498,6 +503,7 @@ async function deletePickedNotes() {
   } catch (e) {
     toast(e.message, true);
     updateBulkBar("notes");   // 失败时把按钮还原，别让它一直灰着
+    await refreshAfterNoteDelete();   // 理由同单篇删除：500 时库里可能已经删掉了
   }
 }
 

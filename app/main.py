@@ -894,6 +894,16 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             except OSError as exc:
                 logger.warning("删除笔记图片失败 note_id=%s key=%s: %s", note_id, key, exc)
                 failed_files.append(key)
+            except BaseException as exc:
+                # 外面套的删除拦截层（沙箱安全删除、回收站工具、杀软）在拒绝删除时
+                # 抛的往往不是 OSError 而是 SystemExit/BrokenPipeError 这类东西。
+                # SystemExit 连 Exception 都不是，会一路穿过接口变成 500——而此刻
+                # **数据库那一行已经删掉且提交了**，报 500 只会让用户以为"没删成功"
+                # 从而反复重试，把已经做完的事再做一遍。
+                # 所以这里和 OSError 同样处理：只记日志，把残留文件如实列进 failed_files。
+                logger.warning("删除笔记图片被中断 note_id=%s key=%s: %s: %s",
+                               note_id, key, type(exc).__name__, exc)
+                failed_files.append(key)
         stats["removed_files"] = removed_files
         stats["failed_files"] = failed_files
         return stats
@@ -921,6 +931,12 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                 result = purge_note(note_id, body.delete_tasks)
             except HTTPException as exc:
                 failed.append({"note_id": note_id, "reason": exc.detail})
+                continue
+            except Exception as exc:
+                # 存储层报错、外部删除拦截层抛错等意料之外的失败也按"单篇失败"记，
+                # 理由同上：不能因为一篇把整批的已删结果一起丢掉（那些已经落库了）。
+                logger.exception("批量删除单篇失败 note_id=%s", note_id)
+                failed.append({"note_id": note_id, "reason": f"删除失败：{type(exc).__name__}"})
                 continue
             tasks_removed += result["tasks"]
             deleted.append(result)
