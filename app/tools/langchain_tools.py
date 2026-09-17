@@ -63,7 +63,13 @@ def build_langchain_tools(
         ),
         StructuredTool.from_function(
             name="get_note",
-            description="根据笔记 ID 查看完整内容；仅在检索片段不足时调用。",
+            description=(
+                "根据笔记 ID 查看完整内容；仅在检索片段不足时调用。"
+                "返回按 正文 / 图片文字 / 评论 分段的 markdown。"
+                "某段写成“（无：原因）”表示知识库里确实没有这部分内容——"
+                "例如“入库时未采集评论”，如实转达即可，"
+                "不要把它说成是自己读取失败，也不要反复重试。"
+            ),
             func=lambda note_id: get_note_tool(getter, note_id),
             args_schema=GetNoteInput,
         ),

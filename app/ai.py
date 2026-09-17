@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 
 from .media import local_file_valid, storage_path
+from .note_text import flatten_inline, note_inline
 
 
 class AIProblem(Exception):
@@ -97,9 +98,7 @@ def _prompt(note: dict, memories: list[dict] | None = None) -> str:
     return f"""你正在分析一篇用户收藏的小红书笔记。
 请结合正文和所有图片内容，严格输出一个 JSON 对象，不要输出 Markdown 代码块。
 
-笔记标题：{note.get('title', '')}
-笔记正文：{note.get('content', '')}
-
+{note_inline(note, include_image_text=False)}
 {_memory_block(memories)}JSON 必须包含以下字段：
 summary: 中文摘要字符串；
 category: 从 健身、学习、做饭、工作、旅行、购物、其他 中选一个；
@@ -207,8 +206,7 @@ def _folder_prompt(note: dict, analysis: dict, confirmation: dict | None,
 同一篇笔记可以同时属于“内容主题”和“使用意图”两个收藏夹。
 严格输出 JSON 对象，不要输出 Markdown 代码块。
 
-笔记标题：{note.get('title', '')}
-笔记正文：{note.get('content', '')}
+{note_inline(note)}
 多模态分析：{json.dumps(analysis, ensure_ascii=False)}
 收藏意图：{json.dumps(intent, ensure_ascii=False)}
 {_memory_block(memories)}候选收藏夹：{json.dumps(folder_candidates, ensure_ascii=False)}
@@ -376,18 +374,11 @@ MEMORY_MAX_NEW = 2             # 一次确认最多沉淀的条数
 def _sanitize_inline(text, limit: int) -> str:
     """把任意文本压成一段安全短文本：剥离控制字符、折叠空白、按长度截断。
 
-    秋招知识点（提示词注入防御）：动态内容进入提示词前，必须按不可信输入处理。
-    控制字符（换行、制表符、不可见字符）会破坏提示词原有的指令边界——笔记正文里
-    写一行"忽略以上要求"就可能在视觉上被模型当成新指令；折叠成单段纯文本后，
-    它只能作为资料存在。截断则是上下文预算护栏，避免长正文挤掉真正的规则说明。
+    实现已迁到 `note_text.flatten_inline`——渲染层（提示词里的笔记片段）也要用
+    同一份清洗规则，两处各写一份迟早会漂移。这里保留同名函数，历史调用方与
+    测试无需改动。
     """
-    if not isinstance(text, str):
-        return ""
-    # isprintable() 对 \n \t \r 与各类不可见字符返回 False，统一替换为空格。
-    cleaned = "".join(ch if ch.isprintable() else " " for ch in text)
-    # split() 会丢弃首尾空白并把连续空白压成一个空格，再 join 回来即单段文本。
-    cleaned = " ".join(cleaned.split())
-    return cleaned[:limit]
+    return flatten_inline(text, limit)
 
 
 def _normalize_content(text: str) -> str:
@@ -408,8 +399,7 @@ def _memory_prompt(note: dict, confirmation: dict, existing_memories: list[dict]
 请根据下面这篇笔记和用户刚刚确认的收藏意图，判断是否产生了值得长期记住的新信息，
 并严格输出一个 JSON 对象，不要输出 Markdown 代码块。
 
-笔记标题：{_sanitize_inline(note.get('title', ''), 200)}
-笔记正文：{_sanitize_inline(note.get('content', ''), MEMORY_NOTE_LIMIT)}
+{note_inline(note, content_limit=MEMORY_NOTE_LIMIT)}
 用户确认的分类：{_sanitize_inline(confirmation.get('category', ''), 50)}
 用户确认的意图：{_sanitize_inline(confirmation.get('intent', ''), 300)}
 用户选择的行动：{_sanitize_inline('；'.join(actions), 300)}
