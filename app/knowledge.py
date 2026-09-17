@@ -13,6 +13,8 @@ CHUNK_SIZE = 500
 CHUNK_OVERLAP = 80
 CHINESE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
 TOPIC_PATTERN = re.compile(r"#([^#\n]+?)\[话题\]#")
+# 视觉模型转写的图片文字并入正文时加的标记，便于检索命中后分辨内容来源。
+IMAGE_TEXT_HEADER = "【图片文字】"
 
 
 def text_hash(text: str) -> str:
@@ -43,6 +45,12 @@ def note_document(note: dict) -> Document:
     # 秋招知识点：Document 将正文与 metadata 分离，是 LangChain 检索链的标准输入。
     title = note.get("title", "").strip()
     content, topics = extract_topics(note.get("content", "").strip())
+    # 小红书大量笔记把内容写在长图里，正文只剩话题标签；视觉模型转写的 image_text
+    # 才是真正的内容。不并进正文，这些笔记就永远索引为空、收藏完搜不到。
+    image_text = str(note.get("image_text") or "").strip()
+    if image_text:
+        content = (f"{content}\n\n{IMAGE_TEXT_HEADER}\n{image_text}" if content
+                   else f"{IMAGE_TEXT_HEADER}\n{image_text}")
     if not title or not content:
         raise ValueError("标题和正文不能为空，无法建立知识库文档。")
 

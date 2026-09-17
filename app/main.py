@@ -24,20 +24,18 @@ from .database import NoteStore, DEFAULT_DB
 from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
 from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe, extract_chat_memories_safe
-from .knowledge import document_hash, split_note
 from .retrieval import search_knowledge
 from .chat_agent import plan_requested, run_agent_turn
 from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
-from . import xhs_source
+from . import indexing, xhs_source
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
     blob_to_vector,
     cosine_similarity,
     embed_query as embed_search_query,
     embed_texts,
-    vector_to_blob,
 )
 
 
@@ -987,18 +985,15 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
 
     @app.post("/notes/{note_id}/index", summary="用 LangChain 建立文档和中文分块")
     def index_note(note_id: str):
-        # 秋招知识点：API 层只做编排；切分逻辑在 knowledge.py，持久化在 database.py。
-        note = get_note(note_id)
+        # 秋招知识点：API 层只做编排；切分在 knowledge.py，持久化在 database.py，
+        # 组合流程（含收藏时的"索引 + 向量"）在 indexing.py，端点与工具共用一份实现。
+        get_note(note_id)
         try:
-            document, chunks = split_note(note)
-        except ValueError as exc:
+            result = indexing.index_note(app.state.store, note_id)
+        except indexing.EmptyContent as exc:
             # 秋招知识点：422 表示请求格式可解析，但业务内容无法处理。
             raise HTTPException(422, detail=str(exc)) from None
-        now = datetime.now(timezone.utc).isoformat()
-        saved, changed = app.state.store.index_document(
-            note, document, chunks, document_hash(document), now
-        )
-        return {"status": "indexed" if changed else "existing", "document": saved}
+        return {"status": result["status"], "document": result["document"]}
 
     @app.get("/notes/{note_id}/document", summary="查看笔记对应的知识库文档")
     def get_document(note_id: str):
@@ -1018,39 +1013,13 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
 
     @app.post("/documents/{document_id}/embed", summary="为尚未向量化的 Chunk 生成 Embedding")
     def embed_document(document_id: int):
-        chunks = app.state.store.document_chunks(document_id)
-        if not chunks:
+        # 与收藏流程共用 app.indexing 的实现，避免"手动能搜、收藏后搜不到"的逻辑漂移。
+        # 这里显式传入本模块的 embed_texts：测试习惯替换 app.main.embed_texts，
+        # 显式传参比依赖 indexing 模块的默认值更稳定。
+        result = indexing.embed_document(app.state.store, document_id, embedder=embed_texts)
+        if result["status"] == "missing":
             raise HTTPException(404, detail="文档不存在或尚无分块。")
-
-        pending = app.state.store.chunks_needing_embeddings(document_id, EMBEDDING_MODEL)
-        if pending:
-            # 秋招知识点：只计算缺失/过期向量，是 Embedding 层的幂等与增量更新。
-            # 标题为每个正文片段补充主题上下文，但不再存成单独的标题 Chunk。
-            # 秋招知识点：切分内容与向量化输入可以不同，前者保证展示干净，后者增强语义。
-            embedding_inputs = [
-                f"标题：{chunk['title']}\n正文片段：{chunk['content']}" for chunk in pending
-            ]
-            vectors = embed_texts(embedding_inputs)
-            records = [{
-                "chunk_id": chunk["id"],
-                "model": EMBEDDING_MODEL,
-                "dimension": len(vector),
-                "vector": vector_to_blob(vector),
-                "content_hash": chunk["content_hash"],
-            } for chunk, vector in zip(pending, vectors, strict=True)]
-            app.state.store.save_embeddings(
-                records, datetime.now(timezone.utc).isoformat()
-            )
-
-        total = app.state.store.embedding_count(document_id, EMBEDDING_MODEL)
-        return {
-            "status": "embedded" if pending else "existing",
-            "model": EMBEDDING_MODEL,
-            "dimension": 512,
-            "total": total,
-            "embedded": len(pending),
-            "skipped": len(chunks) - len(pending),
-        }
+        return result
 
     @app.post("/search", summary="使用 Embedding 余弦相似度检索知识库")
     def semantic_search(body: SearchRequest):
