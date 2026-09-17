@@ -42,6 +42,41 @@ def test_topics_become_metadata_instead_of_standalone_chunks():
     assert document_hash(document) != document_hash(split_note(changed)[0])
 
 
+def test_note_with_only_topics_falls_back_to_them_as_text():
+    """正文只剩话题标签时，标签是这篇笔记仅有的文字线索，不能判成"正文为空"。
+
+    小红书的面经、教程常把内容全画在长图里，desc 只剩标签。这种情况若直接
+    判为空，索引会被跳过，用户收藏完一个字都搜不到。
+    """
+    note = {
+        "note_id": "topics-only",
+        "title": "淘宝 AI Agent 开发面经",
+        "content": "#秋招[话题]# #面试[话题]# #AI产品经理[话题]#",
+        "source_url": "https://www.xiaohongshu.com/explore/topics-only",
+        "images": [],
+    }
+
+    document, chunks = split_note(note)
+
+    assert "秋招" in document.page_content and "AI产品经理" in document.page_content
+    # 标签仍然进 metadata，只是同时兜底当正文用。
+    assert document.metadata["topics"] == ["秋招", "面试", "AI产品经理"]
+    assert chunks
+
+
+def test_image_text_is_indexed_but_not_the_header_alone():
+    """图片文字并入可检索正文——这是图片承载型笔记能被搜到的前提。"""
+    note = sample_note(repeat=2)
+    note["content"] = "#面经[话题]#"
+    note["image_text"] = "一面问了 ReAct 与 Function Calling 的执行链路。"
+
+    document, chunks = split_note(note)
+
+    assert "ReAct" in document.page_content
+    assert "【图片文字】" in document.page_content
+    assert any("ReAct" in chunk.page_content for chunk in chunks)
+
+
 def test_index_is_idempotent_and_persistent(tmp_path):
     # 秋招知识点：这是集成测试，同时覆盖 HTTP、业务逻辑和临时 SQLite。
     db_path = tmp_path / "knowledge.sqlite3"

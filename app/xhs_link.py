@@ -29,6 +29,24 @@ _TOPIC_PATTERN = re.compile(r"#[^#\s]{1,40}#?")
 # 去掉话题标签后正文短于这个长度，就认为内容主要不在文字里。
 MIN_TEXT_CONTENT = 40
 
+
+def text_body_length(content: str) -> int:
+    """去掉话题标签后的正文长度。
+
+    小红书的话题标签（#xxx[话题]#）不算内容，判断"内容是不是都在长图里"
+    要看剥掉它们之后还剩多少字。
+    """
+    return len(_TOPIC_PATTERN.sub("", content or "").strip())
+
+
+def content_lives_in_images(note: dict) -> bool:
+    """正文是不是空壳（真正的内容在长图里）。
+
+    采集层据此决定要不要花一次视觉调用来读图：正文够长的笔记不必付这个成本，
+    只有正文只剩话题标签的才需要。
+    """
+    return text_body_length(note.get("content", "")) < MIN_TEXT_CONTENT
+
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 

@@ -27,10 +27,15 @@ import os
 import time
 
 from .extractor import fetch_page, parse_note
-from .xhs_link import XhsLinkError, expand_short_link, note_from_feed_detail, parse_xhs_link
+from .xhs_link import (XhsLinkError, content_lives_in_images, expand_short_link,
+                       note_from_feed_detail, parse_xhs_link)
 from .xhs_mcp import XhsMcpUnavailable, fetch_feed_detail
+from .xhs_vision import apply_image_text, transcribe_images
 
 logger = logging.getLogger("xhs.source")
+
+# 收件箱通道的转写器，单测替换它以免调用真实视觉模型。
+DEFAULT_TRANSCRIBE = transcribe_images
 
 # 采集来源：写进收件箱任务，便于区分"是 MCP 采的"还是"网页解析采的"。
 SOURCE_MCP = "mcp"
@@ -129,14 +134,43 @@ async def default_html_note(url: str) -> dict:
     return parse_html_note(parse_note, html, final_url, url)
 
 
-async def collect_note(url: str, *, html_note=None) -> tuple[dict, str]:
+async def collect_note(url: str, *, html_note=None, read_images: bool = True,
+                       transcribe=None) -> tuple[dict, str]:
     """统一采集入口，返回 (note, 来源)。
 
     html_note 用于注入网页解析实现（HTTP 层需要让 fetch_page / parse_note
     仍是可被测试替换的模块级引用），不传时用本模块的默认实现。
+
+    两条通道都只拿得到 desc 字段，而小红书大量笔记把内容画在长图里、正文只剩
+    话题标签。read_images 打开时这类笔记会被补上图片文字——否则它们入库后索引
+    是空的，收藏完根本搜不到。正文够长的笔记不会触发读图，不付这份成本。
     """
     note = await collect_via_mcp(url)
-    if note is not None:
-        return note, SOURCE_MCP
-    fallback = html_note or default_html_note
-    return await fallback(url), SOURCE_HTML
+    source = SOURCE_MCP
+    if note is None:
+        fallback = html_note or default_html_note
+        note, source = await fallback(url), SOURCE_HTML
+    if read_images:
+        await enrich_image_text(note, transcribe=transcribe)
+    return note, source
+
+
+async def enrich_image_text(note: dict, *, transcribe=None) -> dict:
+    """为"内容全在图片里"的笔记补上识别出的文字（就地修改并返回同一个 note）。
+
+    秋招知识点（多模态的位置）：视觉调用放在采集层，下游的入库、索引、检索
+    都只面对纯文本，不需要知道这篇笔记的内容原本是一张图。
+    """
+    if str(note.get("image_text") or "").strip():
+        return note
+    # 正文够长的笔记不必读图：省一次视觉调用，也省掉几秒等待。
+    if not note.get("images") or not content_lives_in_images(note):
+        return note
+    transcribe = transcribe or DEFAULT_TRANSCRIBE
+    try:
+        vision = await transcribe(note["images"], title=note.get("title", ""))
+    except Exception:  # noqa: BLE001 - 读图失败只降级成"只有文字正文"
+        logger.warning("xhs_source_transcribe_failed", exc_info=True)
+        vision = {"status": "failed", "text": "", "error": "视觉识别异常。"}
+    apply_image_text(note, vision)
+    return note

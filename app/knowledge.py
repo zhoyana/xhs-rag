@@ -51,6 +51,11 @@ def note_document(note: dict) -> Document:
     if image_text:
         content = (f"{content}\n\n{IMAGE_TEXT_HEADER}\n{image_text}" if content
                    else f"{IMAGE_TEXT_HEADER}\n{image_text}")
+    if not content and topics:
+        # 正文剥掉话题标签后为空（真正的内容在长图里，且这次没读到图片文字）：
+        # 标签是这篇笔记仅有的文字线索，并进正文至少还能按标签语义命中，
+        # 不并的话它连"索引为空"这一步都过不去，彻底搜不到。
+        content = "、".join(topics)
     if not title or not content:
         raise ValueError("标题和正文不能为空，无法建立知识库文档。")
 

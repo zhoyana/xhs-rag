@@ -5,10 +5,13 @@
 ——收藏完能搜到。本模块把两步组合成可复用的服务函数，让 HTTP 端点与 Agent 收藏工具
 共用同一份实现，避免"手动点一次能搜、收藏后搜不到"这类两处逻辑漂移。
 """
+import logging
 from datetime import datetime, timezone
 
 from .embeddings import EXPECTED_DIMENSION, MODEL_NAME, embed_texts, vector_to_blob
 from .knowledge import document_hash, split_note
+
+logger = logging.getLogger(__name__)
 
 
 class EmptyContent(ValueError):
@@ -83,7 +86,7 @@ def index_and_embed(store, note_id, *, embedder=None, model=MODEL_NAME, now=None
     返回结构化摘要而**不抛异常**：收藏流程里"这篇笔记暂时没有可检索正文"
     不该让整次收藏失败，调用方据此如实向用户汇报即可。
     status 取值：indexed（新建/更新了索引）/ existing（内容没变，索引与向量都在位）
-    / skipped（没有可索引文字）/ failed（由调用方包装，见 xhs_mcp._index_safely）。
+    / skipped（没有可索引文字）/ failed（由调用方包装，见 index_safely）。
     """
     now = now or datetime.now(timezone.utc).isoformat()
     try:
@@ -107,3 +110,27 @@ def index_and_embed(store, note_id, *, embedder=None, model=MODEL_NAME, now=None
         # 收藏后能否立刻语义检索，取决于向量是否真的落库了，而不是索引建没建。
         "searchable": embedded["total"] > 0,
     }
+
+
+# 可替换点：单测把它换成不加载模型的替身，写路径的代码本身不做任何分支。
+DEFAULT_INDEXER = index_and_embed
+
+
+def index_safely(store, note_id, *, indexer=None) -> dict:
+    """建索引 + 生成向量；失败只降级，绝不牵连已经保存好的笔记。
+
+    秋招知识点（派生数据可以重建）：索引和向量都能从 notes 原文重算，
+    所以它们的失败不该把"笔记与图片已经存好"这件事一起回滚——用户真正
+    要的东西已经拿到了，只是暂时搜不到。
+
+    收件箱导入（`/notes/import`、`/notes/import-batch`、`/notes/intake`）、
+    刷新正文（`/notes/{id}/refresh-source`）和 Agent 收藏三条写路径都走这里，
+    降级语义只此一份，避免某条路径忘了兜底而让整次导入失败。
+    """
+    indexer = indexer or DEFAULT_INDEXER
+    try:
+        return indexer(store, note_id)
+    except Exception:  # noqa: BLE001 - 派生步骤失败不影响主流程
+        logger.warning("note_index_failed note_id=%s", note_id, exc_info=True)
+        return {"status": "failed", "note_id": note_id, "searchable": False,
+                "reason": "建索引失败，笔记已保存，可稍后重建索引。"}

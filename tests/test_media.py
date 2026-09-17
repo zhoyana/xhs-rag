@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 from fastapi.testclient import TestClient
 
+from app import indexing
 from app.database import NoteStore
 from app.extractor import ImportProblem
 from app.main import create_app
@@ -163,6 +164,37 @@ def test_refresh_source_updates_failed_urls_and_preserves_downloaded_file(tmp_pa
     assert assets[1]["source_url"].endswith("fresh-2") and assets[1]["status"] == "success"
     assert assets[1]["storage_key"] == "abc123/kept.jpg"
     assert assets[2]["status"] == "obsolete"
+
+
+def test_refresh_source_rebuilds_the_index(tmp_path, monkeypatch):
+    """正文刷新后旧索引就过期了，接口应当顺手重建，别让用户再点一次。"""
+    db_path = setup_note(tmp_path)
+
+    async def fake_fetch(_url):
+        return "fresh html", "https://www.xiaohongshu.com/explore/abc123"
+
+    def fake_parse(_html, _url, requested_url=None):
+        return {"note_id": "abc123", "title": "刷新后的标题", "content": "新正文",
+                "source_url": "https://www.xiaohongshu.com/explore/abc123", "images": []}
+
+    calls = []
+
+    def recording_index(_store, note_id, **_kwargs):
+        calls.append(note_id)
+        return {"status": "indexed", "note_id": note_id, "searchable": True}
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    monkeypatch.setattr("app.main.parse_note", fake_parse)
+    monkeypatch.setattr(indexing, "DEFAULT_INDEXER", recording_index)
+
+    with TestClient(create_app(db_path)) as client:
+        body = client.post("/notes/abc123/refresh-source", json={
+            "share_text": "https://www.xiaohongshu.com/explore/abc123"}).json()
+
+    assert calls == ["abc123"]
+    assert body["index"]["searchable"] is True
+    # 已经自动做了，就不该再提示用户手动点一次建索引。
+    assert not any(step.endswith("/index") for step in body["next_steps"])
 
 
 def test_refresh_rejects_a_different_note(tmp_path, monkeypatch):
