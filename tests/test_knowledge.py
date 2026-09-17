@@ -72,3 +72,27 @@ def test_missing_index_returns_404(tmp_path):
     NoteStore(db_path).save(sample_note(note_id="not-indexed", repeat=2))
     with TestClient(create_app(db_path)) as client:
         assert client.get("/notes/not-indexed/document").status_code == 404
+
+
+def test_image_text_is_indexed_alongside_the_content():
+    """图片承载型笔记：视觉转写结果必须进正文，否则收藏完根本搜不到。"""
+    note = sample_note(repeat=2)
+    note["image_text"] = "一面：讲讲 Redis 的持久化方案。"
+    document, chunks = split_note(note)
+
+    assert "Redis 的持久化方案" in document.page_content
+    assert any("Redis 的持久化方案" in chunk.page_content for chunk in chunks)
+    # 正文本身仍要保留，转写结果只是补充而不是替换。
+    assert "先理解检索" in document.page_content
+
+
+def test_image_only_note_can_still_be_documented():
+    """正文只剩话题标签时，只要转写出文字就该能建文档，不再判为"正文为空"。"""
+    note = sample_note(repeat=1)
+    note["content"] = "#面试[话题]#"
+    note["image_text"] = "面试问题：如何设计一个检索评测集？"
+    document, chunks = split_note(note)
+
+    assert document.page_content.strip()
+    assert chunks
+    assert all(chunk.page_content.strip() for chunk in chunks)

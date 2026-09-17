@@ -25,3 +25,19 @@ def _offline_mcp_channel(monkeypatch):
     monkeypatch.setattr(xhs_source, "fetch_feed_detail", unavailable)
     yield
     xhs_source.reset_breaker()
+
+
+@pytest.fixture(autouse=True)
+def _offline_indexer(monkeypatch):
+    """默认不加载真实的 Embedding 模型。
+
+    收藏流程会在保存后自动"建索引 + 生成向量"，而真实模型要下载权重、推理耗时
+    数秒，单测必须离线且秒级完成。这里替换的是收藏工具的默认索引器；需要验证
+    真实索引逻辑的用例直接测 app.indexing（注入假向量函数），或自己传 indexer。
+    """
+    def fake_index(store, note_id, **_kwargs):
+        return {"status": "indexed", "note_id": note_id, "chunk_count": 1,
+                "vector_total": 1, "searchable": True}
+
+    monkeypatch.setattr(xhs_mcp, "DEFAULT_INDEXER", fake_index)
+    yield

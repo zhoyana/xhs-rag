@@ -18,6 +18,7 @@ from langchain_core.tools import StructuredTool
 from .media import download_note_assets
 from .xhs_link import XhsLinkError, expand_short_link, note_from_feed_detail, parse_xhs_link
 from .xhs_vision import transcribe_images
+from . import indexing
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +46,18 @@ SAVE_TOOL_DESCRIPTION = (
     "把小红书链接对应的笔记收藏进用户的知识库，并把图片下载到本地保存。"
     "只在用户明确要求「收藏 / 保存 / 存进知识库 / 加进我的资料」时使用；"
     "只是想知道内容用什么都不用写库的 collect_note_by_link，不要两个都调。"
-    "返回 note_id、status（imported 新建 / existing 已存在）和图片落盘数量，"
+    "收藏时会自动建立语义索引并生成向量，返回的 index.searchable 为 true 表示"
+    "这篇笔记现在就能被语义检索到；index.status 为 skipped 说明它没有可检索的正文"
+    "（纯图片且未识别出文字），failed 说明索引失败但笔记与图片已经保存好了。"
+    "返回 note_id、status（imported 新建 / existing 已存在）、图片落盘数量和 index 摘要，"
     "必须按返回值如实汇报，不要编造保存结果。"
 )
 
 _cache: list | None = None
 DEFAULT_TRANSCRIBE = transcribe_images
 DEFAULT_DOWNLOAD = download_note_assets
+# 收藏后自动建索引：默认是"建文档 + 分块 + 生成向量"一步到位，收藏完即可语义检索。
+DEFAULT_INDEXER = indexing.index_and_embed
 
 
 class XhsMcpUnavailable(Exception):
@@ -232,14 +238,47 @@ def build_link_collect_tool(detail_tool, transcribe=None) -> StructuredTool:
     )
 
 
-def _persist_note(store, media_root, note: dict, downloader=None) -> tuple[dict, str, dict]:
-    """入库 + 图片落盘。返回 (保存后的 note, 状态, 素材统计)。
+def _index_safely(indexer, store, note_id: str) -> dict:
+    """建索引 + 生成向量；失败只降级，绝不牵连已经成功的收藏。
 
-    与收件箱 process_intake 用同一条管线：新建走 save，重复收藏走
+    秋招知识点（派生数据可以重建）：索引和向量都能从 notes 原文重算，
+    所以它们的失败不该把"笔记与图片已经存好"这件事一起回滚——用户真正
+    要的东西已经拿到了，只是暂时搜不到。
+    """
+    try:
+        return indexer(store, note_id)
+    except Exception:  # noqa: BLE001 - 派生步骤失败不影响主流程
+        logger.warning("xhs_note_index_failed note_id=%s", note_id, exc_info=True)
+        return {"status": "failed", "reason": "建索引失败，笔记已保存，可稍后重建索引。"}
+
+
+def _index_summary(index: dict) -> dict:
+    """只把对用户有意义的字段交给模型，别把整份内部结构塞进上下文。
+
+    searchable 无论成败都返回，模型才能稳定地判断"现在能不能搜到"，
+    而不是在缺少字段时靠猜。
+    """
+    summary = {"status": index.get("status", "unknown"),
+               "searchable": bool(index.get("searchable"))}
+    for key in ("chunk_count", "vector_total", "reason"):
+        if key in index:
+            summary[key] = index[key]
+    return summary
+
+
+def _persist_note(store, media_root, note: dict, downloader=None,
+                  indexer=None) -> tuple[dict, str, dict, dict]:
+    """入库 + 图片落盘 + 建索引。返回 (保存后的 note, 状态, 素材统计, 索引摘要)。
+
+    与收件箱 process_intake 用同一条入库管线：新建走 save，重复收藏走
     refresh_note_source（刷新带签名的临时图片地址，已下载的文件保持不变）。
-    downloader 可注入，单测里换成不联网的替身。
+    downloader / indexer 均可注入，单测里换成不联网的替身。
+
+    秋招知识点（顺序有意义）：向量化的输入是**入库后**的正文（含 image_text），
+    所以索引必须排在 save 之后，不能反过来。
     """
     downloader = downloader or DEFAULT_DOWNLOAD
+    indexer = indexer or DEFAULT_INDEXER
     now = datetime.now(timezone.utc).isoformat()
     if store.get(note["note_id"]) is None:
         note["created_at"] = now
@@ -251,12 +290,14 @@ def _persist_note(store, media_root, note: dict, downloader=None) -> tuple[dict,
     store.ensure_assets(saved)
     # 下载是同步的阻塞 IO（httpx + Pillow），由调用方放进线程执行。
     assets = downloader(store, saved, media_root)
-    return saved, status, assets
+    # 索引同样是阻塞的（切分 + 模型推理），和下载一起留在同一个线程里。
+    index = _index_safely(indexer, store, saved["note_id"])
+    return saved, status, assets, index
 
 
 def build_save_note_tool(detail_tool, store, media_root, *, transcribe=None,
-                         downloader=None, collector=None) -> StructuredTool:
-    """把"采集 + 入库 + 图片落盘"包成收藏工具。
+                         downloader=None, collector=None, indexer=None) -> StructuredTool:
+    """把"采集 + 入库 + 图片落盘 + 建索引"包成收藏工具。
 
     秋招知识点（写工具单独成一个工具）：采集工具保持纯读，收藏是写操作。
     拆开之后，普通问答时模型视野里没有任何写入口；提示词注入想借"读笔记"
@@ -265,6 +306,7 @@ def build_save_note_tool(detail_tool, store, media_root, *, transcribe=None,
     transcribe = transcribe or DEFAULT_TRANSCRIBE
     downloader = downloader or DEFAULT_DOWNLOAD
     collector = collector or _collect_note_for_link
+    indexer = indexer or DEFAULT_INDEXER
 
     async def save(link: str) -> dict:
         try:
@@ -276,8 +318,8 @@ def build_save_note_tool(detail_tool, store, media_root, *, transcribe=None,
             return _failure(exc.code, str(exc))
 
         try:
-            saved, status, assets = await asyncio.to_thread(
-                _persist_note, store, media_root, note, downloader)
+            saved, status, assets, index = await asyncio.to_thread(
+                _persist_note, store, media_root, note, downloader, indexer)
         except Exception:  # noqa: BLE001 - 写库失败不该让整轮对话崩掉
             logger.warning("xhs_save_note_failed", exc_info=True)
             return _failure("save_failed", "采集成功但写入知识库失败，请稍后重试。")
@@ -289,6 +331,8 @@ def build_save_note_tool(detail_tool, store, media_root, *, transcribe=None,
             "status": status,
             "assets": assets,
             "has_image_text": bool(str(saved.get("image_text") or "").strip()),
+            # 收藏完能不能马上语义检索，取决于这一步的结果，必须如实回报。
+            "index": _index_summary(index),
             "warnings": saved.get("warnings", []),
         }, "error": None}
 

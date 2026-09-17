@@ -227,10 +227,11 @@ def test_call_detail_maps_plain_text_failure():
 
 # ---------------- 收藏工具 ----------------
 
-def save_tool(store, media_root, *, images=1, downloader=None, transcribe=None):
+def save_tool(store, media_root, *, images=1, downloader=None, transcribe=None, indexer=None):
     detail = FakeDetailTool(result=feed_detail_text(images=images))
     return xhs_mcp.build_save_note_tool(
-        detail, store, media_root, transcribe=transcribe, downloader=downloader), detail
+        detail, store, media_root, transcribe=transcribe, downloader=downloader,
+        indexer=indexer), detail
 
 
 def test_save_tool_writes_note_assets_and_image_text(tmp_path):
@@ -304,6 +305,60 @@ def test_save_tool_reports_write_failure_without_crashing(tmp_path):
 
     assert result["ok"] is False
     assert result["error"]["code"] == "save_failed"
+
+
+# ---------------- 收藏后自动建索引 ----------------
+
+def test_save_tool_builds_index_so_the_note_is_searchable(tmp_path):
+    """收藏完要能马上语义检索：索引器必须拿到刚入库的 note_id。"""
+    store = NoteStore(tmp_path / "indexed.sqlite3")
+    seen = []
+
+    def recording_indexer(_store, note_id, **_kwargs):
+        seen.append(note_id)
+        return {"status": "indexed", "note_id": note_id, "chunk_count": 3,
+                "vector_total": 3, "searchable": True}
+
+    tool, _detail = save_tool(store, tmp_path / "media", indexer=recording_indexer)
+    result = run(tool.ainvoke({"link": PC_LINK}))
+
+    assert result["ok"] is True
+    assert seen == [SAVED_NOTE_ID]
+    assert result["data"]["index"] == {"status": "indexed", "searchable": True,
+                                       "chunk_count": 3, "vector_total": 3}
+
+
+def test_save_tool_keeps_the_note_when_indexing_fails(tmp_path):
+    """索引是可重建的派生数据：它失败不该把已存好的笔记和图片一起丢掉。"""
+    store = NoteStore(tmp_path / "indexfail.sqlite3")
+
+    def broken_indexer(_store, _note_id, **_kwargs):
+        raise RuntimeError("向量库不可用")
+
+    tool, _detail = save_tool(store, tmp_path / "media", indexer=broken_indexer)
+    result = run(tool.ainvoke({"link": PC_LINK}))
+
+    assert result["ok"] is True
+    assert result["data"]["index"]["status"] == "failed"
+    assert result["data"]["index"]["searchable"] is False
+    assert store.get(SAVED_NOTE_ID) is not None
+    assert len(store.assets(SAVED_NOTE_ID)) == 1
+
+
+def test_save_tool_reports_skipped_index_for_textless_note(tmp_path):
+    """纯图片且没转写出文字：索引跳过，但收藏本身仍然成功且如实回报。"""
+    store = NoteStore(tmp_path / "skipped.sqlite3")
+
+    def skipping_indexer(_store, note_id, **_kwargs):
+        return {"status": "skipped", "note_id": note_id, "reason": "标题和正文不能为空"}
+
+    tool, _detail = save_tool(store, tmp_path / "media", indexer=skipping_indexer)
+    result = run(tool.ainvoke({"link": PC_LINK}))
+
+    assert result["ok"] is True
+    assert result["data"]["index"]["status"] == "skipped"
+    assert result["data"]["index"]["searchable"] is False
+    assert store.get(SAVED_NOTE_ID) is not None
 
 
 # ---------------- 读工具与写工具的边界 ----------------
