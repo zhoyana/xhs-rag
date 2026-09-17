@@ -189,6 +189,19 @@ class ChatMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=4000, description="用户发送给知识库助手的消息")
 
 
+def memory_triggered(content: str) -> bool:
+    """只用明确的记忆指令或稳定偏好触发提炼；一次性问题不触发模型调用。"""
+    text = content.strip()
+    if re.search(r"(?:别|不要|不用)记住", text):
+        return False
+    if re.search(r"(?:请|帮我|你要|以后)?记住|以后(?:都|请|按这个)|下次(?:也|都|请)", text):
+        return True
+    return bool(re.search(
+        r"我(?:一直|长期|通常|平时|习惯|偏好|更喜欢|不喜欢|每天(?:只能|只有|都)|"
+        r"每周(?:只能|只有|都)|是在职备考)", text
+    ))
+
+
 class FolderCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=50, description="收藏夹名称")
     description: str = Field(default="", max_length=500, description="收藏夹用途说明")
@@ -295,7 +308,8 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return thread
 
     @app.post("/threads/{thread_id}/messages", summary="与知识库 Agent 对话")
-    async def send_chat_message(thread_id: str, body: ChatMessageRequest):
+    async def send_chat_message(thread_id: str, body: ChatMessageRequest,
+                                background_tasks: BackgroundTasks):
         if app.state.store.thread(thread_id) is None:
             raise HTTPException(404, detail="对话不存在。")
         now = datetime.now(timezone.utc).isoformat()
@@ -350,6 +364,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                 "plan_id": result["plan_id"],
             }, datetime.now(timezone.utc).isoformat()
         )
+        # 响应写好后再提炼：用户先拿到正常回复，候选记忆随后进入审核区。
+        if memory_triggered(body.content):
+            background_tasks.add_task(consolidate_thread_memories, thread_id)
         return {"thread_id": thread_id, "message": assistant}
 
     async def consolidate_thread_memories(thread_id: str):
@@ -366,22 +383,36 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             return
         messages = thread["messages"]
         user_turns = sum(1 for m in messages if m.get("role") == "user")
-        # 少于两轮有效对话不值得花一次模型调用：太短提不出稳定偏好。
-        if user_turns < 2 or len(messages) < 4:
+        # 明确说“记住”或表达长期习惯时，一轮也可以提炼；普通短对话仍跳过。
+        latest_user = next((m["content"] for m in reversed(messages)
+                            if m.get("role") == "user"), "")
+        if (user_turns < 2 or len(messages) < 4) and not memory_triggered(latest_user):
             logger.info("memory_consolidate_skipped thread_id=%s messages=%d",
                         thread_id, len(messages))
             return
-        memories, model = await extract_chat_memories_safe(
-            messages, store.active_memories(), thread_id
-        )
-        if not memories or not model:
-            # 降级路径：safe 包装已经写过 memory_extract_failed 日志。
-            return
-        candidates = store.save_memory_candidates(
-            model, memories, thread_id, datetime.now(timezone.utc).isoformat()
-        )
-        logger.info("memory_candidates_from_chat thread_id=%s count=%d",
-                    thread_id, len(candidates))
+        try:
+            for attempt in range(2):
+                # 待审核候选也用于去重，但仍不能参与 Agent 的 recall_memories()。
+                known_memories = store.active_memories(limit=10) + store.memory_candidates(
+                    status="pending", source_note_id=thread_id, limit=10
+                )
+                memories, model = await extract_chat_memories_safe(
+                    messages, known_memories, thread_id
+                )
+                if model is not None:
+                    break  # 空数组也可能是正常结果，不因此重试。
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+            if memories and model:
+                candidates = store.save_memory_candidates(
+                    model, memories, thread_id, datetime.now(timezone.utc).isoformat()
+                )
+                logger.info("memory_candidates_from_chat thread_id=%s count=%d",
+                            thread_id, len(candidates))
+        except Exception as exc:
+            # 后台附加功能失败只记录类型；不会影响已经生成的对话回复。
+            logger.warning("memory_consolidate_failed thread_id=%s exception_type=%s",
+                           thread_id, type(exc).__name__)
 
     @app.post("/threads/{thread_id}/consolidate",
               summary="从会话消息中提炼长期记忆候选（会话结束或每 N 轮触发）")

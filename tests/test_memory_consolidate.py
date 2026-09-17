@@ -1,6 +1,9 @@
 """会话 → 长期记忆沉淀通道测试：替换提炼函数，不联网也不产生费用。"""
+import asyncio
+
 from fastapi.testclient import TestClient
 
+from app.ai import _chat_memory_prompt, extract_chat_memories
 from app.database import NoteStore
 from app.main import create_app
 
@@ -127,7 +130,30 @@ def test_repeated_consolidation_does_not_duplicate_candidates(tmp_path, monkeypa
         client.post("/threads/t1/consolidate")
 
     assert len(extractor.calls) == 2
+    # 第二次提炼能看到尚未审核的第一条候选，模型可避免换词重提。
+    assert extractor.calls[1]["existing"] == ["用户只在晚上有空学习"]
     assert len(NoteStore(db_path).memory_candidates()) == 1
+
+
+def test_pending_candidate_is_labeled_and_exact_duplicate_is_filtered(monkeypatch):
+    """待审核内容提供给模型避重，也参与提炼后的精确去重。"""
+    known = [
+        {"status": "active", "content": "用户在职备考"},
+        {"status": "pending", "content": "用户只在晚上有空学习"},
+    ]
+    prompt = _chat_memory_prompt([{"role": "user", "content": "我只有晚上有空"}], known)
+    assert "已确认记忆（与其中任何一条重复都不要输出）：\n- 用户在职备考" in prompt
+    assert "待审核候选（尚未成为有效记忆；与其中任何一条重复也不要输出）：\n- 用户只在晚上有空学习" in prompt
+
+    async def fake_completion(_prompt):
+        return {"memories": [{"type": "habit", "content": "用户只在晚上有空学习"}]}, "fake-model"
+
+    monkeypatch.setattr("app.ai._memory_completion", fake_completion)
+    memories, model = asyncio.run(extract_chat_memories(
+        [{"role": "user", "content": "我只有晚上有空"}], known
+    ))
+    assert model == "fake-model"
+    assert memories == []
 
 
 def test_extraction_failure_keeps_endpoint_successful(tmp_path, monkeypatch):
