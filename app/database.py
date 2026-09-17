@@ -1269,3 +1269,74 @@ class NoteStore:
         with closing(sqlite3.connect(self.path)) as db, db:
             cursor = db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cursor.rowcount == 1
+
+    def delete_tasks(self, task_ids):
+        """批量硬删除任务，返回真正被删掉的 ID。
+
+        IN (?, ?, ...) 的占位符按数量动态拼；只拼问号不拼值，值仍走参数绑定。
+        输入先按出现顺序去重，返回时也保持这个顺序，方便前端把结果一一对上。
+        """
+        ids = list(dict.fromkeys(int(i) for i in task_ids))
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        with closing(sqlite3.connect(self.path)) as db, db:
+            found = {row[0] for row in db.execute(
+                f"SELECT id FROM tasks WHERE id IN ({marks})", ids).fetchall()}
+            if found:
+                db.execute(f"DELETE FROM tasks WHERE id IN ({marks})", ids)
+        return [i for i in ids if i in found]
+
+    # 以 note_id 直接关联的派生表。表名是类常量而不是用户输入，可以安全拼进 SQL。
+    NOTE_CHILD_TABLES = (
+        "assets", "analyses", "intent_confirmations", "folder_suggestions", "note_folders",
+    )
+
+    def delete_note(self, note_id, delete_tasks=True):
+        """彻底删除一篇笔记及其全部派生数据，不存在时返回 None。
+
+        笔记是这一坨数据的根：图片、AI 分析、收藏意图、收藏夹归属、检索索引
+        （documents → chunks → embeddings）、收藏夹建议都是从它派生的。只删 notes 那一行
+        会留下一堆指向不存在笔记的孤儿行，检索还会继续命中已删除的内容。
+
+        documents/chunks/embeddings 是三层嵌套，必须从最里层往外删：先按 note_id 找到
+        document，再删它的 chunks，最后按 chunk_id 删 embeddings。
+
+        返回各类被删行数，外加 storage_keys（图片文件名）。磁盘文件交给调用方删除——
+        数据库层不该知道 media_root 在哪。delete_tasks=False 时保留该笔记派生的待办：
+        已经排进日历的待办是用户的时间承诺，是否一起清掉由接口层决定。
+        """
+        stats = {"note_id": note_id}
+        with closing(sqlite3.connect(self.path)) as db, db:
+            row = db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            if row is None:
+                return None
+            document_ids = [r[0] for r in db.execute(
+                "SELECT id FROM documents WHERE note_id=?", (note_id,)).fetchall()]
+            if document_ids:
+                marks = ",".join("?" * len(document_ids))
+                stats["embeddings"] = db.execute(
+                    f"""DELETE FROM embeddings WHERE chunk_id IN
+                        (SELECT id FROM chunks WHERE document_id IN ({marks}))""",
+                    document_ids).rowcount
+                stats["chunks"] = db.execute(
+                    f"DELETE FROM chunks WHERE document_id IN ({marks})",
+                    document_ids).rowcount
+                stats["documents"] = db.execute(
+                    f"DELETE FROM documents WHERE id IN ({marks})", document_ids).rowcount
+            storage_keys = [r[0] for r in db.execute(
+                "SELECT storage_key FROM assets WHERE note_id=? AND storage_key IS NOT NULL",
+                (note_id,)).fetchall()]
+            for table in self.NOTE_CHILD_TABLES:
+                stats[table] = db.execute(
+                    f"DELETE FROM {table} WHERE note_id=?", (note_id,)).rowcount
+            # 计划步骤引用的来源笔记只解除引用，不删计划本身：计划是用户确认过的承诺，
+            # 去掉一篇参考来源不该让整份计划凭空消失。
+            stats["plan_item_sources"] = db.execute(
+                "DELETE FROM plan_item_sources WHERE note_id=?", (note_id,)).rowcount
+            stats["tasks"] = db.execute(
+                "DELETE FROM tasks WHERE note_id=?", (note_id,)).rowcount if delete_tasks else 0
+            stats["notes"] = db.execute(
+                "DELETE FROM notes WHERE note_id=?", (note_id,)).rowcount
+        stats["storage_keys"] = storage_keys
+        return stats

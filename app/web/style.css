@@ -255,6 +255,33 @@ button.block { width: 100%; }
 .chat-head-actions button { padding: 6px 10px; font-size: 12.5px; }
 button.danger { color: var(--danger); border-color: var(--border); }
 
+/* ---- 批量选择（笔记库 / 待办清单）---- */
+.bulk-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px; padding: 8px 12px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  font-size: 13px;
+}
+.bulk-all { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.bulk-count { color: var(--muted); }
+.bulk-hint { color: var(--muted); font-size: 12px; margin-left: auto; }
+.bulk-bar button[disabled] { opacity: .45; cursor: not-allowed; }
+
+/* 行首勾选框：点它只切换选中，不触发行的点击（JS 里挡住了冒泡）。
+   align-items 用 flex-start 让它跟标题首行对齐，而不是垂直居中到整块卡片。 */
+.pick { display: flex; align-items: flex-start; padding-top: 1px; cursor: pointer; }
+.pick input { width: 15px; height: 15px; margin: 0; cursor: pointer; accent-color: var(--accent); }
+.note-list li.pickable, .result-list li.pickable {
+  display: flex; align-items: flex-start; gap: 10px;
+}
+.note-main { flex: 1; min-width: 0; }
+/* 选中态用 accent 蓝，和 .active 的主色区分开：
+   「正在看这篇」和「勾了准备删」是两件事，颜色混用会让人误判。 */
+.note-list li.picked, .result-list li.picked {
+  border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
 .chat-scroll { flex: 1; overflow: auto; }
 .chat-stream {
   max-width: 780px;

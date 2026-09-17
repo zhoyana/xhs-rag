@@ -243,6 +243,24 @@ class FolderSuggestionConfirmRequest(BaseModel):
     )
 
 
+class BulkDeleteNotesRequest(BaseModel):
+    """批量删除笔记。
+
+    max_length 是防呆上限：真删是不可逆操作，一次几百篇多半是调用方写错了循环，
+    挡在接口层比删完再发现要好。
+    """
+
+    note_ids: list[str] = Field(min_length=1, max_length=200,
+                                description="要彻底删除的笔记 ID 列表")
+    delete_tasks: bool = Field(
+        default=True, description="是否同时删除这些笔记派生出来的待办；默认 true")
+
+
+class BulkDeleteTasksRequest(BaseModel):
+    task_ids: list[int] = Field(min_length=1, max_length=200,
+                                description="要彻底删除的任务 ID 列表")
+
+
 class TriageRequest(BaseModel):
     """收件箱里的"一次确认"：意图 + 归档（可选建待办）。
 
@@ -847,6 +865,71 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             # None 表示没有查到；404 表示请求的资源不存在。
             raise HTTPException(404, detail="笔记不存在。")
         return note
+
+    def purge_note(note_id, delete_tasks=True):
+        """删掉一篇笔记的全部痕迹：数据库行 + 磁盘图片。
+
+        拆成"删库"和"删文件"两步是有意的——数据库事务能回滚，文件系统不能。所以先让
+        存储层在事务里把所有行删干净，再按它返回的文件名去删图片；图片删失败只记日志，
+        不让接口报错（库已经干净了，残留一个文件比让用户以为没删掉要好）。
+        """
+        stats = app.state.store.delete_note(note_id, delete_tasks)
+        if stats is None:
+            raise HTTPException(404, detail="笔记不存在。")
+        removed_files, failed_files = 0, []
+        for key in stats.pop("storage_keys"):
+            try:
+                path = storage_path(app.state.media_root, key)
+            except ImportProblem:
+                # 文件名不合法（越界路径）时不动它，也不因此中断整次删除。
+                failed_files.append(key)
+                continue
+            try:
+                path.unlink()
+                removed_files += 1
+            except FileNotFoundError:
+                # 库里登记了、磁盘上没有（比如换过机器）。算它已经不存在，
+                # 但**不能**计数——否则"删了 2 个文件"会虚报，用户以为清理了实际没清。
+                pass
+            except OSError as exc:
+                logger.warning("删除笔记图片失败 note_id=%s key=%s: %s", note_id, key, exc)
+                failed_files.append(key)
+        stats["removed_files"] = removed_files
+        stats["failed_files"] = failed_files
+        return stats
+
+    @app.delete("/notes/{note_id}", summary="彻底删除笔记及其全部派生数据")
+    def delete_note(note_id: str, delete_tasks: bool = Query(
+        True, description="是否同时删除这篇笔记派生出来的待办；默认 true")):
+        """删除一篇笔记，连带图片、分析、收藏意图、收藏夹归属、检索索引、AI 建议。
+
+        默认连待办一起删：待办的标题和内容就是从这篇笔记推出来的，笔记没了它们就是无源
+        之水。想留着已经排进日历的待办，就显式传 delete_tasks=false。
+        """
+        return purge_note(note_id, delete_tasks)
+
+    @app.post("/notes/bulk-delete", summary="批量彻底删除笔记")
+    def bulk_delete_notes(body: BulkDeleteNotesRequest):
+        """一次删一批，每篇的删除范围与单篇接口完全一致。
+
+        单篇失败不拖垮整批：不存在的 ID 记进 failed 而不是整批 500——用户选了 20 篇，
+        其中 1 篇早被别处删了，没有理由让他重选剩下 19 篇。
+        """
+        deleted, failed, tasks_removed = [], [], 0
+        for note_id in dict.fromkeys(body.note_ids):   # 去重但保留顺序
+            try:
+                result = purge_note(note_id, body.delete_tasks)
+            except HTTPException as exc:
+                failed.append({"note_id": note_id, "reason": exc.detail})
+                continue
+            tasks_removed += result["tasks"]
+            deleted.append(result)
+        return {
+            "deleted": deleted,
+            "failed": failed,
+            "deleted_count": len(deleted),
+            "tasks_removed": tasks_removed,
+        }
 
     @app.post("/plans", status_code=201, summary="创建学习计划草案")
     def create_plan(body: PlanCreateRequest):
@@ -1728,6 +1811,22 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return app.state.store.update_task(
             task_id, {"status": "cancelled"}, datetime.now(timezone.utc).isoformat()
         )
+
+    @app.post("/tasks/bulk-delete", summary="批量彻底删除任务")
+    def bulk_delete_tasks(body: BulkDeleteTasksRequest):
+        """一次删掉一批待办（硬删除）。
+
+        只给硬删除：批量场景下"取消一批"没有意义——用户一次圈 15 条，心里的意思是
+        "这些别在列表里碍眼了"，而不是"帮我保留 15 条历史决策记录"。真要留痕就逐条取消。
+        """
+        requested = list(dict.fromkeys(body.task_ids))
+        removed = app.state.store.delete_tasks(requested)
+        removed_set = set(removed)
+        return {
+            "deleted": removed,
+            "missing": [i for i in requested if i not in removed_set],
+            "deleted_count": len(removed),
+        }
 
     # ------------------------------ 长期记忆管理 ------------------------------
     # 记忆是模型自动提炼出来的，可能过时、也可能理解偏了，所以必须给用户

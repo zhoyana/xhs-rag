@@ -5,6 +5,8 @@ __pycache__/
 # 本机 Temp 目录不可写，测试时用 --basetemp 指到这里；它只是运行产物，不进仓库。
 .pytest-tmp*/
 test-temp-*/
+# 真机验收用的副本库/临时服务。删除不可逆，验收一律在副本上做，跑完即删。
+.verify/
 /data/
 *.log
 uvicorn.*.log

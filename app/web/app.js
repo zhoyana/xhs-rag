@@ -194,6 +194,75 @@ $$(".tab").forEach((tab) => {
   tab.addEventListener("click", () => switchView(tab.dataset.view));
 });
 
+// ----------------------------- 批量选择 -----------------------------
+// 笔记和待办各一份选中集合，都存字符串（DOM 的 dataset 拿出来就是字符串，
+// 存成数字会到处要做类型转换，漏一处就变成"勾了却删不掉"）。
+// 用 Set 而不是数组：勾选/取消是 O(1)，"已选几条"也不用每次遍历 DOM 去数。
+const selection = { notes: new Set(), tasks: new Set() };
+
+const BULK = {
+  notes: { bar: "#notes-bulk-count", del: "#btn-notes-delete", all: "#notes-pick-all",
+           list: "#note-list", unit: "篇" },
+  tasks: { bar: "#tasks-bulk-count", del: "#btn-tasks-delete", all: "#tasks-pick-all",
+           list: "#task-list", unit: "条" },
+};
+
+function updateBulkBar(kind) {
+  const conf = BULK[kind];
+  const picked = selection[kind];
+  const total = $$(`${conf.list} li.pickable`).length;
+  $(conf.bar).textContent = `已选 ${picked.size} ${conf.unit}`;
+  $(conf.del).disabled = picked.size === 0;
+  const all = $(conf.all);
+  // 三态全选框：部分选中时显示 indeterminate，否则用户看不出"还有没勾上的行"。
+  all.checked = total > 0 && picked.size === total;
+  all.indeterminate = picked.size > 0 && picked.size < total;
+}
+
+// 行首勾选框。点它只切换选中——必须挡掉冒泡，否则点勾选框会顺带触发
+// "打开这篇笔记详情"，勾一次跳一次，根本没法连续多选。
+function pickEl(kind, id) {
+  const label = document.createElement("label");
+  label.className = "pick";
+  label.title = "选中以批量删除";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = selection[kind].has(id);
+  label.appendChild(box);
+  label.addEventListener("click", (e) => e.stopPropagation());
+  box.addEventListener("change", () => {
+    if (box.checked) selection[kind].add(id);
+    else selection[kind].delete(id);
+    const li = label.closest("li");
+    if (li) li.classList.toggle("picked", box.checked);
+    updateBulkBar(kind);
+  });
+  return label;
+}
+
+// 列表重新加载后按当前数据裁剪选中集合：已经删掉的 ID 不能继续留在计数里，
+// 否则会出现"已选 3 篇"、列表却只剩 2 篇，点删除还要吃一个 404。
+function pruneSelection(kind, ids) {
+  const alive = new Set(ids.map(String));
+  for (const id of Array.from(selection[kind])) {
+    if (!alive.has(String(id))) selection[kind].delete(id);
+  }
+  updateBulkBar(kind);
+}
+
+function toggleAll(kind, on) {
+  const conf = BULK[kind];
+  selection[kind].clear();
+  for (const li of $$(`${conf.list} li.pickable`)) {
+    const id = kind === "notes" ? li.dataset.note : li.dataset.task;
+    if (on && id != null) selection[kind].add(String(id));
+    li.classList.toggle("picked", on);
+    const box = li.querySelector(".pick input");
+    if (box) box.checked = on;
+  }
+  updateBulkBar(kind);
+}
+
 // ----------------------------- 笔记库 -----------------------------
 let currentNoteId = null;
 const noteTitles = {};   // note_id → 标题，用于把对话里的引用 ID 显示成人看得懂的名字
@@ -204,19 +273,28 @@ async function loadNotes() {
   list.innerHTML = "";
   if (!data.items.length) {
     list.innerHTML = `<li class="muted">还没有笔记，先粘贴链接批量导入。</li>`;
+    updateBulkBar("notes");
     return;
   }
   for (const n of data.items) {
     noteTitles[n.note_id] = n.title || "";
     const li = document.createElement("li");
+    li.className = "pickable";
     const hasImg = (n.image_text || "").trim() ? '<span class="badge img">图</span>' : "";
-    li.innerHTML = `<div class="note-title">${escapeHtml(n.title || "(无标题)")}</div>
-      <div class="note-sub">${fmtTime(n.created_at)} ${hasImg}</div>`;
+    // 内容包一层 .note-main：li 现在是 flex 容器（勾选框 + 正文两列），
+    // 不包的话标题和那行小字会被当成两个并列的 flex 子项，横向排开。
+    li.innerHTML = `<div class="note-main">
+      <div class="note-title">${escapeHtml(n.title || "(无标题)")}</div>
+      <div class="note-sub">${fmtTime(n.created_at)} ${hasImg}</div>
+    </div>`;
     // 记住归属的 note_id：对话里的「出处」「原始命中」靠它定位到具体某一行。
     li.dataset.note = n.note_id;
+    li.prepend(pickEl("notes", n.note_id));
+    if (selection.notes.has(n.note_id)) li.classList.add("picked");
     li.addEventListener("click", () => openNote(n.note_id, li));
     list.appendChild(li);
   }
+  pruneSelection("notes", data.items.map((n) => n.note_id));
 }
 
 // 从对话里的出处/原始命中跳到笔记详情：先切回笔记库，再定位并打开那一篇。
@@ -247,6 +325,7 @@ async function openNote(noteId, li) {
       <button id="act-read" class="primary">补读图片</button>
       <button id="act-download" class="ghost">下载图片</button>
       <button id="act-analyze" class="ghost">AI 分析</button>
+      <button id="act-delete" class="ghost danger">删除这篇</button>
     </div>`;
 
   html += `<div class="section-h">正文</div><pre class="pre">${escapeHtml(note.content || "(无)")}</pre>`;
@@ -258,6 +337,7 @@ async function openNote(noteId, li) {
   $("#act-read").onclick = () => readImages(noteId);
   $("#act-download").onclick = () => downloadAssets(noteId);
   $("#act-analyze").onclick = () => analyzeNote(noteId);
+  $("#act-delete").onclick = () => deleteNote(note);
 
   loadAnalysis(noteId, detail);
   loadAssets(noteId, detail);
@@ -364,6 +444,61 @@ async function importBatch() {
     }
   } catch (e) { toast(e.message, true); }
   finally { $("#btn-import").disabled = false; }
+}
+
+// ----------------------------- 删除笔记 -----------------------------
+// 删笔记是这个项目里唯一不可逆的操作，所以确认框必须把"顺带删掉了什么"讲清楚：
+// 用户以为只是少了一篇收藏，实际上图片、AI 分析、收藏意图、收藏夹归属、检索索引
+// 和派生出来的待办都会一起没。一句含糊的"确定删除吗"在这里是不够的。
+const NOTE_DELETE_WARNING = "会一并删除它的图片、AI 分析、收藏意图、收藏夹归属和检索索引，"
+  + "无法恢复；它派生出来的待办也会一起删掉。";
+
+function clearNoteDetail() {
+  currentNoteId = null;
+  $("#note-detail").innerHTML = `<p class="muted">从左侧选择一篇笔记查看详情。</p>`;
+}
+
+// 删完要刷三处：笔记列表、收件箱（少一篇待整理）、日历（待办跟着没了）。
+// 日历是懒加载的，标脏即可——用户没切过去看就不必现在多打一枪。
+async function refreshAfterNoteDelete() {
+  await loadNotes();
+  loadInbox();
+  calendarState.needsRefresh = true;
+}
+
+async function deleteNote(note) {
+  const noteId = note.note_id;
+  const title = String(note.title || "").slice(0, 24);
+  if (!confirm(`彻底删除${title ? `《${title}》` : "这篇笔记"}？\n\n${NOTE_DELETE_WARNING}`)) return;
+  try {
+    const result = await api("DELETE", `/notes/${noteId}`);
+    toast(`已删除${result.tasks ? `（含 ${result.tasks} 条待办）` : ""}`);
+    selection.notes.delete(noteId);
+    clearNoteDetail();
+    await refreshAfterNoteDelete();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function deletePickedNotes() {
+  const ids = Array.from(selection.notes);
+  if (!ids.length) return;
+  if (!confirm(`彻底删除选中的 ${ids.length} 篇笔记？\n\n${NOTE_DELETE_WARNING}`)) return;
+  const button = $("#btn-notes-delete");
+  button.disabled = true;
+  try {
+    const result = await api("POST", "/notes/bulk-delete", { note_ids: ids });
+    let message = `已删除 ${result.deleted_count} 篇笔记`;
+    if (result.tasks_removed) message += `（含 ${result.tasks_removed} 条待办）`;
+    // 部分失败用红字提示：整批"看起来成功"而实际少删了，比直接报错更危险。
+    if (result.failed.length) message += `；${result.failed.length} 篇没删掉`;
+    toast(message, result.failed.length > 0);
+    selection.notes.clear();
+    if (ids.includes(currentNoteId)) clearNoteDetail();
+    await refreshAfterNoteDelete();
+  } catch (e) {
+    toast(e.message, true);
+    updateBulkBar("notes");   // 失败时把按钮还原，别让它一直灰着
+  }
 }
 
 async function readAllImages() {
@@ -1784,20 +1919,30 @@ async function loadTasks() {
   const d = await api("GET", url);
   const list = $("#task-list");
   list.innerHTML = "";
-  if (!d.items.length) { list.innerHTML = `<li class="muted">没有待办。</li>`; return; }
+  if (!d.items.length) {
+    list.innerHTML = `<li class="muted">没有待办。</li>`;
+    updateBulkBar("tasks");
+    return;
+  }
   for (const t of d.items) {
     const li = document.createElement("li");
+    li.className = "pickable";
+    li.dataset.task = String(t.id);
     // 三个动作语义不同，不能合成一个：
     //   完成 = 做完了；取消 = 我不做了（留痕，历史可追溯）；删除 = 这条记录本身就是错的。
     // 之前只有"完成/取消"，误建的任务（比如调试刷出来的空标题）只能一直挂在列表里。
-    li.innerHTML = `<div class="note-title">${escapeHtml(t.title || "(无标题)")}</div>
+    li.innerHTML = `<div class="note-main">
+      <div class="note-title">${escapeHtml(t.title || "(无标题)")}</div>
       <div class="task-meta">${fmtTime(t.scheduled_at)} · <span class="status-${t.status}">${t.status}</span></div>
       ${t.details ? `<div class="note-sub">${escapeHtml(t.details)}</div>` : ""}
       <div class="task-actions">
         ${t.status === "pending" ? '<button class="ghost act-complete">完成</button>' : ""}
         ${t.status === "pending" ? '<button class="ghost act-cancel">取消</button>' : ""}
         <button class="ghost danger act-delete">删除</button>
-      </div>`;
+      </div>
+    </div>`;
+    li.prepend(pickEl("tasks", String(t.id)));
+    if (selection.tasks.has(String(t.id))) li.classList.add("picked");
     const comp = li.querySelector(".act-complete");
     const canc = li.querySelector(".act-cancel");
     const del = li.querySelector(".act-delete");
@@ -1815,10 +1960,33 @@ async function loadTasks() {
       try {
         await api("DELETE", `/tasks/${t.id}?hard=true`);
         toast("已删除");
+        selection.tasks.delete(String(t.id));
         loadTasks();
       } catch (e) { toast(e.message, true); }
     };
     list.appendChild(li);
+  }
+  pruneSelection("tasks", d.items.map((t) => t.id));
+}
+
+// 批量删待办：只给删除、不给"批量取消"。
+// 一次圈十几条时，用户的意思是"这些别再碍眼了"，而不是"帮我留 15 条历史决策记录"。
+async function deletePickedTasks() {
+  const ids = Array.from(selection.tasks);
+  if (!ids.length) return;
+  if (!confirm(`彻底删除选中的 ${ids.length} 条待办？从数据库移除，无法恢复。`)) return;
+  const button = $("#btn-tasks-delete");
+  button.disabled = true;
+  try {
+    const result = await api("POST", "/tasks/bulk-delete", { task_ids: ids.map(Number) });
+    toast(result.missing.length
+      ? `已删除 ${result.deleted_count} 条；${result.missing.length} 条已不存在`
+      : `已删除 ${result.deleted_count} 条`, result.missing.length > 0);
+    selection.tasks.clear();
+    await refreshAfterTaskChange();
+  } catch (e) {
+    toast(e.message, true);
+    updateBulkBar("tasks");
   }
 }
 
@@ -1826,6 +1994,10 @@ async function loadTasks() {
 $("#btn-import").onclick = importBatch;
 $("#btn-read-all").onclick = readAllImages;
 $("#btn-refresh-notes").onclick = loadNotes;
+$("#notes-pick-all").onchange = (e) => toggleAll("notes", e.target.checked);
+$("#btn-notes-delete").onclick = deletePickedNotes;
+$("#tasks-pick-all").onchange = (e) => toggleAll("tasks", e.target.checked);
+$("#btn-tasks-delete").onclick = deletePickedTasks;
 $("#btn-new-folder").onclick = newFolder;
 $("#btn-refresh-folders").onclick = loadFolders;
 $("#btn-refresh-inbox").onclick = loadInbox;

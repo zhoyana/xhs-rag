@@ -42,6 +42,15 @@
         </div>
         <div id="import-result" class="hint"></div>
       </div>
+      <!-- 批量删除：一篇一篇点太累。勾选后在这里一次处理；常驻显示是为了让「全选」
+           一直够得着——按钮只在有选中时才出现的话，用户就没法从零开始全选。 -->
+      <div class="bulk-bar" id="notes-bulk">
+        <label class="bulk-all"><input type="checkbox" id="notes-pick-all" /><span>全选</span></label>
+        <span class="bulk-count" id="notes-bulk-count">已选 0 篇</span>
+        <button id="btn-notes-delete" class="ghost danger" disabled
+          title="彻底删除：连带图片、AI 分析、收藏意图、收藏夹归属与检索索引，不可恢复">删除选中</button>
+        <span class="bulk-hint">删除不可恢复；笔记派生出来的待办也会一起删掉</span>
+      </div>
       <div class="split">
         <ul class="note-list" id="note-list"></ul>
         <div class="note-detail" id="note-detail">
@@ -155,6 +164,13 @@
       </div>
 
       <div class="cal-list" id="cal-list-body" hidden>
+        <div class="bulk-bar" id="tasks-bulk">
+          <label class="bulk-all"><input type="checkbox" id="tasks-pick-all" /><span>全选</span></label>
+          <span class="bulk-count" id="tasks-bulk-count">已选 0 条</span>
+          <button id="btn-tasks-delete" class="ghost danger" disabled
+            title="从数据库彻底移除，不可恢复">删除选中</button>
+          <span class="bulk-hint">批量只提供「删除」：一次圈十几条时，你要的是它们别再碍眼</span>
+        </div>
         <div class="toolbar">
           <select id="task-filter">
             <option value="">全部</option>
