@@ -56,6 +56,22 @@ def test_parser_can_use_matching_internal_note_id_when_map_key_changes():
     assert parse_note(html, URL)["title"] == "目标标题"
 
 
+def test_parser_keeps_original_note_id_after_non_detail_redirect():
+    # 最终跳到首页时，原始分享直链仍能提供 ID；但网页必须含对应笔记。
+    assert parse_note(fixture_html(), "https://www.xiaohongshu.com/", requested_url=URL)["note_id"] == "abc123"
+    with pytest.raises(ImportProblem) as missing:
+        parse_note('<script>window.__INITIAL_STATE__={"note":{}};</script>',
+                   "https://www.xiaohongshu.com/", requested_url=URL)
+    assert missing.value.code == "note_detail_map_missing"
+
+
+def test_parser_rejects_conflicting_redirect_note_id():
+    with pytest.raises(ImportProblem) as conflict:
+        parse_note(fixture_html(), "https://www.xiaohongshu.com/explore/other456",
+                   requested_url=URL)
+    assert conflict.value.code == "redirect_note_id_mismatch"
+
+
 def test_intake_job_exposes_only_safe_error_code(tmp_path, monkeypatch):
     async def fake_fetch(_url):
         return '<script>window.__INITIAL_STATE__={"note":{}};</script>', URL
@@ -204,6 +220,27 @@ def test_redirect_target_checked(monkeypatch):
     with pytest.raises(ImportProblem):
         asyncio.run(fetch_page(URL))
     assert len(calls) == 1
+
+
+def test_short_link_remembers_detail_id_across_later_redirect(monkeypatch):
+    # 用本地模拟响应复现：短链 -> 详情页 -> 首页，不访问真实网站。
+    import asyncio
+    real_client = httpx.AsyncClient
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        if request.url.path == "/short":
+            return httpx.Response(302, headers={"location": URL})
+        if request.url.path == "/explore/abc123":
+            return httpx.Response(302, headers={"location": "/"})
+        return httpx.Response(200, text=fixture_html())
+
+    monkeypatch.setattr("app.extractor.httpx.AsyncClient", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(handler), **kwargs))
+    html, detail_url = asyncio.run(fetch_page("https://xhslink.com/short"))
+    assert paths == ["/short", "/explore/abc123", "/"]
+    assert parse_note(html, detail_url)["note_id"] == "abc123"
 
 
 def test_intake_persists_job_and_downloads_images_immediately(tmp_path, monkeypatch):

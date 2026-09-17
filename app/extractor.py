@@ -48,8 +48,17 @@ def share_url(text: str) -> str:
     return check_url(match.group().rstrip("。；;"))
 
 
+def note_id_from_url(url: str) -> str | None:
+    """只从已知的详情页路径取 ID；不读取查询参数中的访问 token。"""
+    match = re.search(r"^/(?:explore|discovery/item)/([a-zA-Z0-9]+)(?:/|$)",
+                      urlsplit(url).path)
+    return match.group(1) if match else None
+
+
 async def fetch_page(url: str) -> tuple[str, str]:
-    # 返回 (网页 HTML, 最终 URL)。最终 URL 很重要：短链接跳转后才能定位笔记编号。
+    # 返回 (网页 HTML, 可用于解析的详情 URL)。短链接跳转时保留最后见到的详情页地址。
+    # 即使最终落到登录页，也不能因此丢掉已知 ID；解析阶段仍会严格核对网页内容。
+    detail_url = url if note_id_from_url(url) else None
     # async with 在退出代码块时关闭网络资源；User-Agent 是请求头，不是登录凭据。
     # timeout=15 限制各类网络等待，不是整个导入过程严格的 15 秒总上限。
     # 手动检查每次重定向，防止分享链接被用作任意网址代理。
@@ -65,6 +74,8 @@ async def fetch_page(url: str) -> tuple[str, str]:
                     if not location:
                         raise ImportProblem("分享链接跳转地址缺失。")
                     url = urljoin(url, location)
+                    if note_id_from_url(url):
+                        detail_url = url
                     # continue 跳过本轮后续代码；下一轮会重新验证跳转目标的域名。
                     continue
                 if response.status_code >= 400:
@@ -75,22 +86,27 @@ async def fetch_page(url: str) -> tuple[str, str]:
                     chunks.extend(chunk)
                     if len(chunks) > 5_000_000:
                         raise ImportProblem("网页超过 5 MB，已停止读取。")
-                return chunks.decode("utf-8", errors="replace"), url
+                return chunks.decode("utf-8", errors="replace"), url if note_id_from_url(url) else detail_url or url
     raise ImportProblem("链接跳转次数过多，已停止读取。")
 
 
-def parse_note(html: str, final_url: str) -> dict:
+def parse_note(html: str, final_url: str, requested_url: str | None = None) -> dict:
     # 小红书页面可能在脚本中包含初始化数据。这不是官方 API，页面变化会导致失效。
     # re.S 使正则中的点号也能匹配换行；(.*?) 捕获尽可能短的内容。
     match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(.*?)</script>", html, re.S)
     if not match:
         raise ImportProblem("网页没有笔记数据：可能需要登录、内容受限或网页结构已变化。",
                             "initial_state_missing")
-    id_match = re.search(r"/(?:explore|discovery/item)/([a-zA-Z0-9]+)", urlsplit(final_url).path)
-    if not id_match:
+    final_id = note_id_from_url(final_url)
+    requested_id = note_id_from_url(requested_url) if requested_url else None
+    # 原始直链与跳转后的详情 ID 冲突时拒绝，防止导入别人的推荐笔记。
+    if final_id and requested_id and final_id != requested_id:
+        raise ImportProblem("分享链接与跳转后的笔记编号不一致，未导入。",
+                            "redirect_note_id_mismatch")
+    note_id = final_id or requested_id
+    if not note_id:
         raise ImportProblem("未定位到笔记详情地址，可能跳转到了登录或错误页面。",
                             "note_url_missing")
-    note_id = id_match.group(1)
     try:
         # json5 不执行 JavaScript；只把字符串外的 undefined 转成 null。
         literal = match.group(1).strip().rstrip(";")

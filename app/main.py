@@ -804,7 +804,7 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         try:
             url = share_url(candidate)
             html, final_url = await fetch_page(url)
-            fresh_note = parse_note(html, final_url)
+            fresh_note = parse_note(html, final_url, requested_url=url)
             refreshed = app.state.store.refresh_note_source(
                 note_id, fresh_note, datetime.now(timezone.utc).isoformat()
             )

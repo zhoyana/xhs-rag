@@ -141,7 +141,7 @@ def test_refresh_source_updates_failed_urls_and_preserves_downloaded_file(tmp_pa
     async def fake_fetch(_url):
         return "fresh html", "https://www.xiaohongshu.com/explore/abc123"
 
-    def fake_parse(_html, _url):
+    def fake_parse(_html, _url, requested_url=None):
         return {
             "note_id": "abc123", "title": "刷新后的标题", "content": "新正文",
             "source_url": "https://www.xiaohongshu.com/explore/abc123",
@@ -172,7 +172,7 @@ def test_refresh_rejects_a_different_note(tmp_path, monkeypatch):
         return "html", "https://www.xiaohongshu.com/explore/other"
 
     monkeypatch.setattr("app.main.fetch_page", fake_fetch)
-    monkeypatch.setattr("app.main.parse_note", lambda *_: {
+    monkeypatch.setattr("app.main.parse_note", lambda *_, **__: {
         "note_id": "other", "title": "其他笔记", "content": "内容", "images": []
     })
     with TestClient(create_app(db_path)) as client:
