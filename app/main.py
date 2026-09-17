@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from .database import NoteStore, DEFAULT_DB
 from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
-from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe
+from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe, extract_chat_memories_safe
 from .knowledge import document_hash, split_note
 from .retrieval import search_knowledge
 from .chat_agent import plan_requested, run_agent_turn
@@ -343,6 +343,51 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             }, datetime.now(timezone.utc).isoformat()
         )
         return {"thread_id": thread_id, "message": assistant}
+
+    async def consolidate_thread_memories(thread_id: str):
+        """会话 → 长期记忆的沉淀通道（episodic → semantic 固化）。
+
+        三层记忆里，工作记忆是 prompt 本身、会话记忆是 chat_messages 表，
+        但会话层的内容会随对话结束而消散。这里把对话中暴露的持久偏好提炼成
+        记忆候选，交给用户审核后进入长期记忆层——固化走的是"AI 提议、
+        用户拍板"的候选审核流程，不让模型静默改写用户画像。
+        """
+        store = app.state.store
+        thread = store.thread(thread_id)
+        if thread is None:
+            return
+        messages = thread["messages"]
+        user_turns = sum(1 for m in messages if m.get("role") == "user")
+        # 少于两轮有效对话不值得花一次模型调用：太短提不出稳定偏好。
+        if user_turns < 2 or len(messages) < 4:
+            logger.info("memory_consolidate_skipped thread_id=%s messages=%d",
+                        thread_id, len(messages))
+            return
+        memories, model = await extract_chat_memories_safe(
+            messages, store.active_memories(), thread_id
+        )
+        if not memories or not model:
+            # 降级路径：safe 包装已经写过 memory_extract_failed 日志。
+            return
+        candidates = store.save_memory_candidates(
+            model, memories, thread_id, datetime.now(timezone.utc).isoformat()
+        )
+        logger.info("memory_candidates_from_chat thread_id=%s count=%d",
+                    thread_id, len(candidates))
+
+    @app.post("/threads/{thread_id}/consolidate",
+              summary="从会话消息中提炼长期记忆候选（会话结束或每 N 轮触发）")
+    def consolidate_thread(thread_id: str, background_tasks: BackgroundTasks):
+        """沉淀入口只做两件事：验证会话存在、把慢操作丢给后台任务。
+
+        秋招知识点：读操作（存在性检查、404 快速失败）在请求内同步完成，
+        LLM 提炼放后台——与笔记意图确认的记忆触发保持同一模式，调用方
+        （会话结束钩子或前端"保存记忆"按钮）拿到的永远是毫秒级响应。
+        """
+        if app.state.store.thread(thread_id) is None:
+            raise HTTPException(404, detail="会话不存在。")
+        background_tasks.add_task(consolidate_thread_memories, thread_id)
+        return {"thread_id": thread_id, "consolidation": "queued"}
 
     @app.get("/ai/config", summary="检查视觉模型配置；不会显示密钥")
     def ai_config():
