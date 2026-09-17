@@ -14,7 +14,7 @@
       <button class="tab" data-view="notes">笔记库</button>
       <button class="tab" data-view="folders">收藏夹</button>
       <button class="tab" data-view="chat">对话</button>
-      <button class="tab" data-view="tasks">待办</button>
+      <button class="tab" data-view="calendar">日历</button>
     </nav>
     <div class="health" id="health" title="后端状态">…</div>
   </header>
@@ -116,19 +116,56 @@
       </div>
     </section>
 
-    <!-- 待办 -->
-    <section class="view" id="view-tasks">
-      <div class="toolbar">
-        <button id="btn-refresh-tasks" class="primary">刷新待办</button>
-        <select id="task-filter">
-          <option value="">全部</option>
-          <option value="pending">待办</option>
-          <option value="completed">已完成</option>
-          <option value="cancelled">已取消</option>
-        </select>
-        <span class="hint">取消＝不打算做了，记录留在「已取消」可追溯；删除＝从数据库彻底移除，不可恢复</span>
+    <!-- 日历：计划只有在你于对话里点过「确认计划」之后才会落到这里。
+         未确认的草案以虚影标出，提醒你"这里还欠一个决定"，而不是直接当成任务。 -->
+    <section class="view" id="view-calendar">
+      <div class="cal-bar">
+        <div class="cal-nav">
+          <button id="btn-cal-prev" class="ghost" title="上个月">‹</button>
+          <button id="btn-cal-today" class="ghost">今天</button>
+          <button id="btn-cal-next" class="ghost" title="下个月">›</button>
+          <span class="cal-label" id="cal-label"></span>
+        </div>
+        <div class="seg-group" id="cal-views">
+          <button class="seg active" data-calview="month">月历</button>
+          <button class="seg" data-calview="list">清单</button>
+        </div>
+        <span class="hint" id="cal-summary"></span>
+        <button id="btn-refresh-cal" class="ghost">刷新</button>
       </div>
-      <ul class="result-list" id="task-list"></ul>
+
+      <div class="cal-body" id="cal-month-body">
+        <div class="cal-grid-wrap">
+          <div class="cal-weekdays">
+            <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+          </div>
+          <div class="cal-grid" id="cal-grid"></div>
+        </div>
+        <aside class="cal-day" id="cal-day">
+          <div class="cal-day-head">
+            <b id="cal-day-title">选一天</b>
+            <span class="muted" id="cal-day-meta"></span>
+          </div>
+          <div class="cal-day-list" id="cal-day-list"></div>
+          <div class="cal-day-foot">
+            <button id="btn-cal-ask" class="ghost"
+              title="切到对话，让 agent 参考你收藏的笔记来安排这一天">让 agent 帮我安排</button>
+          </div>
+        </aside>
+      </div>
+
+      <div class="cal-list" id="cal-list-body" hidden>
+        <div class="toolbar">
+          <select id="task-filter">
+            <option value="">全部</option>
+            <option value="pending">待办</option>
+            <option value="completed">已完成</option>
+            <option value="cancelled">已取消</option>
+          </select>
+          <span class="hint">取消＝不打算做了（留痕可追溯）；删除＝从数据库彻底移除，不可恢复</span>
+        </div>
+        <ul class="result-list" id="task-list"></ul>
+      </div>
     </section>
   </main>
 

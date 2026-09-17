@@ -186,6 +186,8 @@ function renderMarkdown(text) {
 function switchView(name) {
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
+  // 日历按需拉取：用户可能整场都不打开它，没必要每次进页面都多打两枪。
+  if (name === "calendar" && !calendarState.loaded) loadCalendar();
 }
 
 $$(".tab").forEach((tab) => {
@@ -425,19 +427,16 @@ const inboxState = {
   total: 0,
 };
 
-const TZ = "Asia/Shanghai";
-
-// 待办时间只给三个够用的选项：整理笔记时不该被"选个精确时间"卡住。
-function scheduleIso(daysAhead) {
-  const d = new Date();
-  d.setDate(d.getDate() + daysAhead);
+// 把本机时间转成带时区偏移的 ISO 文本：后端拒收不带时区的时间，
+// 而从 Date 的角度看，偏移量只有本机知道（手拼比 toISOString 的 Z 更好读）。
+function localIso(d) {
   const pad = (n) => String(n).padStart(2, "0");
   const offsetMin = -d.getTimezoneOffset();
   const sign = offsetMin >= 0 ? "+" : "-";
   const abs = Math.abs(offsetMin);
-  // 后端要求时间必须带时区，偏移量从本机取，手拼字符串比 toISOString 更好读。
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-    + `T20:00:00${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+    + `T${pad(d.getHours())}:${pad(d.getMinutes())}:00`
+    + `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
 function cardFromItem(item) {
@@ -450,13 +449,10 @@ function cardFromItem(item) {
     folders: [],
     selected: new Set(),
     suggestionReasons: [],
-    actions: [],          // {text, on}
     category: "",
     intent: "",
     proposal: { category: "", intent: "" },
     editing: false,
-    createTasks: false,
-    scheduleDays: 0,
     touched: false,       // 用户是否动过分类/意图/收藏夹，动过就不再被 AI 结果覆盖
     // 分析和建议都齐了的笔记，进页面就能直接渲染（prepare 命中缓存，不花模型钱）；
     // 缺任何一项都先停在 idle，由用户决定什么时候花这次调用。
@@ -646,27 +642,6 @@ function inboxAiEl(card) {
     box.appendChild(det);
   }
 
-  if (card.actions.length) {
-    const det = document.createElement("details");
-    det.className = "iactions";
-    det.open = true;
-    det.innerHTML = `<summary>建议行动（${card.actions.filter((x) => x.on).length}/${card.actions.length}）</summary>`;
-    const ul = document.createElement("div");
-    for (let i = 0; i < card.actions.length; i += 1) {
-      const act = card.actions[i];
-      const row = document.createElement("label");
-      row.className = "iact";
-      row.innerHTML = `<input type="checkbox" ${act.on ? "checked" : ""}>`;
-      const span = document.createElement("span");
-      span.textContent = act.text;
-      row.appendChild(span);
-      row.querySelector("input").onchange = (e) => { act.on = e.target.checked; renderInbox(); };
-      ul.appendChild(row);
-    }
-    det.appendChild(ul);
-    box.appendChild(det);
-  }
-
   if (card.blockers.length) {
     box.insertAdjacentHTML("beforeend",
       `<div class="icard-blocked">${escapeHtml(card.blockers.join("；"))}</div>`);
@@ -685,27 +660,14 @@ function renderCardActions(bar, card) {
     return;
   }
 
-  if (card.editing) {
-    const taskWrap = document.createElement("label");
-    taskWrap.className = "itask";
-    taskWrap.innerHTML = `<input type="checkbox" ${card.createTasks ? "checked" : ""}>
-      <span>顺手把勾选的行动建成待办</span>`;
-    taskWrap.querySelector("input").onchange = (e) => {
-      card.createTasks = e.target.checked;
-      renderInbox();
-    };
-    bar.appendChild(taskWrap);
-    if (card.createTasks) {
-      const sel = document.createElement("select");
-      sel.className = "isel";
-      for (const [i, label] of [[0, "今晚 20:00"], [1, "明晚 20:00"], [2, "后天 20:00"]]) {
-        sel.insertAdjacentHTML("beforeend", `<option value="${i}">${label}</option>`);
-      }
-      sel.value = String(card.scheduleDays ?? 0);
-      sel.onchange = (e) => { card.scheduleDays = Number(e.target.value); };
-      bar.appendChild(sel);
-    }
-  }
+  // 「这篇该干什么」不在这里派活：模型给的行动清单只是它的猜测，直接变成待办
+  // 等于替用户决定日程。想安排就去对话里和 agent 商量，谈拢了再落成计划。
+  const plan = document.createElement("button");
+  plan.className = "ghost act-plan";
+  plan.textContent = "让 agent 排计划";
+  plan.title = "切到对话，由 agent 参考这篇笔记和你商量后再出草案；你点确认才会写入日历";
+  plan.onclick = () => askAgentForPlan(card);
+  bar.appendChild(plan);
 
   const save = document.createElement("button");
   save.className = "primary";
@@ -774,10 +736,6 @@ function setCardReady(card, data) {
     card.selected = new Set(suggested.map((s) => s.folder_id).filter((id) => names.has(id)));
   }
   if (!card.selected.size && card.folders.length) card.selected.add(card.folders[0].id);
-
-  if (!card.actions.length) {
-    card.actions = (a.suggested_actions || []).map((text) => ({ text, on: false }));
-  }
   card.state = "ready";
 }
 
@@ -797,14 +755,12 @@ async function prepareCard(noteId, force = false) {
 }
 
 async function sendTriage(card, decision) {
+  // 这次确认只管两件事：这篇为什么被收藏、放进哪个夹子。
+  // 待办不在这里建——模型给的行动清单是它的推测，直接落成日程等于替用户做决定。
   const payload = {
     decision,
     folder_ids: decision === "dismissed" ? [] : Array.from(card.selected),
-    action_indexes: card.actions.map((a, i) => (a.on ? i : -1)).filter((i) => i >= 0),
-    create_tasks: decision !== "dismissed" && !!card.createTasks,
-    timezone: TZ,
   };
-  if (payload.create_tasks) payload.scheduled_at = scheduleIso(card.scheduleDays || 0);
   if (decision === "edited") {
     payload.category = card.category.trim();
     payload.intent = card.intent.trim();
@@ -815,8 +771,7 @@ async function sendTriage(card, decision) {
       toast("已忽略，移出收件箱");
     } else {
       const where = (r.folders || []).map((f) => f.name).join("、");
-      const n = (r.tasks || []).length;
-      toast(`已归档到「${where || "所选收藏夹"}」${n ? `，并建了 ${n} 条待办` : ""}`);
+      toast(`已归档到「${where || "所选收藏夹"}」`);
     }
     inboxState.cards.delete(card.note_id);
     inboxState.total = Math.max(0, inboxState.total - 1);
@@ -839,6 +794,20 @@ async function triageCard(card) {
     return;
   }
   await sendTriage(card, edited ? "edited" : "confirmed");
+}
+
+// 从收件箱进"排计划"：切到对话并把提问预填好，让用户补上自己的目标再发。
+// 刻意不自动发送——排计划最关键的输入是用户的目标和可用时间，而不是这篇笔记本身。
+async function askAgentForPlan(card) {
+  switchView("chat");
+  const id = await ensureThread();
+  if (!id) return;
+  const input = $("#chat-text");
+  input.value = `我想围绕《${String(card.title || "").slice(0, 40)}》安排一下。`
+    + "帮我制定一份计划：先问清我的目标和每天能投入多少时间，再出草案。";
+  autoGrow(input);
+  input.focus();
+  toast("补上你的目标，再点发送");
 }
 
 function enqueuePrepare(noteIds, force = false) {
@@ -1024,6 +993,165 @@ function hitsEl(meta) {
   return det;
 }
 
+// ------------------------------ 计划草案卡 ------------------------------
+// agent 只能起草，落库必须由用户点确认。这张卡就是"同意"的落点：没有它之前，
+// 草案只存在于聊天记录里，用户想点头也没地方点。
+const planFmtDay = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d)) return iso || "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+function planEl(meta) {
+  const id = meta && meta.plan_id;
+  if (!id) return null;
+  const box = document.createElement("div");
+  box.className = "plan-card";
+  box.innerHTML = `<div class="plan-wait"><span class="pulse"></span><span>正在载入计划草案…</span></div>`;
+  fillPlanCard(box, id);
+  return box;
+}
+
+async function fillPlanCard(box, planId) {
+  try {
+    renderPlanCard(box, await api("GET", `/plans/${planId}`));
+  } catch (e) {
+    // 草案被丢弃后，历史消息里的卡还在；这时给一句人话，别摆一个报错。
+    if (String(e.message).includes("不存在")) {
+      box.innerHTML = `<div class="plan-head"><span class="plan-badge dead">已丢弃</span>
+        <span class="plan-hint">这份草案没有写入日历</span></div>`;
+      return;
+    }
+    box.innerHTML = `<div class="error">计划载入失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderPlanCard(box, plan) {
+  const draft = plan.status === "draft";
+  box.dataset.plan = plan.id;
+  box.innerHTML = "";
+
+  const head = document.createElement("div");
+  head.className = "plan-head";
+  head.innerHTML = `<span class="plan-badge">${draft ? "计划草案" : "已确认"}</span>
+    <span class="plan-hint">${draft ? "确认后才会写入日历" : "已写入日历"}</span>`;
+  box.appendChild(head);
+
+  const title = document.createElement("div");
+  title.className = "plan-title";
+  title.textContent = plan.title || "（无标题计划）";
+  box.appendChild(title);
+
+  if (plan.goal) {
+    const goal = document.createElement("div");
+    goal.className = "plan-goal";
+    goal.textContent = `目标：${plan.goal}`;
+    box.appendChild(goal);
+  }
+
+  const list = document.createElement("ol");
+  list.className = "plan-items";
+  for (const item of plan.items || []) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="pi-when">${escapeHtml(planFmtDay(item.scheduled_at))}</span>
+      <span class="pi-title"></span>`;
+    li.querySelector(".pi-title").textContent = item.title || "";
+    if (item.details) {
+      const d = document.createElement("div");
+      d.className = "pi-details";
+      d.textContent = item.details;
+      li.appendChild(d);
+    }
+    list.appendChild(li);
+  }
+  box.appendChild(list);
+
+  // 已确认的计划不再给按钮：后续改动去日历里处理具体任务。
+  if (!draft) return;
+
+  const bar = document.createElement("div");
+  bar.className = "plan-actions";
+
+  const ok = document.createElement("button");
+  ok.className = "primary";
+  ok.textContent = "确认计划";
+  ok.title = "确认后这些步骤会变成日历上的待办";
+  ok.onclick = async () => {
+    ok.disabled = true;
+    await confirmPlanById(plan.id, box);
+    ok.disabled = false;
+  };
+  bar.appendChild(ok);
+
+  const edit = document.createElement("button");
+  edit.className = "ghost";
+  edit.textContent = "改一下";
+  edit.title = "在对话里继续说你想怎么改，agent 会重新出草案";
+  edit.onclick = () => {
+    const input = $("#chat-text");
+    // 模板里保留"计划/生成"字样：编排层据此继续授权 draft_plan 工具。
+    input.value = `这份计划草案（#${plan.id}）我想调整一下，请重新生成计划草案：`;
+    autoGrow(input);
+    input.focus();
+  };
+  bar.appendChild(edit);
+
+  const drop = document.createElement("button");
+  drop.className = "ghost danger";
+  drop.textContent = "丢弃";
+  drop.title = "这份草案不写入日历";
+  drop.onclick = async () => {
+    if (!confirm("丢弃这份草案？它不会被写入日历。")) return;
+    try {
+      await api("DELETE", `/plans/${plan.id}`);
+      box.innerHTML = `<div class="plan-head"><span class="plan-badge dead">已丢弃</span>
+        <span class="plan-hint">这份草案没有写入日历</span></div>`;
+      toast("草案已丢弃");
+    } catch (e) { toast(e.message, true); }
+  };
+  bar.appendChild(drop);
+  box.appendChild(bar);
+}
+
+// 确认 + 转任务：两步都在这里收口，任何一步失败都把原因摊开，不静默吞掉。
+async function confirmPlanById(planId, box) {
+  try {
+    await api("POST", `/plans/${planId}/confirm`);
+  } catch (e) {
+    showPlanBlockers(box, e);
+    return;
+  }
+  try {
+    const r = await api("POST", `/plans/${planId}/create-tasks`);
+    const n = (r.task_ids || []).length;
+    toast(n ? `已写入日历：${n} 项` : "这份计划的任务之前已经建过");
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  if (box) fillPlanCard(box, planId);
+  loadCalendar();
+  loadTasks();
+}
+
+function showPlanBlockers(box, e) {
+  // 质量门禁的 409 把结构化的 blockers 放在 detail 里，api() 已把它序列化成文本。
+  let detail = null;
+  try { detail = JSON.parse(e.message); } catch (_) { /* 不是结构化错误 */ }
+  const blockers = detail && Array.isArray(detail.blockers) ? detail.blockers : [];
+  if (!blockers.length || !box) { toast(e.message, true); return; }
+  const old = box.querySelector(".plan-blocked");
+  if (old) old.remove();
+  const div = document.createElement("div");
+  div.className = "plan-blocked";
+  div.innerHTML = `<b>还不能确认：</b><ul>${
+    blockers.map((b) => `<li>${escapeHtml(b.message || "")}</li>`).join("")}</ul>
+    <span class="muted">先改时间或删掉多余的步骤，再确认。</span>`;
+  box.appendChild(div);
+  toast("计划还有问题需要先改一下", true);
+}
+
 function footEl(msg) {
   const div = document.createElement("div");
   div.className = "turn-foot";
@@ -1062,6 +1190,8 @@ function turnEl(msg) {
   body.className = "md";
   body.innerHTML = renderMarkdown(msg.content || "") || '<p class="muted">（本轮没有文字回答）</p>';
   wrap.appendChild(body);
+  const plan = planEl(meta);
+  if (plan) wrap.appendChild(plan);
   const refs = refsEl(meta);
   if (refs) wrap.appendChild(refs);
   const hits = hitsEl(meta);
@@ -1183,6 +1313,8 @@ function createLiveTurn() {
       const finalText = (message && message.content) || draft;
       body.innerHTML = renderMarkdown(finalText) || '<p class="muted">（本轮没有文字回答）</p>';
       if (!body.parentNode) wrap.appendChild(body);
+      const plan = planEl(meta);
+      if (plan) wrap.appendChild(plan);
       const refs = refsEl(meta);
       if (refs) wrap.appendChild(refs);
       const hits = hitsEl(meta);
@@ -1416,7 +1548,236 @@ async function sendChat() {
   }
 }
 
-// ----------------------------- 待办 -----------------------------
+// ----------------------------- 日历 -----------------------------
+// 计划确认之后落到这里，按天排开。月历必须带区间取数：不带区间时后端"按时间升序
+// + limit"会先把最早的历史任务取出来，任务一攒多当月反而是空的。
+const calendarState = {
+  view: localStorage.getItem("xhs_cal_view") || "month",
+  cursor: new Date(),      // 正在看的月份（取该月任意一天）
+  selected: null,          // "YYYY-MM-DD"
+  tasks: [],               // 当月任务
+  drafts: [],              // 未确认草案的步骤：{plan_id, plan_title, item}
+  loaded: false,
+};
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const dayKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const todayKey = () => dayKey(new Date());
+const keyOfIso = (iso) => {
+  const d = new Date(iso);
+  return isNaN(d) ? null : dayKey(d);
+};
+const shorten = (text, n) => {
+  const s = String(text || "");
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+};
+
+async function loadCalendar() {
+  const year = calendarState.cursor.getFullYear();
+  const month = calendarState.cursor.getMonth();
+  const start = new Date(year, month, 1);
+  const end = new Date(year, month + 1, 1);
+  // 区间按本机时区换算成绝对时刻（toISOString 带 Z，后端能解析），
+  // 再由后端统一归一到 UTC 文本与库里的 scheduled_at 做比较。
+  const qs = new URLSearchParams({
+    limit: "500",
+    date_from: start.toISOString(),
+    date_to: end.toISOString(),
+  });
+  try {
+    const [tasks, plans] = await Promise.all([
+      api("GET", `/tasks?${qs}`),
+      // 草案拉全量：它没有按月分页的必要（通常就一两份），跨月也能标出来。
+      api("GET", "/plans?status=draft").catch(() => ({ items: [] })),
+    ]);
+    calendarState.tasks = tasks.items || [];
+    calendarState.drafts = [];
+    for (const plan of plans.items || []) {
+      for (const item of plan.items || []) {
+        calendarState.drafts.push({ plan_id: plan.id, plan_title: plan.title, item });
+      }
+    }
+  } catch (e) {
+    toast(e.message, true);
+  }
+  calendarState.loaded = true;
+  if (!calendarState.selected) calendarState.selected = todayKey();
+  renderCalendar();
+}
+
+function dayItems(key) {
+  return {
+    tasks: calendarState.tasks.filter((t) => keyOfIso(t.scheduled_at) === key),
+    drafts: calendarState.drafts.filter((d) => keyOfIso(d.item.scheduled_at) === key),
+  };
+}
+
+function renderCalendar() {
+  const year = calendarState.cursor.getFullYear();
+  const month = calendarState.cursor.getMonth();
+  $("#cal-label").textContent = `${year} 年 ${month + 1} 月`;
+
+  const grid = $("#cal-grid");
+  grid.innerHTML = "";
+  // 周一开头：getDay() 里周日是 0，先把它挪到队尾再算前导格数。
+  const lead = (new Date(year, month, 1).getDay() + 6) % 7;
+  const days = new Date(year, month + 1, 0).getDate();
+  const cells = Math.ceil((lead + days) / 7) * 7;
+  let pending = 0;
+
+  for (let i = 0; i < cells; i += 1) {
+    const date = new Date(year, month, 1 - lead + i);
+    const key = dayKey(date);
+    const { tasks, drafts } = dayItems(key);
+    if (date.getMonth() === month) {
+      pending += tasks.filter((t) => t.status === "pending").length;
+    }
+
+    const cell = document.createElement("button");
+    cell.className = "cal-cell";
+    if (date.getMonth() !== month) cell.classList.add("out");
+    if (key === todayKey()) cell.classList.add("today");
+    if (key === calendarState.selected) cell.classList.add("sel");
+
+    const chips = [];
+    for (const t of tasks.slice(0, 3)) {
+      chips.push(`<span class="cc-chip ${escapeHtml(t.status)}">${escapeHtml(shorten(t.title, 9))}</span>`);
+    }
+    for (const g of drafts.slice(0, Math.max(0, 3 - chips.length))) {
+      chips.push(`<span class="cc-chip draft">${escapeHtml(shorten(g.item.title, 9))}</span>`);
+    }
+    const hidden = tasks.length + drafts.length - chips.length;
+    if (hidden > 0) chips.push(`<span class="cc-more">+${hidden}</span>`);
+    cell.innerHTML = `<span class="cc-day">${date.getDate()}</span>${chips.join("")}`;
+    cell.onclick = () => { calendarState.selected = key; renderCalendar(); };
+    grid.appendChild(cell);
+  }
+
+  $("#cal-summary").textContent = `本月待办 ${pending} 项`
+    + (calendarState.drafts.length ? ` · 未确认草案 ${calendarState.drafts.length} 步` : "");
+  renderDayPanel();
+}
+
+function dayBtn(label, cls, onclick) {
+  const b = document.createElement("button");
+  b.className = cls;
+  b.textContent = label;
+  b.onclick = onclick;
+  return b;
+}
+
+function renderDayPanel() {
+  const key = calendarState.selected || todayKey();
+  const date = new Date(`${key}T00:00:00`);
+  const { tasks, drafts } = dayItems(key);
+  $("#cal-day-title").textContent =
+    `${date.getMonth() + 1} 月 ${date.getDate()} 日 · 周${"一二三四五六日"[(date.getDay() + 6) % 7]}`;
+  $("#cal-day-meta").textContent = tasks.length || drafts.length
+    ? `${tasks.length} 项待办${drafts.length ? ` · ${drafts.length} 步草案` : ""}`
+    : "没有安排";
+
+  const box = $("#cal-day-list");
+  box.innerHTML = "";
+  if (!tasks.length && !drafts.length) {
+    box.innerHTML = `<div class="muted" style="font-size:13px">这天还空着。要安排点什么，就
+      点右下角让 agent 参考你收藏的笔记来排。</div>`;
+    return;
+  }
+  for (const t of tasks) box.appendChild(taskRowEl(t));
+  for (const g of drafts) box.appendChild(draftRowEl(g));
+}
+
+function taskRowEl(t) {
+  const row = document.createElement("div");
+  row.className = `day-item ${escapeHtml(t.status)}`;
+  const at = new Date(t.scheduled_at);
+  const hhmm = isNaN(at) ? "" : `${pad2(at.getHours())}:${pad2(at.getMinutes())}`;
+  row.innerHTML = `<div class="di-head"><span class="di-time">${hhmm}</span>
+      <span class="di-title"></span></div>
+    ${t.details ? '<div class="di-details"></div>' : ""}
+    <div class="di-actions"></div>`;
+  row.querySelector(".di-title").textContent = t.title || "(无标题)";
+  if (t.details) row.querySelector(".di-details").textContent = t.details;
+
+  const bar = row.querySelector(".di-actions");
+  if (t.status === "pending") {
+    bar.appendChild(dayBtn("完成", "primary", async () => {
+      try { await api("POST", `/tasks/${t.id}/complete`); await refreshAfterTaskChange(); }
+      catch (e) { toast(e.message, true); }
+    }));
+    // 日历上最常见的动作就是"今天做不完，顺延一天"，不该逼用户去改具体时间。
+    bar.appendChild(dayBtn("挪到明天", "ghost", async () => {
+      const next = new Date(t.scheduled_at);
+      next.setDate(next.getDate() + 1);
+      try {
+        await api("PUT", `/tasks/${t.id}`, {
+          scheduled_at: localIso(next), timezone: t.timezone || "Asia/Shanghai",
+        });
+        toast("已挪到明天");
+        await refreshAfterTaskChange();
+      } catch (e) { toast(e.message, true); }
+    }));
+    bar.appendChild(dayBtn("取消", "ghost", async () => {
+      if (!confirm("取消这条待办？记录会留在「已取消」里，仍可追溯。")) return;
+      try { await api("DELETE", `/tasks/${t.id}`); await refreshAfterTaskChange(); }
+      catch (e) { toast(e.message, true); }
+    }));
+  }
+  bar.appendChild(dayBtn("删除", "ghost danger", async () => {
+    if (!confirm("彻底删除这条待办？会从数据库移除，不可恢复。")) return;
+    try {
+      await api("DELETE", `/tasks/${t.id}?hard=true`);
+      toast("已删除");
+      await refreshAfterTaskChange();
+    } catch (e) { toast(e.message, true); }
+  }));
+  return row;
+}
+
+// 草案步骤只是"如果确认，它会落在这里"，所以用虚影样式区分，并直接给出确认入口。
+function draftRowEl(g) {
+  const row = document.createElement("div");
+  row.className = "day-item draft";
+  const at = new Date(g.item.scheduled_at);
+  const hhmm = isNaN(at) ? "" : `${pad2(at.getHours())}:${pad2(at.getMinutes())}`;
+  row.innerHTML = `<div class="di-head"><span class="di-time">${hhmm}</span>
+      <span class="di-title"></span></div>
+    <div class="di-note">草案 · ${escapeHtml(g.plan_title || "未命名计划")}</div>
+    <div class="di-actions"></div>`;
+  row.querySelector(".di-title").textContent = g.item.title || "";
+
+  const bar = row.querySelector(".di-actions");
+  const ok = dayBtn("确认整份计划", "primary", async () => {
+    if (!confirm(`确认《${g.plan_title || "这份计划"}》？确认后所有步骤都会变成日历上的待办。`)) return;
+    await confirmPlanById(g.plan_id, null);
+  });
+  ok.title = "确认的是整份计划，不是单独这一条";
+  bar.appendChild(ok);
+  bar.appendChild(dayBtn("在对话里改", "ghost", () => {
+    switchView("chat");
+    const input = $("#chat-text");
+    input.value = `这份计划草案（#${g.plan_id}）我想调整一下，请重新生成计划草案：`;
+    autoGrow(input);
+    input.focus();
+  }));
+  return row;
+}
+
+async function refreshAfterTaskChange() {
+  await loadCalendar();
+  if (!$("#cal-list-body").hidden) loadTasks();
+}
+
+function setCalView(view) {
+  calendarState.view = view;
+  localStorage.setItem("xhs_cal_view", view);
+  $$("#cal-views .seg").forEach((b) => b.classList.toggle("active", b.dataset.calview === view));
+  $("#cal-month-body").hidden = view !== "month";
+  $("#cal-list-body").hidden = view !== "list";
+  if (view === "list") loadTasks();
+}
+
+// ----------------------------- 待办清单 -----------------------------
 async function loadTasks() {
   const status = $("#task-filter").value || undefined;
   const url = status ? `/tasks?status=${status}` : "/tasks";
@@ -1504,7 +1865,37 @@ const applyTheme = (dark) => {
 };
 $("#btn-toggle-theme").onclick = () => applyTheme(!document.body.classList.contains("theme-dark"));
 
-$("#btn-refresh-tasks").onclick = loadTasks;
+// 日历：翻月、回今天、切换月历/清单、以及"这一天交给 agent 来排"。
+function shiftMonth(delta) {
+  const c = calendarState.cursor;
+  calendarState.cursor = new Date(c.getFullYear(), c.getMonth() + delta, 1);
+  loadCalendar();
+}
+$("#btn-cal-prev").onclick = () => shiftMonth(-1);
+$("#btn-cal-next").onclick = () => shiftMonth(1);
+$("#btn-cal-today").onclick = () => {
+  calendarState.cursor = new Date();
+  calendarState.selected = todayKey();
+  loadCalendar();
+};
+$("#btn-refresh-cal").onclick = loadCalendar;
+$$("#cal-views .seg").forEach((b) => {
+  b.onclick = () => setCalView(b.dataset.calview);
+});
+$("#btn-cal-ask").onclick = async () => {
+  const key = calendarState.selected || todayKey();
+  switchView("chat");
+  const id = await ensureThread();
+  if (!id) return;
+  const input = $("#chat-text");
+  // 带"制定…计划"字样：编排层据此授权 agent 的起草工具；同时要求它先问清目标。
+  input.value = `帮我安排 ${key} 这一天，参考我收藏的笔记制定一份计划。`
+    + "先问清我的目标和可用时间，再出草案。";
+  autoGrow(input);
+  input.focus();
+  toast("补上你的目标，再点发送");
+};
+
 $("#task-filter").onchange = loadTasks;
 
 // ----------------------------- 初始化 -----------------------------
@@ -1520,7 +1911,9 @@ async function init() {
   }
   loadNotes();
   loadFolders();
-  loadTasks();
+  // 日历不在这里预取：进页面就多打两枪的意义不大，等用户真要看时再拉。
+  // 但视图偏好要先还原，否则上次停在"清单"的人进来会看到月历被点亮。
+  setCalView(calendarState.view);
   // 有东西要整理就先落在收件箱（那是唯一需要用户动手的地方）；
   // 空的就直接进笔记库，别让用户打开页面先看到一块"什么都没"。
   await loadInbox();

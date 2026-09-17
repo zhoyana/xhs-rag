@@ -205,3 +205,44 @@ def test_stream_unknown_thread_returns_404(tmp_path):
         response = client.post("/threads/not-a-thread/messages/stream",
                                json={"content": "在吗"})
         assert response.status_code == 404
+
+
+def test_plan_tool_stays_granted_only_across_the_clarifying_turn(tmp_path, monkeypatch):
+    """计划工具的授权要跟着"会话状态"走，而不是只看最后一句。
+
+    agent 追问目标后，用户的回答里不再有"计划"二字。此时若把工具收回，计划就
+    只能停在聊天记录里；但也不能反过来一直开着，否则模型会自己冒出来起草计划。
+    """
+    captured = []
+    turns = [
+        # 明确要计划 → 授权
+        {"user": "帮我制定一份一周面试准备计划", "reply": "你每天能投入多少时间？"},
+        # 回答追问（不含"计划"）→ 仍要授权，否则草案落不了库
+        {"user": "每天两小时，从周五开始", "reply": "草案已经保存，请确认后再写入日历。"},
+        # 无关提问 → 必须收回工具，避免模型自作主张起草
+        {"user": "RAG 的召回策略有哪些？", "reply": "常见的是向量召回加关键词召回。"},
+    ]
+
+    def make_stream(reply):
+        async def _stream(history, tools, model=None, max_rounds=6, required_tool=None):
+            captured.append({
+                "reply": reply,
+                "required_tool": required_tool,
+                "tools": [getattr(tool, "name", None) for tool in tools],
+            })
+            yield {"type": "done", "content": reply, "tool_calls": [],
+                   "retrieved_note_ids": [], "cited_note_ids": [], "plan_id": None}
+        return _stream
+
+    with TestClient(create_app(tmp_path / "plan.sqlite3")) as client:
+        thread_id = client.post("/threads", json={"title": "商量计划"}).json()["id"]
+        for turn in turns:
+            monkeypatch.setattr("app.main.run_agent_turn_stream", make_stream(turn["reply"]))
+            client.post(f"/threads/{thread_id}/messages/stream", json={"content": turn["user"]})
+
+    assert [item["required_tool"] for item in captured[:2]] == ["draft_plan", "draft_plan"]
+    assert "draft_plan" in captured[0]["tools"]
+    assert "draft_plan" in captured[1]["tools"]
+    # 第三轮是普通提问：既不强制，模型也根本看不见这个工具。
+    assert captured[2]["required_tool"] is None
+    assert "draft_plan" not in captured[2]["tools"]

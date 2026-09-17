@@ -27,7 +27,14 @@ from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
 from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe, extract_chat_memories_safe
 from .retrieval import search_knowledge
-from .chat_agent import plan_requested, run_agent_turn, run_agent_turn_stream
+from .chat_agent import (
+    asked_question_last,
+    plan_requested,
+    plan_thread_pending,
+    run_agent_turn,
+    run_agent_turn_stream,
+)
+
 from .plan_quality import check_plan_quality
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
@@ -327,6 +334,29 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         except ZoneInfoNotFoundError:
             raise HTTPException(400, detail="timezone 不是有效的 IANA 时区名称。") from None
 
+    def utc_query_text(value: str | None, field_name: str):
+        """把查询参数里的时间也归一到 UTC 文本，才能和库里的时间做字符串比较。"""
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(
+                400, detail=f"{field_name} 必须是 ISO 8601 时间，例如 2026-09-01T00:00:00+08:00。"
+            ) from None
+        return utc_text(parsed, field_name)
+
+    def plan_turn_requested(text: str, history: list[dict]) -> bool:
+        """本轮是否授权（并强制）draft_plan。
+
+        除了"这一句就在要计划"，还要接住多轮商量：agent 追问目标之后，用户回的那句
+        往往没有"计划"二字（"每天两小时，从周五开始"）。只看最后一句就会在这里把
+        工具收回，agent 只能接着空谈，草稿永远落不了库。
+        """
+        return plan_requested(text) or (
+            asked_question_last(history) and plan_thread_pending(history)
+        )
+
     @app.get("/health", summary="检查后端是否启动")
     def health():
         # @app.get 是装饰器，把 URL 和函数关联起来。GET 主要用于读取。
@@ -415,10 +445,10 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             raise HTTPException(404, detail="对话不存在。")
         now = datetime.now(timezone.utc).isoformat()
         app.state.store.add_chat_message(thread_id, "user", body.content.strip(), {}, now)
-        wants_plan = plan_requested(body.content)
-        tools = await chat_tools(wants_plan)
         # 只发送最近 20 条消息：这是滑动窗口短期记忆，避免上下文无限增长。
         history = app.state.store.thread(thread_id, message_limit=20)["messages"]
+        wants_plan = plan_turn_requested(body.content, history)
+        tools = await chat_tools(wants_plan)
         try:
             result = await run_agent_turn(
                 history, tools, required_tool="draft_plan" if wants_plan else None
@@ -465,12 +495,12 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                 thread_id, "user", body.content.strip(), {},
                 datetime.now(timezone.utc).isoformat(),
             )
-            wants_plan = plan_requested(body.content)
             yield sse({"type": "start", "thread_id": thread_id})
             try:
-                tools = await chat_tools(wants_plan)
                 # 只发送最近 20 条消息：滑动窗口短期记忆，控制上下文成本。
                 history = app.state.store.thread(thread_id, message_limit=20)["messages"]
+                wants_plan = plan_turn_requested(body.content, history)
+                tools = await chat_tools(wants_plan)
                 async for event in run_agent_turn_stream(
                     history, tools, required_tool="draft_plan" if wants_plan else None
                 ):
@@ -983,6 +1013,19 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             plan_id, plan["source_note_ids"][0], datetime.now(timezone.utc).isoformat()
         )
         return {"status": "created" if task_ids else "existing", "task_ids": task_ids, "plan": result}
+
+    @app.delete("/plans/{plan_id}", summary="丢弃计划草案")
+    def discard_plan(plan_id: int):
+        """把一份还没确认的草案删掉。
+
+        只允许 draft：已确认的计划已经生成了任务，抹掉计划会让那些任务失去来源，
+        这种情况下正确的收尾是去日历里取消任务，而不是删计划。
+        """
+        plan = get_plan(plan_id)
+        if plan["status"] != "draft":
+            raise HTTPException(409, detail="只有草案可以丢弃；已确认的计划请改为取消其中的任务。")
+        app.state.store.delete_plan(plan_id)
+        return {"status": "discarded", "plan_id": plan_id}
 
     @app.post("/notes/{note_id}/refresh-source", summary="刷新笔记正文和临时图片地址")
     async def refresh_note_source(note_id: str, body: RefreshSourceRequest | None = None):
@@ -1617,8 +1660,17 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
 
     @app.get("/tasks", summary="查看任务列表")
     def list_tasks(status: Literal["pending", "completed", "cancelled"] | None = None,
-                   limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
-        return {"items": app.state.store.tasks(status, limit, offset)}
+                   limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+                   date_from: str | None = Query(default=None,
+                                                 description="区间起点（含），ISO 8601，例如 2026-09-01T00:00:00+08:00"),
+                   date_to: str | None = Query(default=None,
+                                               description="区间终点（不含），ISO 8601，日历取整月时用它排除下月第一天")):
+        # 日历按月取数，必须带区间：默认的"按时间升序 + limit"会先把最早的历史任务
+        # 取出来，任务一多当月反而是空的。
+        return {"items": app.state.store.tasks(
+            status, limit, offset,
+            utc_query_text(date_from, "date_from"), utc_query_text(date_to, "date_to"),
+        )}
 
     def require_task(task_id: int):
         task = app.state.store.task(task_id)

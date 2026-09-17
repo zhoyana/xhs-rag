@@ -25,7 +25,10 @@ status 是 existing 就说明之前已经收藏过，不要说成刚收藏成功
 表示这篇笔记现在就能被 search_notes 检索到；index.status 是 skipped 时说明它没有可检索
 的正文，应告诉用户这次没建索引，不要谎称可以搜到。同一篇笔记不要两个工具都调。
 制定计划前应检索相关笔记并读取用户记忆，之后只能生成 draft 草案。
-绝不能替用户确认计划或创建任务。回答使用简洁中文，并说明参考了哪些笔记。
+目标还不清楚时（不知道想解决什么、从哪天开始、每天能投入多久），先用一两句话
+问清楚再起草，不要凭空替用户定目标；追问的那条回答要以问号结尾。
+起草之后必须说明"这是草案，需要你确认才会写入日历"，绝不能替用户确认或创建任务。
+回答使用简洁中文，并说明参考了哪些笔记。
 """
 
 
@@ -43,6 +46,38 @@ def plan_requested(text: str) -> bool:
     if PLAN_NEGATION_PATTERN.search(text):
         return False
     return bool(PLAN_ACTION_PATTERN.search(text) and PLAN_OBJECT_PATTERN.search(text))
+
+
+QUESTION_TAIL = re.compile(r"[？?]\s*$")
+
+
+def asks_clarification(content: str) -> bool:
+    """模型这句话是不是在向用户追问（以问号结尾）。
+
+    用户说"帮我排个计划"却没给目标，此时强行逼它调 draft_plan，只会得到一份
+    凭空定目标的草案。允许它以追问收尾，把"想清楚再落库"这一步留给用户。
+    """
+    return bool(QUESTION_TAIL.search((content or "").strip()))
+
+
+def asked_question_last(history: list[dict]) -> bool:
+    """上一轮助手是不是在追问。
+
+    追问之后用户回的那句往往没有"计划"二字（例如"每天两小时，从周五开始"），
+    只看最后一句会把 draft_plan 工具收回，计划就只能在文字里空谈、落不了库。
+    """
+    for item in reversed(history):
+        if item.get("role") != "assistant":
+            continue
+        return asks_clarification(item.get("content") or "")
+    return False
+
+
+def plan_thread_pending(history: list[dict], window: int = 6) -> bool:
+    """最近几轮里出现过明确的计划请求——会话还在"商量计划"的状态中。"""
+    user_turns = [item.get("content") or "" for item in history
+                  if item.get("role") == "user"][-window:]
+    return any(plan_requested(text) for text in user_turns)
 
 
 def safe_tool_error(exc: Exception) -> dict:
@@ -183,14 +218,18 @@ async def run_agent_turn(
         response = await round_model.ainvoke(messages)
         messages.append(response)
         if not response.tool_calls:
-            if required_tool and required_tool not in attempted_tools:
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            # 以追问收尾不算"不听话"：目标都没问清就把草稿逼出来，只会得到一份
+            # 凭空定目标的计划，用户还得推翻重来。
+            if (required_tool and required_tool not in attempted_tools
+                    and not asks_clarification(content)):
                 messages.append(HumanMessage(content=(
                     f"用户明确要求生成可保存的计划草案。不要直接输出文字计划；"
                     f"现在必须调用 {required_tool}，并使用已检索或上一轮引用的笔记 ID。"
+                    f"还缺必要信息就先用一句问句问清楚，不要凭空假设。"
                 )))
                 force_required_next = True
                 continue
-            content = response.content if isinstance(response.content, str) else str(response.content)
             # cited 只记录模型最终回答中出现过，或通过 get_note 明确展开过的来源。
             cited = cited_ids_for(content, viewed_note_ids, retrieved_note_ids)
             return {
@@ -280,16 +319,19 @@ async def run_agent_turn_stream(
         messages.append(gathered)
 
         if not gathered.tool_calls:
-            if required_tool and required_tool not in attempted_tools:
+            content = gathered.content if isinstance(gathered.content, str) else str(gathered.content)
+            # 以追问收尾不算"不听话"：保留这段文字让用户回答，不逼它凭空起草。
+            if (required_tool and required_tool not in attempted_tools
+                    and not asks_clarification(content)):
                 messages.append(HumanMessage(content=(
                     f"用户明确要求生成可保存的计划草案。不要直接输出文字计划；"
                     f"现在必须调用 {required_tool}，并使用已检索或上一轮引用的笔记 ID。"
+                    f"还缺必要信息就先用一句问句问清楚，不要凭空假设。"
                 )))
                 force_required_next = True
                 # 刚吐出去的只是模型的“口头答应”，不是答案，通知前端丢弃这段草稿。
                 yield {"type": "reset"}
                 continue
-            content = gathered.content if isinstance(gathered.content, str) else str(gathered.content)
             yield {
                 "type": "done",
                 "content": content,

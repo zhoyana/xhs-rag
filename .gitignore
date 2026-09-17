@@ -2,6 +2,8 @@
 .venv-local/
 __pycache__/
 .pytest_cache/
+# 本机 Temp 目录不可写，测试时用 --basetemp 指到这里；它只是运行产物，不进仓库。
+.pytest-tmp*/
 test-temp-*/
 /data/
 *.log

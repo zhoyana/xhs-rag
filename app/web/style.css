@@ -509,6 +509,78 @@ body.theme-dark .toast { background: #e9e9ec; color: #16161a; }
 .status-completed { color: var(--ok); }
 .status-cancelled { color: var(--muted); }
 
+/* ---------- 日历 ---------- */
+/* 计划确认之后落到这里。月历负责"哪天有安排"，右侧负责"那天具体做什么"。 */
+.cal-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.cal-nav { display: flex; align-items: center; gap: 6px; }
+.cal-nav button { padding: 4px 10px; }
+.cal-label { font-size: 15px; font-weight: 700; min-width: 100px; }
+.seg-group { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg {
+  border: none; background: var(--panel); color: var(--muted);
+  font: inherit; font-size: 12px; padding: 5px 12px; cursor: pointer;
+}
+.seg + .seg { border-left: 1px solid var(--border); }
+.seg.active { background: var(--primary); color: #fff; font-weight: 600; }
+
+.cal-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+.cal-grid-wrap { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--panel); }
+.cal-weekdays {
+  display: grid; grid-template-columns: repeat(7, 1fr);
+  border-bottom: 1px solid var(--border);
+}
+.cal-weekdays span { text-align: center; font-size: 11px; color: var(--muted); padding: 6px 0; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); }
+.cal-cell {
+  min-height: 92px; padding: 6px; text-align: left;
+  display: flex; flex-direction: column; gap: 3px; align-items: stretch;
+  font: inherit; color: var(--text); cursor: pointer;
+  background: var(--panel);
+  border: none; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.cal-cell:nth-child(7n) { border-right: none; }
+.cal-cell:hover { background: var(--bg); }
+.cal-cell.out { opacity: 0.4; }
+.cal-cell.sel { box-shadow: inset 0 0 0 2px var(--primary); }
+.cal-cell.today .cc-day { color: var(--primary); font-weight: 800; }
+.cc-day { font-size: 12px; font-weight: 600; }
+.cc-chip {
+  display: block; padding: 1px 5px; border-radius: 4px;
+  font-size: 10px; line-height: 1.5;
+  background: var(--primary-soft); color: var(--primary);
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.cc-chip.completed { background: var(--border); color: var(--muted); text-decoration: line-through; }
+.cc-chip.cancelled { background: var(--border); color: var(--muted); }
+/* 未确认的草案：虚框，明确表示"还可能不算数" */
+.cc-chip.draft { background: transparent; border: 1px dashed var(--border); color: var(--muted); }
+.cc-more { font-size: 10px; color: var(--muted); }
+
+.cal-day {
+  border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+  background: var(--panel);
+  display: flex; flex-direction: column; gap: 10px; min-height: 240px;
+}
+.cal-day-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.cal-day-list { display: flex; flex-direction: column; gap: 12px; flex: 1; }
+.cal-day-foot { border-top: 1px solid var(--border); padding-top: 10px; }
+.day-item { border-left: 2px solid var(--border); padding-left: 10px; }
+.day-item.completed { opacity: 0.6; }
+.day-item.draft { border-left-style: dashed; }
+.di-head { display: flex; align-items: baseline; gap: 8px; }
+.di-time { font-size: 11px; color: var(--accent); font-variant-numeric: tabular-nums; }
+.di-title { font-size: 13px; font-weight: 600; }
+.di-details, .di-note { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.di-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.di-actions button { font-size: 11px; padding: 3px 8px; }
+.cal-list { display: block; }
+
+@media (max-width: 900px) {
+  .cal-body { grid-template-columns: 1fr; }
+  .cal-cell { min-height: 68px; }
+  .cc-chip { display: none; }
+}
+
 /* 标签上的待整理数量徽标 */
 .tab-badge {
   display: inline-block;
@@ -609,25 +681,53 @@ body.theme-dark .toast { background: #e9e9ec; color: #16161a; }
 }
 .fchip.on { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); font-weight: 600; }
 
-.ireasons summary, .iactions summary, .hits summary {
+.ireasons summary, .hits summary {
   cursor: pointer;
   font-size: 12px;
   color: var(--muted);
 }
 .ireasons ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
-.iact { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; font-size: 13px; }
-.iact input { margin-top: 4px; }
 
 .icard-actions {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   margin-top: 12px;
 }
-.itask { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
-.isel {
-  font: inherit; font-size: 12px; padding: 4px 6px;
-  border: 1px solid var(--border); border-radius: 6px;
-  background: var(--panel); color: var(--text);
+
+/* ---------- 对话里的计划草案卡 ---------- */
+/* agent 只起草，落库要用户点确认；这张卡就是那个入口，所以左边框给主色。 */
+.plan-card {
+  margin: 12px 0 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--primary);
+  border-radius: 8px;
+  background: var(--panel);
 }
+.plan-wait { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.plan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.plan-badge {
+  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+  background: var(--primary-soft); color: var(--primary);
+}
+.plan-badge.dead { background: var(--border); color: var(--muted); }
+.plan-hint { font-size: 11px; color: var(--muted); }
+.plan-title { font-size: 14px; font-weight: 700; }
+.plan-goal { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+.plan-items { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+.plan-items li { font-size: 13px; }
+.pi-when {
+  display: inline-block; min-width: 86px; margin-right: 6px;
+  font-size: 12px; color: var(--accent); font-variant-numeric: tabular-nums;
+}
+.pi-details { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.plan-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.plan-blocked {
+  margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+  background: rgba(208, 48, 80, 0.08);
+  border: 1px solid rgba(208, 48, 80, 0.3);
+  font-size: 12px;
+}
+.plan-blocked ul { margin: 4px 0; padding-left: 18px; }
 
 /* ---------- 对话里的「原始命中」 ---------- */
 .hits { margin: 10px 0 4px; }

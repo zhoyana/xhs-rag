@@ -2,9 +2,17 @@
 import asyncio
 
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 
-from app.chat_agent import build_hits, plan_requested, run_agent_turn
+from app.chat_agent import (
+    asked_question_last,
+    asks_clarification,
+    build_hits,
+    plan_requested,
+    plan_thread_pending,
+    run_agent_turn,
+    run_agent_turn_stream,
+)
 from app.main import create_app
 from app.tools import build_langchain_tools
 
@@ -149,6 +157,73 @@ def test_explicit_plan_request_forces_draft_tool_when_model_only_writes_text():
     assert model.was_forced is True
     assert result["plan_id"] == 12
     assert result["tool_calls"][0]["name"] == "draft_plan"
+
+
+def test_plan_conversation_helpers_keep_multi_turn_context():
+    """"先聊清楚再起草"就靠这三个判断，回归时最容易被当成样板删掉。"""
+    assert asks_clarification("你打算从哪天开始？") is True
+    assert asks_clarification("这份草案已经准备好了。") is False
+
+    history = [
+        {"role": "user", "content": "帮我制定一份一周面试准备计划"},
+        {"role": "assistant", "content": "你每天能投入多少时间？"},
+        {"role": "user", "content": "大概两小时，从周五开始"},
+    ]
+    # 用户回答里没有"计划"二字，但会话仍在商量计划，工具不能被收回，
+    # 否则 agent 只能在文字里空谈，草案永远落不了库。
+    assert plan_requested(history[-1]["content"]) is False
+    assert asked_question_last(history) is True
+    assert plan_thread_pending(history) is True
+
+    assert plan_thread_pending([{"role": "user", "content": "帮我检索 RAG 笔记"}]) is False
+    assert asked_question_last([{"role": "user", "content": "你好"}]) is False
+
+
+def test_clarifying_question_is_not_treated_as_disobedience():
+    """模型追问目标时不该被强行纠正：目标都没问清，逼出来的草案只会凭空定目标。"""
+
+    class AskingModel:
+        def __init__(self):
+            self.forced = False
+
+        def bind_tools(self, tools, **kwargs):
+            if kwargs.get("tool_choice"):
+                self.forced = True
+            return self
+
+        async def ainvoke(self, messages):
+            return AIMessage(content="这份计划你想覆盖到哪天面试？每天能投入多久？")
+
+    model = AskingModel()
+    result = asyncio.run(run_agent_turn(
+        [{"role": "user", "content": "帮我制定一份计划", "metadata": {}}],
+        [], model=model, required_tool="draft_plan",
+    ))
+    assert model.forced is False
+    assert result["plan_id"] is None
+    assert "每天能投入多久" in result["content"]
+
+
+def test_stream_clarifying_question_is_kept_not_reset():
+    """流式链路同理：追问要原样保留，不能发 reset 把用户看到的字抹掉。"""
+
+    class AskingModel:
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        async def astream(self, messages):
+            yield AIMessageChunk(content="你想从哪天开始？")
+
+    async def collect():
+        return [event async for event in run_agent_turn_stream(
+            [{"role": "user", "content": "帮我制定一份计划", "metadata": {}}],
+            [], model=AskingModel(), required_tool="draft_plan",
+        )]
+
+    events = asyncio.run(collect())
+    assert [event["type"] for event in events] == ["delta", "done"]
+    assert events[-1]["plan_id"] is None
+    assert events[-1]["content"] == "你想从哪天开始？"
 
 
 def test_normalize_tool_result_flattens_mcp_content_blocks():

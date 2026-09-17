@@ -387,6 +387,20 @@ class NoteStore:
             db.execute("UPDATE plans SET status='active', updated_at=? WHERE id=?", (now, plan_id))
         return self.plan(plan_id), task_ids
 
+    def delete_plan(self, plan_id):
+        """丢弃计划草案：步骤与来源关系一并删掉。
+
+        只有 draft 允许删（接口层把关）：已确认的计划已经生成任务，删掉计划会让
+        那些任务失去来源，收尾方式应该是取消任务，而不是抹掉计划本身。
+        """
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("""DELETE FROM plan_item_sources WHERE plan_item_id IN
+                (SELECT id FROM plan_items WHERE plan_id = ?)""", (plan_id,))
+            db.execute("DELETE FROM plan_items WHERE plan_id = ?", (plan_id,))
+            cursor = db.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+            deleted = cursor.rowcount
+        return deleted > 0
+
     def create_thread(self, thread_id, title, now):
         """创建一次对话；UUID 由接口层生成，数据库只负责持久化。"""
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -1208,15 +1222,30 @@ class NoteStore:
             row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return self._task_dict(row)
 
-    def tasks(self, status=None, limit=50, offset=0):
+    def tasks(self, status=None, limit=50, offset=0, date_from=None, date_to=None):
+        """按状态与时间区间查询任务。
+
+        date_from / date_to 是已归一到 UTC 的 ISO 文本，与库里 scheduled_at 同格式，
+        直接做字符串比较即可。日历必须带区间：不带区间时"按时间升序 + limit"会先把
+        最早的历史任务取出来，当月反而被挤掉——任务攒多了日历就永远是空的。
+        """
+        clauses, params = [], []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if date_from:
+            clauses.append("scheduled_at >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("scheduled_at < ?")
+            params.append(date_to)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with closing(sqlite3.connect(self.path)) as db:
             db.row_factory = sqlite3.Row
-            if status:
-                rows = db.execute("""SELECT * FROM tasks WHERE status = ?
-                    ORDER BY scheduled_at LIMIT ? OFFSET ?""", (status, limit, offset)).fetchall()
-            else:
-                rows = db.execute("""SELECT * FROM tasks
-                    ORDER BY scheduled_at LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
+            rows = db.execute(
+                f"SELECT * FROM tasks {where} ORDER BY scheduled_at LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
         return [self._task_dict(row) for row in rows]
 
     def update_task(self, task_id, fields, updated_at):
