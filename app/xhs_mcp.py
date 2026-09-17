@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 
 from .xhs_link import XhsLinkError, expand_short_link, note_from_feed_detail, parse_xhs_link
+from .xhs_vision import transcribe_images
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,15 @@ XHS_MCP_URL = os.getenv("XHS_MCP_URL", "http://localhost:18060/mcp")
 
 LINK_TOOL_NAME = "collect_note_by_link"
 LINK_TOOL_DESCRIPTION = (
-    "按小红书链接采集笔记原文。用户直接粘贴小红书链接或分享文案时用它，"
-    "比 search_feeds 更准确。链接必须带 xsec_token（从 App 或网页复制的分享链接都带），"
-    "令牌会过期，失败就说明链接已失效，应请用户重新复制，不要反复重试。"
+    "按小红书链接采集笔记原文，并自动识别图片里的文字。用户直接粘贴小红书链接或分享文案时用它，"
+    "比 search_feeds 更准确。小红书很多笔记把正文写在长图里，此时返回值中的 image_text 才是真正的"
+    "内容——只要它非空，就必须以它为准来回答，不要再声称无法识别图片。"
+    "链接必须带 xsec_token（从 App 或网页复制的分享链接都带），令牌会过期，"
+    "失败就说明链接已失效，应请用户重新复制，不要反复重试。"
 )
 
 _cache: list | None = None
+DEFAULT_TRANSCRIBE = transcribe_images
 
 
 class CollectNoteInput(BaseModel):
@@ -41,6 +45,9 @@ class CollectNoteInput(BaseModel):
 
     link: str = Field(min_length=8, max_length=2000,
                       description="小红书笔记链接，或包含链接的整段分享文案")
+    read_images: bool = Field(
+        default=True,
+        description="是否识别图片里的文字（默认开启）。关闭可更快返回，但图文笔记会拿不到正文。")
     with_comments: bool = Field(default=False, description="是否加载更多评论，会更慢")
 
 
@@ -78,14 +85,38 @@ def _tool_text(raw) -> str | None:
     return None
 
 
-def build_link_collect_tool(detail_tool) -> StructuredTool:
+def _apply_image_text(note: dict, vision: dict) -> None:
+    """把读图结果并进 note，并同步修正 warnings。
+
+    警告必须跟着事实走：图片一旦被识别成功，"内容在图片里"这句就不再成立，
+    留着反而会误导模型声称自己看不到内容。
+    """
+    warnings = [w for w in note.get("warnings", []) if "主要内容在图片里" not in w
+                and "需及时下载" not in w]
+    text = str(vision.get("text") or "").strip()
+    if text:
+        note["image_text"] = text
+        note["image_count"] = vision.get("read")
+        warnings.append(
+            f"已用视觉模型识别 {vision.get('read')} 张图片，完整内容见 image_text，可直接引用。")
+    else:
+        warnings.append(
+            f"图片识别未取得文字（{vision.get('error') or '未知原因'}），只能依据文字正文回答。")
+    note["warnings"] = warnings
+
+
+def build_link_collect_tool(detail_tool, transcribe=None) -> StructuredTool:
     """把 MCP 的 get_feed_detail 包成"粘链接即可采集"的工具。
 
     秋招知识点：MCP 侧只有 feed_id + xsec_token 的接口，但用户手里只有链接。
     参数形态的差异不该由模型去感知——由编排层补齐，模型只看到"能按链接采集"。
-    """
 
-    async def collect(link: str, with_comments: bool = False) -> dict:
+    秋招知识点（多模态的位置）：图片必须在这里就地转成文字。Agent 的工具结果
+    走的是文本通道，模型拿不到图片本身；把视觉调用放在工具内部，模型侧零改动。
+    """
+    transcribe = transcribe or DEFAULT_TRANSCRIBE
+
+    async def collect(link: str, read_images: bool = True, with_comments: bool = False) -> dict:
         try:
             ref = parse_xhs_link(link)
             if ref["short_link"]:
@@ -127,6 +158,15 @@ def build_link_collect_tool(detail_tool) -> StructuredTool:
             note = note_from_feed_detail(payload)
         except XhsLinkError as exc:
             return _failure(exc.code, str(exc))
+
+        # 图片地址带签名且很快过期，必须在采集的同一轮里读掉，不能留着稍后再下载。
+        if read_images and note.get("images"):
+            try:
+                vision = await transcribe(note["images"], title=note.get("title", ""))
+            except Exception:  # noqa: BLE001 - 读图失败只降级成"只有文字正文"
+                logger.warning("xhs_note_transcribe_failed", exc_info=True)
+                vision = {"status": "failed", "text": "", "error": "视觉识别异常。"}
+            _apply_image_text(note, vision)
         return {"ok": True, "data": note, "error": None}
 
     return StructuredTool.from_function(

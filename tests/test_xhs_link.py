@@ -17,6 +17,19 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _offline_transcribe(monkeypatch):
+    """采集工具现在默认会下载图片并调视觉模型；单测必须把它挡在网外。
+
+    默认实现是模块级常量，工具构造时才读取，所以替换它就等于替换默认行为。
+    """
+    async def fake_transcribe(images, title="", **_kwargs):
+        return {"status": "ok", "text": "（测试替身转写）", "images": [], "model": "fake",
+                "read": len(images), "dropped": 0, "error": None}
+
+    monkeypatch.setattr(xhs_mcp, "DEFAULT_TRANSCRIBE", fake_transcribe)
+
+
 PC_LINK = ("https://www.xiaohongshu.com/explore/6aa3c6ff0000000025036dd4"
            "?xsec_token=ABXOT8pzCMmo0h7NC6K6n-HpMsyKDQF-ltrOlOCVMrQG8=&xsec_source=pc_user")
 

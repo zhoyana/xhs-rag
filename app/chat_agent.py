@@ -14,8 +14,11 @@ SYSTEM_PROMPT = """你是用户的小红书知识库学习助手。当前日期�
 回答收藏内容前先使用 search_notes；需要完整原文时再使用 get_note。
 需要站外小红书内容时使用 search_feeds；用户直接粘贴小红书链接或分享文案时，
 用 collect_note_by_link 按链接采集原文。这些站外工具可能不可用，调用失败就说明
-仅基于知识库回答，不要反复重试。采集结果若带 warnings，必须如实转达——例如提示
-"正文过短、内容在图片里"时，只能说明这一点，绝不能凭空编造图片里的内容。
+仅基于知识库回答，不要反复重试。
+小红书很多笔记把正文写在长图里：collect_note_by_link 已内置视觉识别，返回值里的
+image_text 就是图片中的文字。只要 image_text 非空，就必须以它为准来回答，
+不要再声称自己无法识别图片；只有 image_text 为空时，才可以说内容看不清。
+采集结果若带 warnings，必须如实转达，绝不能凭空编造图片里的内容。
 制定计划前应检索相关笔记并读取用户记忆，之后只能生成 draft 草案。
 绝不能替用户确认计划或创建任务。回答使用简洁中文，并说明参考了哪些笔记。
 """
@@ -44,6 +47,25 @@ def safe_tool_error(exc: Exception) -> dict:
     if isinstance(status_code, int):
         return {"code": f"http_{status_code}", "message": str(detail or "工具请求失败")}
     return {"code": "tool_exception", "message": "工具执行失败，请稍后重试。"}
+
+
+def normalize_tool_result(result) -> dict:
+    """把任意工具的返回值统一成 {ok, data, error} 契约。
+
+    秋招知识点（混合工具来源的契约收敛）：本地工具返回的是自研 dict，
+    而 MCP 工具经 langchain-mcp-adapters 包装后返回的是 MCP 的 content
+    blocks 列表 —— [{ "type": "text", "text": "..." }]。编排层若不抹平这个
+    差异，下游一句 result.get("data") 就会直接崩，而且是在真实对话里才暴露。
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, (list, tuple)):
+        parts = [str(block.get("text") or "") for block in result
+                 if isinstance(block, dict) and block.get("type") == "text"]
+        text = "".join(parts)
+        # 文本块能拼出内容就交文本；拼不出则原样透传，至少不丢数据。
+        return {"ok": True, "data": text or list(result), "error": None}
+    return {"ok": True, "data": result, "error": None}
 
 
 def deepseek_chat_model():
@@ -128,7 +150,7 @@ async def run_agent_turn(
                           "error": {"code": "unknown_tool", "message": "工具不存在"}}
             else:
                 try:
-                    result = await tool.ainvoke(call["args"])
+                    result = normalize_tool_result(await tool.ainvoke(call["args"]))
                 except Exception as exc:  # 工具失败应回传给模型，让它解释或换策略。
                     result = {"ok": False, "data": None, "error": safe_tool_error(exc)}
             data = result.get("data")
