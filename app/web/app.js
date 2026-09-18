@@ -1263,7 +1263,7 @@ function renderPlanCard(box, plan) {
   box.appendChild(bar);
 }
 
-// 确认 + 转任务：两步都在这里收口，任何一步失败都把原因摊开，不静默吞掉。
+// 确认 = 服务端一次 resume（确认 + 建任务 + 收集质量门禁），失败原因都摊开，不静默吞掉。
 async function confirmPlanById(planId, box) {
   // 一次调用完成「确认 + 写进日历」。原来是连打 confirm 和 create-tasks 两个接口，
   // 中间断开就会留下"计划已确认、日历里却没有任务"的半成品；现在这两步是服务端
