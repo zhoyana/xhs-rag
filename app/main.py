@@ -36,6 +36,7 @@ from .chat_agent import (
 )
 
 from .plan_quality import check_plan_quality
+from .plan_flow import commit_plan, flow_snapshot, start_review
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
 from . import indexing, xhs_source
@@ -182,6 +183,21 @@ class PlanItemUpdateRequest(BaseModel):
 
 class PlanItemsReorderRequest(BaseModel):
     item_ids: list[int] = Field(min_length=1, max_length=30)
+
+
+class PlanCommitItem(BaseModel):
+    """闸门里被用户改过的步骤：只带要改的字段，没带的保持原值。"""
+    id: int
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    scheduled_at: datetime | None = None
+    reminder_at: datetime | None = None
+
+
+class PlanCommitRequest(BaseModel):
+    items: list[PlanCommitItem] = Field(
+        default_factory=list, max_length=30,
+        description="用户改过的步骤；不传表示原样确认。",
+    )
 
 
 class AIDraftPlanRequest(BaseModel):
@@ -1000,7 +1016,15 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             result["title"].strip(), result["goal"].strip(), body.source_note_ids,
             items, datetime.now(timezone.utc).isoformat()
         )
-        return {"status": "draft", "model": model, "plan": plan}
+        # 草案一落地就让它停在人工闸门上，checkpoint 随之落盘。
+        # 这样"用户什么时候点确认""中间服务有没有重启"都不影响续跑。
+        # 这层是增强：它坏了也不该连带把草案弄丢，所以单独兜住异常。
+        flow = None
+        try:
+            flow = start_review(app.state.store, plan["id"])
+        except Exception:
+            logger.warning("plan_flow_start_failed plan_id=%s", plan["id"], exc_info=True)
+        return {"status": "draft", "model": model, "plan": plan, "flow": flow}
 
     @app.get("/plans", summary="查看学习计划")
     def list_plans(status: Literal["draft", "confirmed", "active", "completed"] | None = None):
@@ -1112,6 +1136,49 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             plan_id, plan["source_note_ids"][0], datetime.now(timezone.utc).isoformat()
         )
         return {"status": "created" if task_ids else "existing", "task_ids": task_ids, "plan": result}
+
+    @app.post("/plans/{plan_id}/commit",
+              summary="确认计划并写入日历（一次调用完成，幂等）")
+    def commit_plan_endpoint(plan_id: int, body: PlanCommitRequest | None = None):
+        """把"确认"和"建任务"合成一个动作。
+
+        原来前端要连打 confirm 和 create-tasks 两个接口，中间断开就会留下
+        "计划已确认、日历里没任务"的半成品。现在这两步是 LangGraph 图上
+        同一个 resume：服务端一轮跑完，客户端只发一次。
+
+        幂等：重复调用不会重复建任务，返回 status=existing。
+        """
+        get_plan(plan_id)  # 不存在就 404，别把 404 混进下面的 outcome 分支
+        edits = []
+        for item in (body.items if body else []):
+            changes = item.model_dump(exclude_unset=True)
+            changes.pop("id")
+            # 时间同样要换算成 UTC 再落库（和 PUT /plans/{id}/items/{item_id} 一致）。
+            if changes.get("scheduled_at") is not None:
+                changes["scheduled_at"] = utc_text(changes["scheduled_at"], "scheduled_at")
+            if changes.get("reminder_at") is not None:
+                changes["reminder_at"] = utc_text(changes["reminder_at"], "reminder_at")
+            edits.append({"id": item.id, **changes})
+
+        result = commit_plan(app.state.store, plan_id, items=edits)
+        outcome = result["outcome"]
+        if outcome == "missing_source":
+            raise HTTPException(409, detail="计划至少需要一个来源笔记，才能关联现有任务。")
+        if outcome == "blocked":
+            # 保持与 confirm 一样的结构化 409，前端 showPlanBlockers 不用改。
+            raise HTTPException(409, detail=result["quality"])
+        return {
+            "status": "created" if result["task_ids"] else "existing",
+            "task_ids": result["task_ids"],
+            "applied_item_ids": result["applied_item_ids"],
+            "checkpoint_id": result["checkpoint_id"],
+            "plan": get_plan(plan_id),
+        }
+
+    @app.get("/plans/{plan_id}/flow", summary="查看这条计划链的执行路径（暂停在哪、走过哪些节点）")
+    def get_plan_flow(plan_id: int):
+        get_plan(plan_id)
+        return flow_snapshot(app.state.store, plan_id)
 
     @app.delete("/plans/{plan_id}", summary="丢弃计划草案")
     def discard_plan(plan_id: int):

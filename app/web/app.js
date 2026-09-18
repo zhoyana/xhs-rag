@@ -1265,20 +1265,18 @@ function renderPlanCard(box, plan) {
 
 // 确认 + 转任务：两步都在这里收口，任何一步失败都把原因摊开，不静默吞掉。
 async function confirmPlanById(planId, box) {
+  // 一次调用完成「确认 + 写进日历」。原来是连打 confirm 和 create-tasks 两个接口，
+  // 中间断开就会留下"计划已确认、日历里却没有任务"的半成品；现在这两步是服务端
+  // 同一个 resume，客户端只发一次。
+  let result;
   try {
-    await api("POST", `/plans/${planId}/confirm`);
+    result = await api("POST", `/plans/${planId}/commit`);
   } catch (e) {
     showPlanBlockers(box, e);
     return;
   }
-  try {
-    const r = await api("POST", `/plans/${planId}/create-tasks`);
-    const n = (r.task_ids || []).length;
-    toast(n ? `已写入日历：${n} 项` : "这份计划的任务之前已经建过");
-  } catch (e) {
-    toast(e.message, true);
-    return;
-  }
+  const n = (result.task_ids || []).length;
+  toast(n ? `已写入日历：${n} 项` : "这份计划的任务之前已经建过");
   if (box) fillPlanCard(box, planId);
   loadCalendar();
   loadTasks();

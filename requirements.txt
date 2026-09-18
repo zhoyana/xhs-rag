@@ -21,3 +21,7 @@ langchain-text-splitters==1.1.2
 langchain-huggingface==1.2.2
 langchain-mcp-adapters==0.3.2
 sentence-transformers==6.0.1
+
+# 计划链的编排与检查点：草案停在人工闸门上的状态要能落盘、跨进程恢复
+langgraph==1.2.11
+langgraph-checkpoint-sqlite==3.1.1
