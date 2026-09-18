@@ -975,10 +975,17 @@ class NoteStore:
         return self.memory_candidates(source_note_id=source_note_id)
 
     def memory_candidate(self, candidate_id):
+        """单条候选，字段与列表一致（含来源解析）——审核接口的回包也走这里。"""
         with closing(sqlite3.connect(self.path)) as db:
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT * FROM memory_candidates WHERE id=?", (candidate_id,)).fetchone()
-        return dict(row) if row else None
+            labels = self._source_labels(db, [row["source_note_id"]]) if row else {}
+        if row is None:
+            return None
+        item = dict(row)
+        item["source_kind"], item["source_title"] = labels.get(
+            item["source_note_id"], ("unknown", ""))
+        return item
 
     def memory_candidates(self, status=None, source_note_id=None, limit=50):
         """按状态/来源查看待确认信息；不与长期记忆混在同一列表。"""
@@ -996,7 +1003,14 @@ class NoteStore:
                 f"SELECT * FROM memory_candidates {where} ORDER BY id DESC LIMIT ?",
                 [*params, limit],
             ).fetchall()
-        return [dict(row) for row in rows]
+            labels = self._source_labels(db, [row["source_note_id"] for row in rows])
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["source_kind"], item["source_title"] = labels.get(
+                item["source_note_id"], ("unknown", ""))
+            items.append(item)
+        return items
 
     def review_memory_candidate(self, candidate_id, decision, now, memory_type=None, content=None):
         """确认/忽略在同一事务中完成，避免候选已确认但记忆未落库。"""
@@ -1070,7 +1084,8 @@ class NoteStore:
         with closing(sqlite3.connect(self.path)) as db:
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        return self._memory_public(row) if row else None
+            labels = self._source_labels(db, [row["source_note_id"]]) if row else {}
+        return self._memory_public(row, labels) if row else None
 
     def memories(self, status=None, limit=50, offset=0):
         """列出记忆；默认包含 dismissed，管理接口可用 status 过滤。"""
@@ -1084,7 +1099,8 @@ class NoteStore:
                 rows = db.execute("""SELECT * FROM memories
                     ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
                     (limit, offset)).fetchall()
-        return [self._memory_public(row) for row in rows]
+            labels = self._source_labels(db, [row["source_note_id"] for row in rows])
+        return [self._memory_public(row, labels) for row in rows]
 
     def active_memories(self, limit=10):
         """注入提示词用：只取 active，按 updated_at 倒序（最近整理过的最可信）。
@@ -1111,13 +1127,86 @@ class NoteStore:
     # 统一入口：调用方（分析 / 收藏夹建议 / 未来的问答与计划）只依赖
     # recall_memories()，内部从“时间排序”升级到“向量检索”对调用方透明。
 
-    def _memory_public(self, row):
-        """去掉向量缓存三列——它们是内部实现细节，不进入接口响应。"""
+    def _source_labels(self, db, source_ids):
+        """把来源 id 解析成 {id: (kind, title)}。
+
+        记忆与候选的来源有两种形态：确认笔记意图时提炼的挂在 note_id 上，
+        对话里固化的挂在 thread_id 上。两者都是字符串，形态不可靠地区分
+        （笔记 id 是十六进制串、会话 id 是 uuid，但这是巧合不是契约），
+        所以两个表都查一遍，用"哪个查得到"来定类型。
+
+        审核一条记忆时，"它从哪儿来"直接决定用户要不要信它——这个信息必须由
+        存储层给准，不能让前端看着一串 id 猜。
+        """
+        labels = {}
+        ids = [item for item in dict.fromkeys(source_ids) if item]
+        if not ids:
+            return labels
+        placeholders = ",".join("?" * len(ids))
+        for row in db.execute(
+                f"SELECT note_id, payload FROM notes WHERE note_id IN ({placeholders})", ids):
+            try:
+                title = json.loads(row["payload"]).get("title") or ""
+            except (ValueError, TypeError):
+                title = ""
+            labels[row["note_id"]] = ("note", title)
+        for row in db.execute(
+                f"SELECT id, title FROM chat_threads WHERE id IN ({placeholders})", ids):
+            labels[row["id"]] = ("thread", row["title"] or "")
+        return labels
+
+    def _memory_public(self, row, labels=None):
+        """去掉向量本体，但保留"这条的向量是不是最新的"这个可观测状态。
+
+        embedding / embedding_model 是实现细节，不进接口响应；而
+        embedding_fresh 是用户看得懂的状态——内容改过、向量还没重算时它是
+        False。不暴露这个字段的话，向量过期就成了一件只有日志知道的事：
+        用户明明改了记忆，回答却还按旧口径，界面上看不出任何异常。
+
+        source_kind / source_title 由 _source_labels 解析：没有来源 id 说明这条
+        是用户自己加的（kind=user），与"AI 从某处提炼出来"必须能区分开。
+        """
+        fresh = False
+        if "embedding" in row.keys():
+            fresh = bool(row["embedding"]) and row["embedding_hash"] == row["content_hash"]
         public = dict(row)
         public.pop("embedding", None)
         public.pop("embedding_model", None)
         public.pop("embedding_hash", None)
+        public["embedding_fresh"] = fresh
+        source_id = public.get("source_note_id")
+        if not source_id:
+            public["source_kind"], public["source_title"] = "user", ""
+        else:
+            public["source_kind"], public["source_title"] = (labels or {}).get(
+                source_id, ("unknown", ""))
         return public
+
+    def memory_stats(self, model=None):
+        """记忆管理页的顶部计数：各状态条数 + 有多少条向量待重建。
+
+        单列一个方法，而不是让前端拉全量列表再自己数：active 一旦超过列表上限，
+        "注入预算"和"向量过期数"就会算错——而这两个数字恰好是用户最需要准的
+        （前者决定哪些记忆真进了提示词，后者决定他要不要点重建）。
+        """
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            memories = {row["status"]: row["n"] for row in db.execute(
+                "SELECT status, COUNT(*) AS n FROM memories GROUP BY status")}
+            candidates = {row["status"]: row["n"] for row in db.execute(
+                "SELECT status, COUNT(*) AS n FROM memory_candidates GROUP BY status")}
+            if model:
+                stale = db.execute("""SELECT COUNT(*) FROM memories
+                    WHERE status='active' AND (embedding IS NULL
+                        OR embedding_model != ? OR embedding_hash != content_hash)""",
+                    (model,)).fetchone()[0]
+            else:
+                stale = db.execute("""SELECT COUNT(*) FROM memories
+                    WHERE status='active'
+                      AND (embedding IS NULL OR embedding_hash != content_hash)"""
+                    ).fetchone()[0]
+        return {"memories": memories, "candidates": candidates,
+                "stale_embeddings": stale}
 
     def memories_missing_embeddings(self, model, limit=200):
         """active 且向量缺失或已过期的记忆（内容改过，指纹就对不上）。"""

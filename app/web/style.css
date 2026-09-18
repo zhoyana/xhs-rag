@@ -774,3 +774,70 @@ body.theme-dark .toast { background: #e9e9ec; color: #16161a; }
 
 body.theme-dark .icard-ai { background: #101014; }
 body.theme-dark .fchip.on { background: var(--primary-soft); }
+
+/* ============================ 记忆（长期偏好） ============================
+   这一页要回答三个问题：哪几条真的会被带进提示词、它们从哪儿来、我改得动吗。
+   所以顶部是注入预算（用了几条 / 上限 + 超限警告 + 向量过期入口），下面三段列表。
+   颜色全部走变量，深色主题不用另写一套。
+   ========================================================================== */
+
+.mem-budget {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  flex: 1;
+  font-size: 13px;
+}
+.mem-budget-main b { color: var(--primary); font-size: 15px; margin: 0 2px; }
+.mem-warn { color: var(--warn); font-size: 12px; }
+
+.mem-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  box-shadow: var(--shadow);
+}
+.mem-add input { flex: 1; min-width: 180px; }
+
+.mem-block { margin-bottom: 24px; }
+
+.note-list li.mem-item { cursor: default; padding: 12px 14px; }
+.note-list li.mem-item:hover { border-color: var(--border); }
+
+.mem-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.mem-src { font-size: 12px; color: var(--muted); }
+.mem-src-link { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+.mem-when { font-size: 12px; margin-left: auto; }
+
+.mem-content { white-space: pre-wrap; word-break: break-word; }
+
+.mem-edit {
+  width: 100%;
+  min-height: 56px;
+  font: inherit;
+  padding: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  resize: vertical;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.mem-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.mem-primary { color: var(--ok); border-color: var(--ok); }
+
+.mem-stale { margin-top: 6px; font-size: 12px; color: var(--warn); }
+
+.note-list li.mem-empty {
+  background: transparent;
+  border-style: dashed;
+  box-shadow: none;
+  cursor: default;
+}
+.mem-archived { opacity: .7; }

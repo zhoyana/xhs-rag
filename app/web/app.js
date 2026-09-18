@@ -188,6 +188,7 @@ function switchView(name) {
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   // 日历按需拉取：用户可能整场都不打开它，没必要每次进页面都多打两枪。
   if (name === "calendar" && !calendarState.loaded) loadCalendar();
+  if (name === "memory" && !memoryState.loaded) loadMemories();
 }
 
 $$(".tab").forEach((tab) => {
@@ -1595,7 +1596,10 @@ async function consolidateThread() {
   if (!id) { toast("先选一个对话", true); return; }
   try {
     await api("POST", `/threads/${id}/consolidate`);
-    toast("已提交提炼，稍后在记忆候选里审核");
+    // 提示必须指一个真实存在的去处：提炼是后台任务，稍后才会出现候选，
+    // 所以引导到「记忆」页并让徽标负责提醒"有几条在等你审"。
+    toast("已提交提炼。稍后到「记忆」页审核——确认过的才会进入回答");
+    setTimeout(renderMemoryBadge, 1500);
   } catch (e) { toast(e.message, true); }
 }
 
@@ -2002,7 +2006,343 @@ async function deletePickedTasks() {
   }
 }
 
+// ----------------------------- 记忆（长期偏好） -----------------------------
+// 这一页是记忆层唯一的出入口：AI 只产候选，进不进提示词在这里拍板。
+// 在这之前后端接口全都在，前端一个都没接——用户点「提炼记忆」得到的提示是
+// "稍后在记忆候选里审核"，而那个页面并不存在，候选永远攒在待审、进不了注入。
+const memoryState = { loaded: false, stats: null, pending: [], active: [], archive: [] };
+
+// 与后端 CHECK 约束里的三个类型一一对应。类型不是标签装饰：
+// preference 是稳定偏好（不爱去健身房）、habit 是做事方式（团课记在健身夹）、
+// correction 是"模型错过的地方"，三者的生命周期不同，混着看就会判断错该不该留。
+const MEMORY_TYPES = { preference: "偏好", habit: "习惯", correction: "纠正" };
+const memTypeLabel = (t) => MEMORY_TYPES[t] || t;
+
+// 来源要写成人话：审核一条记忆时，"它从哪儿来"直接决定用户要不要信它。
+// 之前只有一串 source_note_id，所以没人知道该不该点确认。
+function memSourceEl(item) {
+  const span = document.createElement("span");
+  const fromNote = item.source_kind === "note" && item.source_note_id;
+  span.className = fromNote ? "mem-src mem-src-link" : "mem-src";
+  if (item.source_kind === "note") span.textContent = `来自笔记：${item.source_title || "(无标题)"}`;
+  else if (item.source_kind === "thread") span.textContent = `来自对话：${item.source_title || "(未命名对话)"}`;
+  else if (item.source_kind === "user") span.textContent = "你手动添加";
+  else span.textContent = item.source_note_id ? `来源：${item.source_note_id}` : "来源未知";
+  // 笔记来源可点回去看原文：依据要能核查，不能只是界面上一句话。
+  if (fromNote) span.onclick = () => { switchView("notes"); gotoNote(item.source_note_id); };
+  return span;
+}
+
+function memHeadEl(item, badges) {
+  const head = document.createElement("div");
+  head.className = "mem-head";
+  for (const [text, cls, title] of badges) {
+    const b = document.createElement("span");
+    b.className = `badge ${cls}`.trim();
+    b.textContent = text;
+    if (title) b.title = title;
+    head.appendChild(b);
+  }
+  head.appendChild(memSourceEl(item));
+  const when = document.createElement("span");
+  when.className = "muted mem-when";
+  when.textContent = relativeTime(item.updated_at || item.created_at);
+  head.appendChild(when);
+  return head;
+}
+
+// 内容默认是可改的文本块，点「改字」换成 textarea。
+// AI 提炼的措辞经常差一点（"用户不喜欢健身房"其实想说的是"最近不去健身房"），
+// 要是必须先忽略再手动加一条，用户多半就直接放弃了。
+function memContentEl(m, onSave) {
+  const wrap = document.createElement("div");
+  const text = document.createElement("div");
+  text.className = "mem-content";
+  text.textContent = m.content;
+  wrap.appendChild(text);
+
+  const edit = document.createElement("textarea");
+  edit.className = "mem-edit";
+  edit.hidden = true;
+  edit.value = m.content;
+  wrap.appendChild(edit);
+
+  // actions 必须挂进 wrap：调用方是往这个容器里追加"确认/忽略/停用"的，
+  // 漏了这一步按钮就只存在于内存里，界面上一个都看不到。
+  const actions = document.createElement("div");
+  actions.className = "mem-actions";
+  const toggle = document.createElement("button");
+  toggle.className = "ghost";
+  toggle.textContent = "改字";
+  toggle.onclick = () => {
+    if (edit.hidden) {
+      edit.hidden = false; text.hidden = true; edit.focus();
+      toggle.textContent = "保存";
+      return;
+    }
+    const value = edit.value.trim();
+    if (!value) { toast("内容不能为空", true); return; }
+    if (value === m.content) { edit.hidden = true; text.hidden = false; toggle.textContent = "改字"; return; }
+    onSave(value);
+  };
+  actions.appendChild(toggle);
+  wrap.appendChild(actions);   // 挂载点：调用方把"确认/忽略/停用"追加进 actions
+  return { wrap, actions, toggle };
+}
+
+function renderMemoryBudget() {
+  const box = $("#mem-budget");
+  box.innerHTML = "";
+  const s = memoryState.stats;
+  if (!s) { box.innerHTML = `<span class="muted">加载中…</span>`; return; }
+  const active = (s.memories && s.memories.active) || 0;
+  const limit = s.inject_limit || 10;
+  const main = document.createElement("span");
+  main.className = "mem-budget-main";
+  main.innerHTML = `每次回答会参考 <b>${Math.min(active, limit)}</b> / ${limit} 条记忆`;
+  main.title = "记忆按最近更新排序，取够上限为止，作为参考（不是硬规则）注入提示词。";
+  box.appendChild(main);
+
+  // 超出上限的记忆不会消失，只是静默取不到——这正是最该被看见的一件事：
+  // 库里还在、用户以为还有效，实际永远进不了提示词。
+  const overflow = Math.max(0, active - limit);
+  if (overflow) {
+    const warn = document.createElement("span");
+    warn.className = "mem-warn";
+    warn.textContent = `另有 ${overflow} 条超上限带不进去（越早更新的越先出局）`;
+    box.appendChild(warn);
+  }
+
+  const stale = s.stale_embeddings || 0;
+  if (stale) {
+    const btn = document.createElement("button");
+    btn.className = "ghost";
+    btn.textContent = `重建 ${stale} 条过期向量`;
+    btn.title = "内容改过、向量还是旧的：语义召回会按旧口径匹配。重建后按新内容匹配。";
+    btn.onclick = rebuildMemoryEmbeddings;
+    box.appendChild(btn);
+  }
+}
+
+function candidateEl(c) {
+  const li = document.createElement("li");
+  li.className = "mem-item";
+  li.appendChild(memHeadEl(c, [[`候选 · ${memTypeLabel(c.type)}`, "warn"]]));
+
+  const content = memContentEl(c, (value) => reviewCandidate(c, "confirmed", value));
+  li.appendChild(content.wrap);
+
+  const skip = document.createElement("button");
+  skip.className = "ghost";
+  skip.textContent = "忽略";
+  skip.onclick = () => reviewCandidate(c, "dismissed");
+  content.actions.appendChild(skip);
+
+  const ok = document.createElement("button");
+  ok.className = "ghost mem-primary";
+  ok.textContent = "确认";
+  ok.title = "只对这条放行：确认后它才会进入提示词";
+  ok.onclick = () => reviewCandidate(c, "confirmed");
+  content.actions.appendChild(ok);
+  return li;
+}
+
+function activeMemoryEl(m, injected) {
+  const li = document.createElement("li");
+  li.className = "mem-item";
+  li.appendChild(memHeadEl(m, [
+    [memTypeLabel(m.type), ""],
+    [injected ? "会注入" : "超出上限", injected ? "ok" : ""],
+  ]));
+
+  const content = memContentEl(m, (value) => saveMemoryContent(m, value));
+  li.appendChild(content.wrap);
+
+  if (!m.embedding_fresh) {
+    const stale = document.createElement("div");
+    stale.className = "mem-stale";
+    stale.textContent = "这条的向量还是改动前算的，语义召回暂时按旧口径匹配 —— 上面的「重建」可以修。";
+    li.appendChild(stale);
+  }
+
+  const off = document.createElement("button");
+  off.className = "ghost";
+  off.textContent = "停用";
+  off.title = "不再注入提示词，但记录保留、随时可以恢复";
+  off.onclick = () => dismissMemory(m);
+  content.actions.appendChild(off);
+  return li;
+}
+
+function archivedMemoryEl(m) {
+  const li = document.createElement("li");
+  li.className = "mem-item mem-archived";
+  const label = m.status === "superseded" ? "已换代" : "已停用";
+  li.appendChild(memHeadEl(m, [[memTypeLabel(m.type), ""], [label, ""]]));
+
+  const text = document.createElement("div");
+  text.className = "mem-content";
+  text.textContent = m.content;
+  li.appendChild(text);
+
+  const actions = document.createElement("div");
+  actions.className = "mem-actions";
+  const back = document.createElement("button");
+  back.className = "ghost";
+  back.textContent = "恢复";
+  back.title = "改回生效中，重新参与注入";
+  back.onclick = () => restoreMemory(m);
+  actions.appendChild(back);
+  li.appendChild(actions);
+  return li;
+}
+
+function renderMemoryPending() {
+  const list = $("#mem-pending");
+  list.innerHTML = "";
+  const n = memoryState.pending.length;
+  $("#mem-pending-count").textContent = n ? `${n} 条` : "";
+  if (!n) {
+    list.innerHTML = `<li class="muted mem-empty">没有待审核的记忆。跟 agent 多聊几轮、或在收件箱里确认几篇笔记的意图，这里就会攒出候选。</li>`;
+    return;
+  }
+  for (const c of memoryState.pending) list.appendChild(candidateEl(c));
+}
+
+function renderMemoryActive() {
+  const list = $("#mem-active");
+  list.innerHTML = "";
+  const items = memoryState.active;
+  $("#mem-active-count").textContent = items.length ? `${items.length} 条` : "";
+  if (!items.length) {
+    list.innerHTML = `<li class="muted mem-empty">还没有生效的记忆。</li>`;
+    return;
+  }
+  // 列表与注入用的是同一个排序（updated_at 倒序），所以前 inject_limit 条
+  // 就是这次提问真正会带进去的那些——让"哪几条真的生效"在界面上看得见。
+  const limit = (memoryState.stats && memoryState.stats.inject_limit) || 10;
+  items.forEach((m, i) => list.appendChild(activeMemoryEl(m, i < limit)));
+}
+
+function renderMemoryArchive() {
+  const list = $("#mem-archive");
+  list.innerHTML = "";
+  const items = memoryState.archive;
+  $("#mem-archive-count").textContent = items.length ? `${items.length} 条` : "";
+  if (!items.length) {
+    list.innerHTML = `<li class="muted mem-empty">没有历史记忆。</li>`;
+    return;
+  }
+  for (const m of items) list.appendChild(archivedMemoryEl(m));
+}
+
+function renderMemory() {
+  renderMemoryBudget();
+  renderMemoryPending();
+  renderMemoryActive();
+  renderMemoryArchive();
+}
+
+async function loadMemories() {
+  try {
+    // 三个请求并发：概览数字（权威计数）、全量记忆、待审候选。
+    const [all, pending, stats] = await Promise.all([
+      api("GET", "/memories?limit=100"),
+      api("GET", "/memory-candidates?status=pending&limit=100"),
+      api("GET", "/memory-stats"),
+    ]);
+    const items = all.items || [];
+    memoryState.active = items.filter((m) => m.status === "active");
+    memoryState.archive = items.filter((m) => m.status !== "active");
+    memoryState.pending = pending.items || [];
+    memoryState.stats = stats;
+    memoryState.loaded = true;
+    renderMemory();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function reviewCandidate(c, decision, content) {
+  try {
+    const body = { decision };
+    if (content) body.content = content;
+    await api("POST", `/memory-candidates/${c.id}/review`, body);
+    toast(decision === "confirmed"
+      ? "已加入长期记忆，下一次回答就会参考它"
+      : "已忽略，这条不会再出现");
+    await loadMemories();
+    renderMemoryBadge();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function saveMemoryContent(m, content) {
+  try {
+    await api("PUT", `/memories/${m.id}`, { content });
+    toast("已更新；内容变了，向量会在下次召回时重算");
+    await loadMemories();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function dismissMemory(m) {
+  try {
+    await api("DELETE", `/memories/${m.id}`);
+    toast("已停用，记录保留在下面，随时可以恢复");
+    await loadMemories();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function restoreMemory(m) {
+  try {
+    await api("PUT", `/memories/${m.id}`, { status: "active" });
+    toast("已恢复，重新参与注入");
+    await loadMemories();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function rebuildMemoryEmbeddings() {
+  try {
+    const r = await api("POST", "/memories/embeddings/rebuild", {});
+    toast(r.rebuilt ? `已重建 ${r.rebuilt} 条向量` : "没有需要重建的向量");
+    await loadMemories();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function addMemory() {
+  const content = $("#mem-add-content").value.trim();
+  if (!content) { toast("内容不能为空", true); return; }
+  try {
+    await api("POST", "/memories", { type: $("#mem-add-type").value, content });
+    $("#mem-add-content").value = "";
+    $("#mem-add").hidden = true;
+    toast("已加入长期记忆");
+    await loadMemories();
+    renderMemoryBadge();
+  } catch (e) { toast(e.message, true); }
+}
+
+// 徽标只做一件事：让"有东西等你审"在标签栏上看得见。
+// 之前提炼完的提示指向一个不存在的页面，用户根本不知道候选攒着没处理。
+async function renderMemoryBadge() {
+  try {
+    const s = await api("GET", "/memory-stats");
+    const n = (s.candidates && s.candidates.pending) || 0;
+    const badge = $("#memory-badge");
+    badge.textContent = n > 99 ? "99+" : String(n);
+    badge.hidden = n === 0;
+  } catch (_) { /* 拿不到就不显示，徽标不该拖累页面 */ }
+}
+
 // ----------------------------- 事件绑定 -----------------------------
+$("#btn-memory-refresh").onclick = loadMemories;
+$("#btn-memory-add").onclick = () => {
+  const form = $("#mem-add");
+  form.hidden = !form.hidden;
+  if (!form.hidden) $("#mem-add-content").focus();
+};
+$("#btn-mem-add-cancel").onclick = () => { $("#mem-add").hidden = true; };
+$("#btn-mem-add-save").onclick = addMemory;
+$("#mem-add-content").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); addMemory(); }
+});
 $("#btn-import").onclick = importBatch;
 $("#btn-read-all").onclick = readAllImages;
 $("#btn-refresh-notes").onclick = loadNotes;
@@ -2093,6 +2433,7 @@ async function init() {
     $("#health").textContent = "后端未连接";
     $("#health").style.color = "var(--danger)";
   }
+  renderMemoryBadge();   // 只拉一个计数：让"有候选等你审"在标签栏上看得到
   loadNotes();
   loadFolders();
   // 日历不在这里预取：进页面就多打两枪的意义不大，等用户真要看时再拉。

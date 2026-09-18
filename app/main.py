@@ -25,7 +25,16 @@ from dotenv import load_dotenv
 from .database import NoteStore, DEFAULT_DB
 from .extractor import ImportProblem, share_url, fetch_page, parse_note
 from .media import download_note_assets, local_file_valid, storage_path
-from .ai import AIProblem, analyze_note, suggest_folders, draft_plan, extract_memories_safe, extract_chat_memories_safe
+from .ai import (
+    AIProblem,
+    MEMORY_INJECT_CONTENT_LIMIT,
+    MEMORY_INJECT_LIMIT,
+    analyze_note,
+    draft_plan,
+    extract_chat_memories_safe,
+    extract_memories_safe,
+    suggest_folders,
+)
 from .retrieval import search_knowledge
 from .chat_agent import (
     asked_question_last,
@@ -47,6 +56,7 @@ from .embeddings import (
     cosine_similarity,
     embed_query as embed_search_query,
     embed_texts,
+    vector_to_blob,
 )
 
 
@@ -1920,6 +1930,46 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         if memory is None:
             raise HTTPException(404, detail="记忆不存在。")
         return memory
+
+    @app.get("/memory-stats", summary="记忆总览：各状态条数与向量待重建数")
+    def memory_overview():
+        """记忆页顶部的数字。
+
+        注入上限由服务端给，不让前端写死：上限定义在 ai.py（MEMORY_INJECT_LIMIT），
+        两边各写一份早晚会漂移，而漂移的表现是"界面说会注入 10 条、实际只注入了 8 条"
+        这种没人会主动去核对的错。
+        """
+        stats = app.state.store.memory_stats(EMBEDDING_MODEL)
+        return {
+            **stats,
+            "inject_limit": MEMORY_INJECT_LIMIT,
+            "inject_content_limit": MEMORY_INJECT_CONTENT_LIMIT,
+        }
+
+    @app.post("/memories/embeddings/rebuild", summary="重算内容已变化的记忆向量")
+    def rebuild_memory_embeddings():
+        """把"内容改过、向量没跟上"的记忆补算回来。
+
+        记忆页会显示这个数量，用户点一下就能修。少了这一步，向量过期就只是一件
+        日志知道的事——召回一直按旧口径匹配，界面看不出任何异常。
+        向量算不出来（模型缺失 / 离线）时如实报 503，不假装修好了。
+        """
+        store = app.state.store
+        pending = store.memories_missing_embeddings(EMBEDDING_MODEL)
+        if not pending:
+            return {"rebuilt": 0, "still_stale": 0}
+        try:
+            vectors = embed_texts([row["content"] for row in pending])
+        except Exception:  # noqa: BLE001 - 模型缺失与推理失败都算"暂时不可用"
+            logger.warning("memory_embedding_rebuild_failed count=%d", len(pending))
+            raise HTTPException(503, detail="向量模型暂时不可用，稍后再试。") from None
+        store.save_memory_embeddings([
+            {"id": row["id"], "vector": vector_to_blob(vector),
+             "model": EMBEDDING_MODEL, "content_hash": row["content_hash"]}
+            for row, vector in zip(pending, vectors)
+        ])
+        return {"rebuilt": len(pending),
+                "still_stale": len(store.memories_missing_embeddings(EMBEDDING_MODEL))}
 
     @app.get("/memory-candidates", summary="查看 AI 提议、等待你确认的记忆")
     def list_memory_candidates(
