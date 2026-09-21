@@ -9,6 +9,8 @@
 3. 向量重建要么真的修好，要么如实报错——静默失败会让用户以为修好了，
    而召回还在按旧口径匹配。
 """
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -200,3 +202,102 @@ def test_active_list_order_matches_injection_order(tmp_path):
 
     assert listed == injected
     assert len(listed) == 3
+
+
+# ---------------------- 来源标题快照 ----------------------
+# 现场：两张候选卡的来源笔记已被删除，界面上只剩一串十六进制 id
+# （来源：6aa7e7a20000000027014556）。可"这条从哪儿来"正是用户判断该不该信它的
+# 唯一依据——来源查不到，审核就退化成凭感觉点确认。快照在提炼那一刻写下，
+# 之后不再依赖源表还活着。
+
+
+def test_deleted_source_note_still_shows_the_title_it_came_from(tmp_path):
+    """来源笔记被删掉之后，候选仍要说出它当初是从哪篇提炼的。"""
+    db_path = tmp_path / "page.sqlite3"
+    store = NoteStore(db_path)
+    seed_note(store, "n1", "搜狐 AI 面经")
+    store.save_memory_candidates(
+        "test-model", [{"type": "preference", "content": "偏好居家徒手训练"}], "n1", NOW)
+
+    store.delete_note("n1")   # 记忆活得比笔记久：候选不受影响，来源标签也不该丢
+
+    item = store.memory_candidates(status="pending")[0]
+    assert item["source_kind"] == "deleted"
+    assert item["source_title"] == "搜狐 AI 面经"
+    # 快照列是实现细节，接口只需要人话版的 kind/title。
+    assert "source_label" not in item
+
+
+def test_confirmed_candidate_carries_the_title_into_the_memory(tmp_path):
+    """候选确认成记忆时快照要跟着走，否则删掉笔记后记忆那边又开始显示 id。"""
+    db_path = tmp_path / "page.sqlite3"
+    store = NoteStore(db_path)
+    seed_note(store, "n1", "搜狐 AI 面经")
+    candidate = store.save_memory_candidates(
+        "test-model", [{"type": "habit", "content": "团课记到健身夹"}], "n1", NOW)[0]
+
+    created = store.review_memory_candidate(candidate["id"], "confirmed", NOW)["memory"]
+
+    store.delete_note("n1")
+    memory = store.memory(created["id"])
+    assert memory["source_kind"] == "deleted"
+    assert memory["source_title"] == "搜狐 AI 面经"
+
+
+def test_source_title_follows_a_rename_while_the_note_exists(tmp_path):
+    """源还在库里时以现查为准：笔记改了标题，界面上的来源要跟得上（点进去对得上）。"""
+    db_path = tmp_path / "page.sqlite3"
+    store = NoteStore(db_path)
+    seed_note(store, "n1", "旧标题")
+    store.save_memory_candidates(
+        "test-model", [{"type": "preference", "content": "偏好居家徒手训练"}], "n1", NOW)
+
+    store.update_note_fields("n1", {"title": "新标题"})
+
+    item = store.memory_candidates(status="pending")[0]
+    assert item["source_kind"] == "note"
+    assert item["source_title"] == "新标题"
+
+
+def test_legacy_row_without_a_snapshot_is_marked_unknown(tmp_path):
+    """老数据既没有快照、来源也早被删了：如实标 unknown，不伪造标题。"""
+    db_path = tmp_path / "page.sqlite3"
+    store = NoteStore(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute("""INSERT INTO memory_candidates
+            (type, content, content_hash, model, source_note_id, created_at)
+            VALUES ('preference', '老候选', 'hash-old', 'm', '6aa7e7a20000000027014556', ?)""",
+            (NOW,))
+
+    item = store.memory_candidates(status="pending")[0]
+    assert item["source_kind"] == "unknown"
+    assert item["source_title"] == ""
+
+
+def test_existing_database_gains_the_snapshot_column(tmp_path):
+    """老库第一次打开时自动补上快照列，现有候选与记忆一条都不丢。"""
+    db_path = tmp_path / "old.sqlite3"
+    with sqlite3.connect(db_path) as db:
+        db.execute("""CREATE TABLE memory_candidates (
+            id INTEGER PRIMARY KEY,
+            type TEXT NOT NULL CHECK(type IN ('preference', 'habit', 'correction')),
+            content TEXT NOT NULL, content_hash TEXT NOT NULL,
+            model TEXT NOT NULL, source_note_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'confirmed', 'dismissed')),
+            memory_id INTEGER, created_at TEXT NOT NULL, reviewed_at TEXT,
+            UNIQUE(source_note_id, content_hash)
+        )""")
+        db.execute("""INSERT INTO memory_candidates
+            (type, content, content_hash, model, source_note_id, status, created_at)
+            VALUES ('preference', '旧候选', 'hash-old', 'm', 'note0', 'pending', ?)""",
+            (NOW,))
+
+    store = NoteStore(db_path)   # 打开即迁移
+
+    with sqlite3.connect(store.path) as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(memory_candidates)")}
+    assert "source_label" in columns
+    item = store.memory_candidates(status="pending")[0]
+    assert item["content"] == "旧候选"
+    assert item["source_kind"] == "unknown"   # 来源 id 早就不存在了，只能如实说

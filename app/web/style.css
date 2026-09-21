@@ -813,6 +813,8 @@ body.theme-dark .fchip.on { background: var(--primary-soft); }
 .mem-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .mem-src { font-size: 12px; color: var(--muted); }
 .mem-src-link { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+/* 依据缺失（来源笔记已删、或老数据没留快照）要显眼：审核时这是最重要的前提。 */
+.mem-src-gone { color: var(--warn); }
 .mem-when { font-size: 12px; margin-left: auto; }
 
 .mem-content { white-space: pre-wrap; word-break: break-word; }

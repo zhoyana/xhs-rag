@@ -2109,7 +2109,18 @@ function memSourceEl(item) {
   if (item.source_kind === "note") span.textContent = `来自笔记：${item.source_title || "(无标题)"}`;
   else if (item.source_kind === "thread") span.textContent = `来自对话：${item.source_title || "(未命名对话)"}`;
   else if (item.source_kind === "user") span.textContent = "你手动添加";
-  else span.textContent = item.source_note_id ? `来源：${item.source_note_id}` : "来源未知";
+  else if (item.source_kind === "deleted") {
+    // 来源笔记被删了，但提炼那一刻记下了它当时的标题——审核时这就是唯一的依据。
+    span.className = "mem-src mem-src-gone";
+    span.textContent = `来源已删除：${item.source_title || "(标题未记录)"}`;
+    span.title = "提炼这条时的来源笔记或对话已不在库里，只能按内容本身判断要不要留。";
+  } else {
+    // 更老的数据连标题快照都没有，来源也查不到：如实说依据缺失，
+    // 而不是甩一串 id 让人自己猜（那正是这一列要解决的问题）。
+    span.className = "mem-src mem-src-gone";
+    span.textContent = "来源记录已丢失";
+    if (item.source_note_id) span.title = `原始来源 id：${item.source_note_id}`;
+  }
   // 笔记来源可点回去看原文：依据要能核查，不能只是界面上一句话。
   if (fromNote) span.onclick = () => { switchView("notes"); gotoNote(item.source_note_id); };
   return span;

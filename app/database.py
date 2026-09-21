@@ -96,7 +96,7 @@ class NoteStore:
                 content TEXT NOT NULL,
                 content_hash TEXT NOT NULL UNIQUE,
                 model TEXT NOT NULL,
-                source_note_id TEXT,
+                source_note_id TEXT, source_label TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active'
                     CHECK(status IN ('active', 'superseded', 'dismissed')),
                 embedding BLOB, embedding_model TEXT, embedding_hash TEXT,
@@ -104,11 +104,13 @@ class NoteStore:
             )""")
             # AI 提议与用户确认分开：候选不进入 active_memories，也不会注入提示词。
             # 老的 active 记忆原样保留；新流程只改变之后提炼出的记忆。
+            # source_label 是提炼那一刻的来源标题快照，见下方迁移处的说明。
             db.execute("""CREATE TABLE IF NOT EXISTS memory_candidates (
                 id INTEGER PRIMARY KEY,
                 type TEXT NOT NULL CHECK(type IN ('preference', 'habit', 'correction')),
                 content TEXT NOT NULL, content_hash TEXT NOT NULL,
                 model TEXT NOT NULL, source_note_id TEXT NOT NULL,
+                source_label TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN ('pending', 'confirmed', 'dismissed')),
                 memory_id INTEGER, created_at TEXT NOT NULL, reviewed_at TEXT,
@@ -139,6 +141,16 @@ class NoteStore:
                            status, created_at, updated_at FROM memories""")
                 db.execute("DROP TABLE memories")
                 db.execute("ALTER TABLE memories_new RENAME TO memories")
+            # 记忆与候选都记一份"来源标题快照"。来源 id 指向的笔记/会话随时可能被删，
+            # 一旦删掉，解析来源就只剩一串 id，审核界面上用户根本判断不了该不该信这条
+            # 记忆。快照在提炼那一刻写下、之后不随源变化，所以源没了依据也还在。
+            # 这里加的是普通列，ALTER TABLE ADD COLUMN 就够，不需要重建表。
+            for table in ("memories", "memory_candidates"):
+                fields = {row[1] for row in db.execute(
+                    f"PRAGMA table_info({table})").fetchall()}
+                if "source_label" not in fields:
+                    db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN source_label TEXT NOT NULL DEFAULT ''")
             # 秋招知识点：content_hash 是内容 SHA-256 指纹 + UNIQUE 约束，重复记忆在
             # 数据库层直接插不进去——幂等去重从“代码约定”升级为“硬约束”（对齐 chunks）。
             # 任务使用普通关系表保存，安卓 App 以后只需读取这些字段即可展示待办。
@@ -963,13 +975,20 @@ class NoteStore:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def save_memory_candidates(self, model, records, source_note_id, now):
-        """保存 AI 候选，不激活；重复提炼同一来源和内容不会刷出新候选。"""
+        """保存 AI 候选，不激活；重复提炼同一来源和内容不会刷出新候选。
+
+        来源标题在这里写下快照：审核一条候选时"它从哪儿来"决定用户信不信它，
+        而来源笔记随时可能被删除——等界面要显示时再查就查不到了。
+        """
         with closing(sqlite3.connect(self.path)) as db, db:
+            db.row_factory = sqlite3.Row   # 解析来源标题要按列名取
+            label = self._source_title(db, source_note_id)
             db.executemany("""INSERT OR IGNORE INTO memory_candidates
-                (type, content, content_hash, model, source_note_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)""", [
+                (type, content, content_hash, model, source_note_id, source_label, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""", [
                 (record["type"], record["content"],
-                 self.memory_content_hash(record["content"]), model, source_note_id, now)
+                 self.memory_content_hash(record["content"]), model, source_note_id,
+                 label, now)
                 for record in records
             ])
         return self.memory_candidates(source_note_id=source_note_id)
@@ -982,10 +1001,7 @@ class NoteStore:
             labels = self._source_labels(db, [row["source_note_id"]]) if row else {}
         if row is None:
             return None
-        item = dict(row)
-        item["source_kind"], item["source_title"] = labels.get(
-            item["source_note_id"], ("unknown", ""))
-        return item
+        return self._attach_source(dict(row), labels)
 
     def memory_candidates(self, status=None, source_note_id=None, limit=50):
         """按状态/来源查看待确认信息；不与长期记忆混在同一列表。"""
@@ -1004,13 +1020,7 @@ class NoteStore:
                 [*params, limit],
             ).fetchall()
             labels = self._source_labels(db, [row["source_note_id"] for row in rows])
-        items = []
-        for row in rows:
-            item = dict(row)
-            item["source_kind"], item["source_title"] = labels.get(
-                item["source_note_id"], ("unknown", ""))
-            items.append(item)
-        return items
+        return [self._attach_source(dict(row), labels) for row in rows]
 
     def review_memory_candidate(self, candidate_id, decision, now, memory_type=None, content=None):
         """确认/忽略在同一事务中完成，避免候选已确认但记忆未落库。"""
@@ -1035,12 +1045,14 @@ class NoteStore:
                 if existing:
                     memory_id = existing["id"]
                 else:
+                    # 来源快照跟着候选一起进记忆：候选审核完，来源笔记还可能被删，
+                    # 那时记忆的依据标签仍然要能说清"它当初从哪儿来"。
                     cursor = db.execute("""INSERT INTO memories
                         (type, content, content_hash, model, source_note_id,
-                         status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+                         source_label, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
                         (chosen_type, chosen_content, content_hash, row["model"],
-                         row["source_note_id"], now, now))
+                         row["source_note_id"], row["source_label"] or "", now, now))
                     memory_id = cursor.lastrowid
                 db.execute("""UPDATE memory_candidates
                     SET status='confirmed', memory_id=?, reviewed_at=? WHERE id=?""",
@@ -1067,14 +1079,16 @@ class NoteStore:
         """
         saved_ids = []
         with closing(sqlite3.connect(self.path)) as db, db:
+            db.row_factory = sqlite3.Row   # 解析来源标题要按列名取
+            label = self._source_title(db, source_note_id)
             for record in records:
                 cursor = db.execute("""INSERT OR IGNORE INTO memories
                     (type, content, content_hash, model, source_note_id,
-                     status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+                     source_label, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
                     (record["type"], record["content"],
                      self.memory_content_hash(record["content"]),
-                     model, source_note_id, now, now))
+                     model, source_note_id, label, now, now))
                 if cursor.rowcount == 1:
                     saved_ids.append(cursor.lastrowid)
         # 秋招知识点：回读必须放在事务提交之后——另一个连接看不到未提交的写入。
@@ -1155,6 +1169,37 @@ class NoteStore:
             labels[row["id"]] = ("thread", row["title"] or "")
         return labels
 
+    def _source_title(self, db, source_id):
+        """现查来源标题；写快照时用它（那时源一定还在）。"""
+        if not source_id:
+            return ""
+        return self._source_labels(db, [source_id]).get(source_id, ("", ""))[1]
+
+    def _attach_source(self, item, labels):
+        """给一条记忆/候选补上 source_kind / source_title（人话版），并去掉快照列。
+
+        标题以落库时的快照为准：审核界面要回答的是"这条当初是从哪儿提炼出来的"，
+        快照记录下来就不再改变，源笔记被删掉也还在。老数据没有快照，才回退到现查。
+        三者都拿不到（源已删除的老数据）时标 unknown，由界面说明依据缺失，
+        而不是甩一串 id 让用户猜。
+        """
+        snapshot = (item.pop("source_label", None) or "").strip()
+        source_id = item.get("source_note_id")
+        if not source_id:
+            # 没有来源 id 说明是用户自己加的，与"AI 从某处提炼"必须能区分开。
+            item["source_kind"], item["source_title"] = "user", ""
+            return item
+        kind, live_title = (labels or {}).get(source_id, (None, ""))
+        if kind:
+            # 源还在库里就按现查的显示（标题改过则以新的为准，点进去要对得上）；
+            # 只有现查连标题都拿不到时才用快照兜底。
+            item["source_kind"], item["source_title"] = kind, live_title or snapshot
+        elif snapshot:
+            item["source_kind"], item["source_title"] = "deleted", snapshot
+        else:
+            item["source_kind"], item["source_title"] = "unknown", ""
+        return item
+
     def _memory_public(self, row, labels=None):
         """去掉向量本体，但保留"这条的向量是不是最新的"这个可观测状态。
 
@@ -1163,7 +1208,7 @@ class NoteStore:
         False。不暴露这个字段的话，向量过期就成了一件只有日志知道的事：
         用户明明改了记忆，回答却还按旧口径，界面上看不出任何异常。
 
-        source_kind / source_title 由 _source_labels 解析：没有来源 id 说明这条
+        source_kind / source_title 由 _attach_source 解析：没有来源 id 说明这条
         是用户自己加的（kind=user），与"AI 从某处提炼出来"必须能区分开。
         """
         fresh = False
@@ -1174,13 +1219,7 @@ class NoteStore:
         public.pop("embedding_model", None)
         public.pop("embedding_hash", None)
         public["embedding_fresh"] = fresh
-        source_id = public.get("source_note_id")
-        if not source_id:
-            public["source_kind"], public["source_title"] = "user", ""
-        else:
-            public["source_kind"], public["source_title"] = (labels or {}).get(
-                source_id, ("unknown", ""))
-        return public
+        return self._attach_source(public, labels)
 
     def memory_stats(self, model=None):
         """记忆管理页的顶部计数：各状态条数 + 有多少条向量待重建。
