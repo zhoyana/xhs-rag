@@ -6,7 +6,7 @@ xiaohongshu-mcp 在跑，也不依赖小红书页面当前长什么样。站外�
 """
 import pytest
 
-from app import indexing, xhs_mcp, xhs_source
+from app import indexing, media, xhs_mcp, xhs_source
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +45,18 @@ def _offline_indexer(monkeypatch):
 
     monkeypatch.setattr(indexing, "DEFAULT_INDEXER", fake_index)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_image_stash():
+    """图片字节暂存是进程级的，用例之间必须互不影响。
+
+    它跨越"读图"和"落盘"两个阶段，一旦某条用例留下的字节被下一条取走，
+    就会出现"这条用例明明没走网络却成功了"的假象。
+    """
+    media.clear_stashed_images()
+    yield
+    media.clear_stashed_images()
 
 
 @pytest.fixture(autouse=True)

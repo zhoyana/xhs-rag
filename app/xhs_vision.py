@@ -10,6 +10,10 @@
 2. 可降级：读图失败只意味着少了一段文字，绝不能让"采集"这件事本身失败。
 3. 白名单：图片地址必须落在小红书图床，避免把工具变成任意 URL 下载器（SSRF）。
 
+还有一条容易漏的：这里下载到的字节不只是一份中间产物，它同时是"本地原图"的
+唯一机会——图床地址带签名、很快过期，落盘晚一步就只有 403。所以读图时顺手把
+字节交给 media 的暂存层（stash_image），落盘阶段优先复用，不再发第二次请求。
+
 秋招知识点（多模态在 Agent 里的位置）：视觉能力属于模型，但"把图片送到模型
 眼前"属于工程。工具调用的返回值是文本通道，图片无法经由工具结果回传，因此
 多模态必须在服务端完成一次"图 → 文"的转换，再把文字作为普通工具结果返回。
@@ -24,7 +28,7 @@ import httpx
 # 复用 ai 里的消息文本提取：它已经把 content 可能是字符串、可能是分块数组
 # 这两种形态都抹平了，比在图片链路里重写一份可靠。
 from .ai import AIProblem, _message_text
-from .media import IMAGE_HOSTS
+from .media import IMAGE_HOSTS, stash_image
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +189,8 @@ async def transcribe_images(images, *, title: str = "", max_images: int = MAX_IM
             logger.warning("xhs_vision_image_fetch_failed index=%d", index, exc_info=True)
             failed.append(index)
             continue
+        # 字节顺手交给落盘层复用：签名地址过期后就再也下不到了，能存的只有这一份。
+        stash_image(url, data, mime)
         content = [
             {"type": "text", "text": TRANSCRIBE_PROMPT.format(index=index, total=total)
              + (f"\n笔记标题：{title}" if title else "")},

@@ -671,17 +671,26 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return await xhs_source.collect_note(url, html_note=_html_note)
 
     async def import_from_url(url: str):
-        """单条与批量接口共用的核心步骤：采集、保存、建索引。"""
+        """单条与批量接口共用的核心步骤：采集、保存、图片落盘、建索引。
+
+        图片必须和采集同一轮落盘，不能留给用户事后手点「下载图片」：图床地址带
+        签名且很快过期，晚一步就只剩 403，而"这张图有没有存下来"用户事前无从
+        判断（读图成功后界面甚至不再提示"需及时下载"）。读图那一次拿到的字节
+        由 media 的暂存层复用，所以这一步通常不产生额外请求。
+        """
         note, source = await collect_note(url)
         note["created_at"] = datetime.now(timezone.utc).isoformat()
         saved, created = app.state.store.save(note)
+        assets = await asyncio.to_thread(
+            download_note_assets, app.state.store, saved, app.state.media_root
+        )
         # 索引读的是入库后的正文（含图片转写文字），所以必须排在 save 之后；
         # 它是阻塞的模型推理，放进线程避免堵住事件循环。
         index = await asyncio.to_thread(
             indexing.index_safely, app.state.store, saved["note_id"]
         )
         return {"status": "imported" if created else "existing", "note": saved,
-                "source": source, "index": index}
+                "source": source, "assets": assets, "index": index}
 
     async def process_intake(job_id: str, url: str):
         """后台执行导入和图片下载，并在每个阶段写入 SQLite 进度。"""
@@ -845,6 +854,11 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                     # 批量导入最关心的就是"哪几条现在能搜到"，直接放在每条结果里。
                     "searchable": bool(result["index"].get("searchable")),
                     "index_status": result["index"].get("status"),
+                    # 图片是否存下来同样要如实回报：地址过期只影响落盘，
+                    # 不影响导入成功，两者混在一个状态里用户就分不清了。
+                    "images": {"total": result["assets"]["total"],
+                               "saved": result["assets"]["downloaded"] + result["assets"]["skipped"],
+                               "failed": result["assets"]["failed"]},
                     "error": None,
                 })
             except ImportProblem as exc:

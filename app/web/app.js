@@ -374,10 +374,17 @@ async function loadAnalysis(noteId, detail) {
 async function loadAssets(noteId, detail) {
   try {
     const d = await api("GET", `/notes/${noteId}/assets`);
-    const items = (d.items || []).filter((x) => x.file_url);
-    if (!items.length) return;
-    let html = `<div class="section-h">图片（${items.length} 张）</div>`;
-    for (const it of items) html += `<img class="asset" src="${it.file_url}" alt="笔记图片" />`;
+    const all = d.items || [];
+    if (!all.length) return;
+    const saved = all.filter((x) => x.file_url);
+    let html = `<div class="section-h">图片（已保存 ${saved.length} / 共 ${all.length} 张）</div>`;
+    for (const it of saved) html += `<img class="asset" src="${it.file_url}" alt="笔记图片" />`;
+    const missing = all.filter((x) => !x.file_url);
+    if (missing.length) {
+      // 没存下来的图以前被直接过滤掉，页面上看不出「少了图」；这里如实说出张数与原因。
+      const why = (missing.find((x) => x.error) || {}).error || "尚未下载";
+      html += `<div class="note-sub">还有 ${missing.length} 张没有保存到本地：${escapeHtml(why)}</div>`;
+    }
     detail.insertAdjacentHTML("beforeend", html);
   } catch (_) { /* 无图片 */ }
 }
@@ -392,23 +399,58 @@ async function loadFoldersForNote(noteId, detail) {
   } catch (_) { /* 未收藏 */ }
 }
 
+// 读图与下载都是长请求，点第二下只会撞上服务端的"已有任务进行中"（409）。
+// 置灰按钮比让用户看一条 409 更直接。
+function withBusyButton(selector, task) {
+  const button = $(selector);
+  if (button && button.disabled) return Promise.resolve();
+  if (button) button.disabled = true;
+  return Promise.resolve(task()).finally(() => { if (button) button.disabled = false; });
+}
+
 async function readImages(noteId) {
   const force = confirm("补读图片会调用视觉模型（消耗额度）。确定继续？");
   if (!force) return;
-  try {
-    const r = await api("POST", `/notes/${noteId}/read-images?force=true`);
-    toast(`补读完成：读出 ${r.read || 0} 张图片`);
-    loadNotes();
-    openNote(noteId);
-  } catch (e) { toast(e.message, true); }
+  await withBusyButton("#act-read", async () => {
+    try {
+      const r = await api("POST", `/notes/${noteId}/read-images?force=true`);
+      // 接口对"没图可读""已有文字"都是 200，以前一律显示"补读完成"，看着像成功。
+      if (r.status === "no_local_images") {
+        toast(r.reason || "这篇还没有本地图片，补读无事可做。", true);
+        return;
+      }
+      if (r.status === "skipped") {
+        toast(r.reason || "已有图片文字，未重复读图。", true);
+        return;
+      }
+      if (!r.read) {
+        const why = (r.vision && r.vision.error) || "没有读出文字";
+        toast(`补读失败：${why}`, true);
+        return;
+      }
+      toast(`补读完成：读出 ${r.read} 张图片${r.status === "partial" ? "（部分图片失败）" : ""}`);
+      loadNotes();
+      openNote(noteId);
+    } catch (e) { toast(e.message, true); }
+  });
 }
 
 async function downloadAssets(noteId) {
-  try {
-    const r = await api("POST", `/notes/${noteId}/assets/download`);
-    toast(`下载完成：本地下载 ${r.downloaded || 0} 张，跳过 ${r.skipped || 0} 张`);
-    openNote(noteId);
-  } catch (e) { toast(e.message, true); }
+  await withBusyButton("#act-download", async () => {
+    try {
+      const r = await api("POST", `/notes/${noteId}/assets/download`);
+      if (r.failed) {
+        // 失败张数与原因以前被吞掉，只剩"下载完成 0/0"，用户既存不到也不知道为什么。
+        const why = ((r.items || []).find((x) => x.status === "failed" && x.error) || {}).error
+          || "原因未知";
+        toast(`下载失败 ${r.failed} 张（成功 ${r.downloaded || 0} 张）：${why}`, true);
+      } else {
+        const reused = r.reused ? `，其中 ${r.reused} 张复用刚读图时的字节` : "";
+        toast(`下载完成：本地保存 ${r.downloaded || 0} 张，跳过已有 ${r.skipped || 0} 张${reused}`);
+      }
+      openNote(noteId);
+    } catch (e) { toast(e.message, true); }
+  });
 }
 
 async function analyzeNote(noteId) {
@@ -520,7 +562,14 @@ async function readAllImages() {
   if (!confirm("将遍历全部已入库笔记，为已下载图片的笔记补读图（消耗较多视觉模型额度）。确定？")) return;
   try {
     const r = await api("POST", "/notes/read-images", { all: true });
-    toast(`批量补读完成：成功 ${r.succeeded} / 共 ${r.total}`);
+    // 逐类如实汇总：只报"成功 x / 共 n"会把"没有本地图"这种无事可做的也混成成功。
+    const count = (s) => (r.items || []).filter((x) => x.status === s).length;
+    const detail = [];
+    if (count("no_local_images")) detail.push(`没有本地图片 ${count("no_local_images")} 篇`);
+    if (count("skipped")) detail.push(`已有图片文字 ${count("skipped")} 篇`);
+    if (count("vision_failed")) detail.push(`读图失败 ${count("vision_failed")} 篇`);
+    toast(`批量补读：成功 ${r.succeeded} / 共 ${r.total}${detail.length ? "；" + detail.join("，") : ""}`,
+      r.succeeded === 0);
   } catch (e) { toast(e.message, true); }
 }
 

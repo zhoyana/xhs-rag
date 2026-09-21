@@ -1,5 +1,6 @@
 """图片测试：使用微型合成图片和模拟网络，不下载用户资料。"""
 from io import BytesIO
+import json
 import sqlite3
 
 import httpx
@@ -11,9 +12,11 @@ from app import indexing
 from app.database import NoteStore
 from app.extractor import ImportProblem
 from app.main import create_app
-from app.media import check_image_url, storage_path
+from app.media import (check_image_url, stash_image, storage_path,
+                       take_stashed_image)
 
 CDN = "https://sns-webpic-qc.xhscdn.com/image"
+NOTE_URL = "https://www.xiaohongshu.com/explore/abc123"
 
 
 def picture_bytes():
@@ -37,6 +40,15 @@ def setup_note(tmp_path, urls=None):
     path = tmp_path / "test.sqlite3"
     NoteStore(path).save({"note_id": "abc123", "title": "test", "images": urls or [CDN]})
     return path
+
+
+def note_page(image_url):
+    """构造一篇只带图片、正文是空壳的笔记页面。"""
+    state = {"note": {"noteDetailMap": {"abc123": {"note": {
+        "title": "测试标题", "desc": "#标签 #内推", "type": "normal",
+        "imageList": [{"urlDefault": image_url}],
+    }}}}}
+    return "<script>window.__INITIAL_STATE__=" + json.dumps(state) + ";</script>"
 
 
 def test_download_open_skip_and_repair(tmp_path, mock_network):
@@ -213,3 +225,88 @@ def test_refresh_rejects_a_different_note(tmp_path, monkeypatch):
         })
     assert response.status_code == 409
     assert NoteStore(db_path).get("abc123")["title"] == "test"
+
+
+def test_stashed_bytes_are_saved_without_a_second_request(tmp_path, mock_network):
+    """读图时已经下载过的字节应当直接落盘。
+
+    图床地址带签名、很快过期，落盘再发一次请求就是必然的 403——而这批字节
+    本来就在手上。这条用例把网络层设成"只要被碰到就记一笔"，用 0 次调用来证明。
+    """
+    data = picture_bytes()
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(403)
+    mock_network(handler)
+    stash_image(CDN, data, "image/png")
+    with TestClient(create_app(setup_note(tmp_path))) as client:
+        result = client.post("/notes/abc123/assets/download").json()
+        assert (result["downloaded"], result["reused"], result["failed"]) == (1, 1, 0)
+        asset = result["items"][0]
+        assert asset["mime_type"] == "image/png"  # 类型仍以解码结果为准，不信 MIME 参数。
+        assert (asset["width"], asset["height"]) == (3, 2)
+        assert client.get(asset["file_url"]).content == data
+    assert calls == []
+    assert take_stashed_image(CDN) is None  # 取走即删除，不会被下一批误用。
+
+
+def test_stashed_bytes_that_are_not_images_fail_honestly(tmp_path, mock_network):
+    """暂存内容不是图片时要如实失败，不能因为"来自本机"就跳过校验。"""
+    mock_network(lambda request: httpx.Response(200, content=picture_bytes()))
+    stash_image(CDN, b"<html>login</html>", "image/webp")
+    with TestClient(create_app(setup_note(tmp_path))) as client:
+        result = client.post("/notes/abc123/assets/download").json()
+        assert result["failed"] == 1 and result["reused"] == 0
+        assert "有效图片" in result["items"][0]["error"]
+        assert not list((tmp_path / "media").rglob("*.part"))
+
+
+def test_image_stash_is_bounded(tmp_path, monkeypatch):
+    """一批长图笔记可能几十兆，没被取走的暂存要能自己让位。"""
+    monkeypatch.setattr("app.media.STASH_MAX_BYTES", 10)
+    stash_image(CDN + "1", b"x" * 8, "image/png")
+    stash_image(CDN + "2", b"y" * 8, "image/png")
+    assert take_stashed_image(CDN + "1") is None
+    assert take_stashed_image(CDN + "2") is not None
+
+
+def test_batch_import_downloads_images_in_the_same_round(tmp_path, monkeypatch, mock_network):
+    """批量导入必须自己把图片存下来。
+
+    它以前只存正文，图片要等用户手点「下载图片」——那时签名地址早已过期，
+    界面上却只显示"下载完成 0 张"，用户既存不到图也不知道为什么。
+    """
+    data = picture_bytes()
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, content=data)
+    mock_network(handler)
+
+    async def fake_fetch(_url):
+        return note_page(CDN), NOTE_URL
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    with TestClient(create_app(tmp_path / "test.db")) as client:
+        result = client.post("/notes/import-batch", json={"share_text": NOTE_URL}).json()
+        assert result["items"][0]["status"] == "imported"
+        assert result["items"][0]["images"] == {"total": 1, "saved": 1, "failed": 0}
+        items = client.get("/notes/abc123/assets").json()["items"]
+        assert items[0]["status"] == "success"
+        assert client.get(items[0]["file_url"]).content == data
+    assert calls == [CDN]
+
+
+def test_batch_import_reports_image_failure_without_losing_the_note(tmp_path, monkeypatch, mock_network):
+    """图片存不下来只影响图片：笔记本身照样导入，且失败张数如实回报。"""
+    mock_network(lambda request: httpx.Response(403))
+    async def fake_fetch(_url):
+        return note_page(CDN), NOTE_URL
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    with TestClient(create_app(tmp_path / "test.db")) as client:
+        result = client.post("/notes/import-batch", json={"share_text": NOTE_URL}).json()
+        assert result["items"][0]["status"] == "imported"
+        assert result["items"][0]["images"] == {"total": 1, "saved": 0, "failed": 1}
+        assert client.get("/notes/abc123").status_code == 200

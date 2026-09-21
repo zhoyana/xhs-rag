@@ -4,6 +4,7 @@ import ipaddress
 import re
 import socket
 import tempfile
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -20,6 +21,55 @@ MAX_BYTES = 20 * 1024 * 1024
 MAX_PIXELS = 25_000_000
 FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"),
            "WEBP": (".webp", "image/webp")}
+
+
+# 采集同一轮里已经拿到手的图片字节，按地址暂存，供随即的落盘复用。
+#
+# 为什么需要这层：读图（喂视觉模型）和落盘如果各发一次请求，第二次撞上过期签名
+# 就是必然——而第一次明明已经把字节拿到手了。界面「批量导入」当初就是死在这里：
+# 读图成功、用户几小时后再点下载时地址已过期，只剩 403，一张也存不下来。
+STASH_MAX_BYTES = 48 * 1024 * 1024
+_stash_lock = threading.Lock()
+_stash = {}
+_stash_bytes = 0
+
+
+def stash_image(url, data, mime):
+    """暂存一张刚下载的图片字节，供同一次采集的落盘取用。
+
+    只做有界缓存：一批长图笔记可能几十兆，落盘前没人取走的部分要能自己让位。
+    """
+    global _stash_bytes
+    if not isinstance(url, str) or not url or not data or len(data) > MAX_BYTES:
+        return
+    with _stash_lock:
+        if url in _stash:
+            return
+        _stash[url] = (data, mime)
+        _stash_bytes += len(data)
+        # 插入顺序即淘汰顺序：超上限时丢最早的，留下的仍是最近采集的那批。
+        while _stash_bytes > STASH_MAX_BYTES and len(_stash) > 1:
+            oldest = next(iter(_stash))
+            dropped, _dropped_mime = _stash.pop(oldest)
+            _stash_bytes -= len(dropped)
+
+
+def take_stashed_image(url):
+    """取走暂存的（字节, MIME）；取走即删除，没有暂存时返回 None。"""
+    global _stash_bytes
+    with _stash_lock:
+        item = _stash.pop(url, None) if isinstance(url, str) else None
+        if item is not None:
+            _stash_bytes -= len(item[0])
+    return item
+
+
+def clear_stashed_images():
+    """清空暂存；测试用，避免用例之间互相影响。"""
+    global _stash_bytes
+    with _stash_lock:
+        _stash.clear()
+        _stash_bytes = 0
 
 
 def check_image_url(url):
@@ -57,6 +107,63 @@ def local_file_valid(root, asset):
             return hashlib.file_digest(file, "sha256").hexdigest() == asset["sha256"]
     except (OSError, ImportProblem):
         return False
+
+
+def _place_verified(asset, root, temporary, size, digest):
+    """校验临时文件确为支持的图片，按内容指纹命名后原子替换到最终位置。
+
+    下载路径与复用路径都要走这里：图片格式校验、命名规则、原子落盘只该有一份，
+    否则"本地下载的图"和"复用字节落盘的图"会各有一套可信度。
+    """
+    # 不凭响应头/网址后缀相信文件类型。verify 检查结构，load 实际解码。
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(temporary) as picture:
+            fmt, width, height = picture.format, picture.width, picture.height
+            if fmt not in FORMATS or width * height > MAX_PIXELS or getattr(picture, "n_frames", 1) != 1:
+                raise ImportProblem("仅支持像素数不超过2500万的静态 JPEG、PNG、WebP 图片。")
+            picture.verify()
+        with Image.open(temporary) as picture:
+            picture.load()
+    suffix, mime = FORMATS[fmt]
+    # 加入文件指纹，避免不同内容在同一位置相互覆盖。
+    key = f"{asset['note_id']}/{asset['position']:03d}-{digest[:16]}{suffix}"
+    temporary.replace(storage_path(root, key))
+    return {"storage_key": key, "mime_type": mime, "size_bytes": size,
+            "width": width, "height": height, "sha256": digest}
+
+
+def save_image_bytes(asset, root, data, mime=None):
+    """把已经在内存里的图片字节落盘，不再发第二次请求。
+
+    用在"采集同轮已经为读图下载过这张图"的场景：图床地址带签名且很快过期，
+    第二次请求正是 403 的来源，而字节本来就在手上。mime 只作为兼容参数接收，
+    真实类型一律以解码结果为准。
+    """
+    if not re.fullmatch(r"[a-zA-Z0-9]+", asset["note_id"]):
+        raise ImportProblem("笔记编号不合法。")
+    if len(data) > MAX_BYTES:
+        raise ImportProblem("单张图片超过 20 MB。")
+    folder = storage_path(root, asset["note_id"])
+    folder.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        # 与下载路径一样先写同目录临时文件，校验通过后再原子替换。
+        with tempfile.NamedTemporaryFile(dir=folder, suffix=".part", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(data)
+        return _place_verified(asset, root, temporary, len(data),
+                               hashlib.sha256(data).hexdigest())
+    except ImportProblem:
+        raise
+    except (UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning, SyntaxError, ValueError):
+        raise ImportProblem("文件不是支持的有效图片，或图片像素数超限。") from None
+    except OSError:
+        raise ImportProblem("图片写入失败，请检查磁盘空间与权限。") from None
+    finally:
+        # 只删除本次创建的临时文件，不删除已保存的图片或原笔记。
+        if temporary is not None and temporary.exists():
+            temporary.unlink(missing_ok=True)
 
 
 def download_image(asset, root):
@@ -98,22 +205,7 @@ def download_image(asset, root):
                         break
                 else:
                     raise ImportProblem("图片跳转次数过多。")
-        # 不凭响应头/网址后缀相信文件类型。verify 检查结构，load 实际解码。
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(temporary) as picture:
-                fmt, width, height = picture.format, picture.width, picture.height
-                if fmt not in FORMATS or width * height > MAX_PIXELS or getattr(picture, "n_frames", 1) != 1:
-                    raise ImportProblem("仅支持像素数不超过2500万的静态 JPEG、PNG、WebP 图片。")
-                picture.verify()
-            with Image.open(temporary) as picture:
-                picture.load()
-        suffix, mime = FORMATS[fmt]
-        # 加入文件指纹，避免不同内容在同一位置相互覆盖。
-        key = f"{asset['note_id']}/{asset['position']:03d}-{digest.hexdigest()[:16]}{suffix}"
-        temporary.replace(storage_path(root, key))
-        return {"storage_key": key, "mime_type": mime, "size_bytes": size,
-                "width": width, "height": height, "sha256": digest.hexdigest()}
+        return _place_verified(asset, root, temporary, size, digest.hexdigest())
     except ImportProblem:
         raise
     except httpx.TimeoutException:
@@ -132,7 +224,7 @@ def download_image(asset, root):
 
 def download_note_assets(store, note, root):
     store.ensure_assets(note)
-    downloaded = skipped = 0
+    downloaded = skipped = reused = 0
     for asset in store.assets(note["note_id"]):
         # 刷新后来源页面已不存在的旧位置只保留审计记录，不再向过期 URL 发请求。
         if asset["status"] == "obsolete":
@@ -142,7 +234,14 @@ def download_note_assets(store, note, root):
             continue
         store.asset_status(asset["id"], "downloading")
         try:
-            info = download_image(asset, root)
+            # 采集同一轮为读图下载过的字节优先复用：省一次请求，也绕开
+            # "用户手点下载时签名地址早已过期"这个必然发生的问题。
+            staged = take_stashed_image(asset["source_url"])
+            if staged is not None:
+                info = save_image_bytes(asset, root, *staged)
+                reused += 1
+            else:
+                info = download_image(asset, root)
             store.complete_asset(asset["id"], info)
             downloaded += 1
         except ImportProblem as exc:
@@ -150,5 +249,8 @@ def download_note_assets(store, note, root):
             store.asset_status(asset["id"], "failed", str(exc))
     items = store.assets(note["note_id"])
     failed = sum(item["status"] == "failed" for item in items)
+    # downloaded 含复用字节的那部分：对用户来说两者都是"这次存下来了"，
+    # reused 只是把来源说清楚，前端提示与排查都靠它。
     return {"status": "complete" if not failed else "partial" if downloaded + skipped else "failed",
-            "total": len(items), "downloaded": downloaded, "skipped": skipped, "failed": failed}
+            "total": len(items), "downloaded": downloaded, "skipped": skipped,
+            "reused": reused, "failed": failed}
