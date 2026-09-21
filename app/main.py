@@ -49,7 +49,7 @@ from .plan_quality import check_plan_quality
 from .plan_flow import commit_plan, flow_snapshot, start_review
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
-from . import indexing, xhs_source
+from . import eval_reports, indexing, xhs_source
 from .xhs_vision import apply_image_text, transcribe_local_files
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
@@ -64,6 +64,10 @@ from .embeddings import (
 # 使用固定名称的日志器，方便以后接入结构化日志和可观测性平台。
 # 日志内容只包含请求编号、批次位置和异常类型，绝不记录分享链接或 xsec_token。
 logger = logging.getLogger("xhs.import")
+
+# 评估页一次最多聚合多少轮带工具调用的回答。这是内存护栏：会话攒多了以后
+# 每条 metadata 都要解析，无上限地全表扫会在打开看板时卡住整个事件循环。
+TRACE_TURN_LIMIT = 200
 
 
 def classify_network_error(exc: httpx.HTTPError) -> tuple[str, str]:
@@ -344,7 +348,7 @@ class MemoryCandidateReviewRequest(BaseModel):
     content: str | None = Field(default=None, min_length=1, max_length=200)
 
 
-def create_app(db_path=DEFAULT_DB, media_root=None):
+def create_app(db_path=DEFAULT_DB, media_root=None, case_dir=None):
     # 从项目根目录的 .env 读取本地配置。这个文件已被 .gitignore 排除，
     # 因而不会在提交代码时意外上传 API Key。
     project_root = Path(__file__).resolve().parents[1]
@@ -2098,6 +2102,63 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         return app.state.store.update_memory(
             memory_id, {"status": "dismissed"}, datetime.now(timezone.utc).isoformat()
         )
+
+    # ---------------------------- 评估看板 ----------------------------
+    # 这一页回答"检索和工具调用到底行不行"。数据分两半，刻意不混在一起：
+    #   ① 离线评测（报告文件）——真实跑过 /search 的产物，可复现、可对比；
+    #   ② 运行痕迹（tool_calls）——真实提问里模型调了什么、多慢、失败没有。
+    # 把两者混着展示会让人分不清"快"指的是检索还是模型，所以接口和界面都分开。
+    #
+    # 报告目录跟数据库同目录（与 media_root 同一约定）。这是刻意的：serve_real.py
+    # 指向主仓真实库时，看板自动读到主仓那几份报告；测试用临时库时读到空目录。
+    # 代码里不出现任何绝对路径，换台机器也不会指向别人机器上的目录。
+    eval_dir = eval_reports.report_dir(db_path)
+    # 评测集（人工标注的 reason）与报告分处两地：报告是跑出来的产物，评测集是
+    # 仓库内的测试资产。做成参数是为了测试能自己造一份，不必依赖仓库里那份文件的
+    # 当前内容——否则评测集一改，看板的测试就红。
+    eval_case_dir = Path(case_dir) if case_dir else project_root / "tests" / "data"
+
+    @app.get("/eval-reports", summary="评测报告列表与摘要（只读扫描 eval_reports 目录）")
+    def list_eval_reports():
+        """列报告。读不出来的文件以 kind=unreadable 出现在列表里。
+
+        一份写了一半、被手工编辑坏的 JSON 不该让整个看板 500——报告本来就是手工
+        产出的文件。列表永远返回 200，坏文件在行内自带 error 说明。
+        """
+        items = eval_reports.list_reports(eval_dir)
+        return {"directory": str(eval_dir), "total": len(items), "items": items}
+
+    @app.get("/eval-reports/{name}", summary="单份报告的逐题明细与人工标注")
+    def get_eval_report(name: str):
+        """`name` 是文件名，必须过 resolve_report 的越界校验。
+
+        这个接口的形状（客户端给个名字、服务端照名字读文件）就是目录穿越的经典
+        入口，校验放在 eval_reports.resolve_report 里而不是这里，是为了让它能被
+        单独测——安全逻辑写在路由函数里就没法脱离 HTTP 层验证。
+        """
+        try:
+            report = eval_reports.load_report(eval_dir, name)
+        except FileNotFoundError:
+            raise HTTPException(404, detail="报告不存在。") from None
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc)) from None
+        # 人工标注在仓库内的评测集里；题目版本与报告不同步时匹配不到，只是少一行
+        # 说明，不报错——评测集与报告本来就是两条时间线。
+        notes = eval_reports.load_case_notes([
+            eval_case_dir / "retrieval_eval.jsonl",
+            eval_case_dir / "multihop_eval.jsonl",
+        ])
+        return eval_reports.attach_reasons(report, notes)
+
+    @app.get("/traces/stats", summary="跨会话的工具调用聚合（只读）")
+    def trace_stats():
+        """真实使用侧的另一半：调了哪些工具、多少次、多慢、失败与引用情况。
+
+        数据量取决于真实使用，冷启动阶段会很空。空就是空，不拿评测报告的数据来
+        凑数——那会让人误以为"这些耗时来自我的提问"。
+        """
+        turns = app.state.store.tool_call_turns(limit=TRACE_TURN_LIMIT)
+        return {**eval_reports.summarize_traces(turns), "turn_limit": TRACE_TURN_LIMIT}
 
     # 单页前端：由后端直接托管，与 API 同源，免去跨域与额外构建步骤。
     # html=True 让 /ui/ 直接返回 index.html；子路径（/ui/app.js 等）按文件返回。

@@ -478,6 +478,52 @@ class NoteStore:
             items.append(item)
         return items
 
+    def tool_call_turns(self, limit=200):
+        """取出带工具调用的助手消息，供评估页统计工具使用情况。
+
+        只读、不写库。聚合逻辑在 `eval_reports.summarize_traces` 里，这里只负责把
+        行捞出来，所以返回的是"一轮回答"的扁平结构而不是原始行。
+
+        顺带把这一轮对应的用户提问一起取出来（question 子查询）：看板上"这轮在问
+        什么"比"回答前 60 字"有用得多，而提问在另一行里，聚合层不该自己去查库。
+
+        `metadata_json` 解析失败的行直接跳过：历史数据里可能有手工写入的脏
+        metadata，一行坏数据不该让整页打不开。
+        """
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""
+                SELECT m.id, m.thread_id, m.content, m.metadata_json, m.created_at,
+                    (SELECT u.content FROM chat_messages u
+                      WHERE u.thread_id = m.thread_id AND u.role = 'user' AND u.id < m.id
+                      ORDER BY u.id DESC LIMIT 1) AS question
+                FROM chat_messages m
+                WHERE m.role = 'assistant'
+                ORDER BY m.id DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        turns = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except ValueError:
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            calls = metadata.get("tool_calls")
+            if not isinstance(calls, list) or not calls:
+                continue
+            source = row["question"] or row["content"] or ""
+            turns.append({
+                "thread_id": row["thread_id"],
+                "created_at": row["created_at"],
+                "label": " ".join(source.split())[:60],
+                "tool_calls": calls,
+                "retrieved_note_ids": metadata.get("retrieved_note_ids") or [],
+                "cited_note_ids": metadata.get("cited_note_ids") or [],
+            })
+        return turns
+
     def rename_thread(self, thread_id, title, now):
         """改标题只动 chat_threads；顺便刷新 updated_at，让侧边栏顺序跟手。"""
         with closing(sqlite3.connect(self.path)) as db, db:

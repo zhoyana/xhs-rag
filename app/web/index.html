@@ -16,6 +16,7 @@
       <button class="tab" data-view="chat">对话</button>
       <button class="tab" data-view="calendar">日历</button>
       <button class="tab" data-view="memory">记忆<span class="tab-badge" id="memory-badge" hidden></span></button>
+      <button class="tab" data-view="eval">评估</button>
     </nav>
     <div class="health" id="health" title="后端状态">…</div>
   </header>
@@ -225,6 +226,59 @@
         <div class="section-h">已换代 / 已停用 <span id="mem-archive-count" class="muted"></span></div>
         <p class="hint">新口径替换旧口径时，旧的那条留在这里不再参与注入；停用的是你手动下线的，随时可以恢复。</p>
         <ul class="note-list mem-list" id="mem-archive"></ul>
+      </div>
+    </section>
+
+    <!-- 评估：这一页回答"检索和工具调用到底行不行"，也是唯一的数字出处。
+         两半刻意分开，切换看而不是堆一页：
+           离线评测 = 真实跑过 /search 的报告文件，可复现、可对比、可下钻到单题；
+           运行痕迹 = 真实提问里模型调了哪些工具、多慢、失败没有。
+         混在一起之后"平均 2.5 秒"到底指检索还是模型，就没人说得清了。 -->
+    <section class="view" id="view-eval">
+      <div class="toolbar">
+        <div class="seg-group" id="eval-modes">
+          <button class="seg active" data-evalmode="reports">离线评测</button>
+          <button class="seg" data-evalmode="traces">运行痕迹</button>
+        </div>
+        <span class="hint" id="eval-dir"></span>
+        <div class="toolbar-actions">
+          <button id="btn-eval-refresh" class="ghost">刷新</button>
+        </div>
+      </div>
+
+      <div id="eval-reports-body">
+        <div class="eval-cards" id="eval-cards"></div>
+        <div class="eval-pick">
+          <select id="eval-report-picker"></select>
+          <span class="hint" id="eval-report-meta"></span>
+        </div>
+        <div id="eval-note" class="eval-note" hidden></div>
+        <div id="eval-metrics"></div>
+        <div id="eval-ablation"></div>
+        <div class="eval-block">
+          <div class="section-h">逐题明细 <span class="muted" id="eval-case-count"></span></div>
+          <p class="hint">未命中的题按判据标红：先看它 Top1 是谁、再看这题原本在考察什么。</p>
+          <div id="eval-cases"></div>
+        </div>
+      </div>
+
+      <div id="eval-traces-body" hidden>
+        <div class="eval-cards" id="trace-cards"></div>
+        <div class="eval-block">
+          <div class="section-h">工具调用分布 <span class="muted" id="trace-tool-count"></span></div>
+          <p class="hint">次数 / 失败 / 平均与 p95 耗时。平均被极值拉高时看 p95，两者差得远说明长尾很重。</p>
+          <div id="trace-tools"></div>
+        </div>
+        <div class="eval-block">
+          <div class="section-h">最慢的调用</div>
+          <p class="hint">耗时大户通常是站外能力（搜索、采集），本地检索一般在几十毫秒内。</p>
+          <div id="trace-slowest"></div>
+        </div>
+        <div class="eval-block">
+          <div class="section-h">失败的调用 <span class="muted" id="trace-fail-count"></span></div>
+          <p class="hint">失败不静默：失败次数与错误码一并列出，方便对日志。</p>
+          <div id="trace-failures"></div>
+        </div>
       </div>
     </section>
   </main>

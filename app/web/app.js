@@ -189,6 +189,8 @@ function switchView(name) {
   // 日历按需拉取：用户可能整场都不打开它，没必要每次进页面都多打两枪。
   if (name === "calendar" && !calendarState.loaded) loadCalendar();
   if (name === "memory" && !memoryState.loaded) loadMemories();
+  // 评估页要扫描报告目录 + 聚合全部工具调用，比别的页面重；同样等用户真的点开再拉。
+  if (name === "eval" && !evalState.loaded) loadEval();
 }
 
 $$(".tab").forEach((tab) => {
@@ -1415,7 +1417,7 @@ function turnEl(msg) {
   }
   const meta = msg.metadata || {};
   const traces = meta.tool_calls || [];
-  if (traces.length) wrap.appendChild(stepsEl(traces, traces.reduce((s, t) => s + (t.duration_ms || 0), 0)));
+  if (traces.length) wrap.appendChild(stepsEl(traces, traces.reduce((s, t) => s + (t.duration_ms || 0), 0), meta));
   const body = document.createElement("div");
   body.className = "md";
   body.innerHTML = renderMarkdown(msg.content || "") || '<p class="muted">（本轮没有文字回答）</p>';
@@ -1430,16 +1432,87 @@ function turnEl(msg) {
   return wrap;
 }
 
-function stepsEl(traces, totalMs) {
+function stepsEl(traces, totalMs, meta) {
   const det = document.createElement("details");
   det.className = "steps";
   const failed = traces.filter((t) => t.ok === false).length;
   det.innerHTML = `<summary></summary>`;
   const body = document.createElement("div");
+  // 先给"这一轮长什么样"，再给逐步明细：路径图负责一眼看懂顺序与断点，
+  // 明细行负责回答"这一步到底传了什么参数"。
+  body.appendChild(traceChainEl(traces, meta));
   for (const t of traces) body.appendChild(stepEl(t));
   det.appendChild(body);
   setStepsSummary(det, traces, totalMs, failed);
   return det;
+}
+
+// 执行路径图：把一轮 ReAct 按顺序排成一条链。
+// 原来只有逐步列表，信息是全的，但要一行行读完才知道"一共搜了几次、哪一步空手而归、
+// 最后有没有真的用上"。链路把这三件事变成一眼可见：空结果的节点标黄、失败标红、
+// 末端挂上引用了几篇。
+function traceChainEl(traces, meta) {
+  const box = document.createElement("div");
+  box.className = "trace";
+  const cited = new Set((meta && (meta.cited_note_ids || meta.source_note_ids)) || []);
+  const hits = traces.filter((t) => typeof t.result_count === "number" && t.result_count > 0).length;
+  const emptyEnded = traces.filter((t) => t.ok !== false && t.result_count === 0).length;
+
+  const head = document.createElement("div");
+  head.className = "trace-head";
+  const parts = [`${traces.length} 步`];
+  if (hits) parts.push(`${hits} 步有命中`);
+  if (emptyEnded) parts.push(`${emptyEnded} 步空手而归`);
+  if (cited.size) parts.push(`引用 ${cited.size} 篇`);
+  head.textContent = parts.join(" · ");
+  box.appendChild(head);
+
+  const chain = document.createElement("div");
+  chain.className = "trace-chain";
+  traces.forEach((trace, index) => {
+    if (index) chain.appendChild(traceArrowEl());
+    chain.appendChild(traceNodeEl(trace, index));
+  });
+  if (cited.size) {
+    chain.appendChild(traceArrowEl());
+    const node = document.createElement("div");
+    node.className = "trace-node ref";
+    node.innerHTML = `<span class="trace-step">结果</span>
+      <span class="trace-name"></span>
+      <span class="trace-meta">写进回答的出处</span>`;
+    node.querySelector(".trace-name").textContent = `引用 ${cited.size} 篇`;
+    chain.appendChild(node);
+  }
+  box.appendChild(chain);
+  return box;
+}
+
+function traceArrowEl() {
+  const arrow = document.createElement("span");
+  arrow.className = "trace-arrow";
+  arrow.textContent = "→";
+  return arrow;
+}
+
+function traceNodeEl(trace, index) {
+  const node = document.createElement("div");
+  const failed = trace.ok === false;
+  // "空手而归"与"失败"要分开：前者是检索正常返回但没命中（换个说法再搜就是了），
+  // 后者是工具本身挂了（得去查日志）。混成一种颜色就分不清该怪谁。
+  const empty = !failed && trace.result_count === 0;
+  node.className = `trace-node${failed ? " fail" : empty ? " empty" : ""}`;
+  const bits = [];
+  if (trace.duration_ms != null) bits.push(`${(trace.duration_ms / 1000).toFixed(2)}s`);
+  if (trace.result_count != null) bits.push(`${trace.result_count} 条`);
+  if (trace.top_score != null) bits.push(`top ${Number(trace.top_score).toFixed(2)}`);
+  if (failed) bits.push(trace.error_code || "失败");
+  if (trace.ok === null || trace.ok === undefined) bits.push("进行中");
+  node.innerHTML = `<span class="trace-step">第 ${index + 1} 步</span>
+    <span class="trace-name"></span>
+    <span class="trace-meta"></span>`;
+  node.querySelector(".trace-name").textContent = TOOL_LABELS[trace.name] || trace.name;
+  node.querySelector(".trace-meta").textContent = bits.join(" · ") || "—";
+  return node;
 }
 
 function setStepsSummary(det, traces, totalMs, failed) {
@@ -1534,12 +1607,19 @@ function createLiveTurn() {
     finish(message) {
       stopTimer();
       working.remove();
+      const meta = (message && message.metadata) || { tool_calls: traces };
       if (det) {
         det.dataset.live = "0";
         det.open = false;   // 回答出来之后步骤默认收起，不挡正文
+        // 流式期间每一步到货就追一行，来不及排版；路径图要等 trace 收齐才能连成链，
+        // 所以在这一刻补上，末端接"引用了几篇"。
+        if (stepsBody && traces.length) {
+          stepsBody.innerHTML = "";
+          stepsBody.appendChild(traceChainEl(traces, meta));
+          for (const trace of traces) stepsBody.appendChild(stepEl(trace));
+        }
         updateSummary();
       }
-      const meta = (message && message.metadata) || { tool_calls: traces };
       const finalText = (message && message.content) || draft;
       body.innerHTML = renderMarkdown(finalText) || '<p class="muted">（本轮没有文字回答）</p>';
       if (!body.parentNode) wrap.appendChild(body);
@@ -2424,6 +2504,388 @@ async function renderMemoryBadge() {
   } catch (_) { /* 拿不到就不显示，徽标不该拖累页面 */ }
 }
 
+// ----------------------------- 评估（检索质量与运行痕迹） -----------------------------
+// 这一页是"检索到底行不行"的唯一数字出处。两半刻意分开：
+//   离线评测 = 报告文件（真实跑过 /search 的产物，可复现、可对比、能下钻到单题）；
+//   运行痕迹 = 真实提问里落库的 tool_calls（调了什么、多慢、失败没有）。
+// 在此之前这些数字只存在于 data/eval_reports/*.json 里，要看先得会跑脚本再读 JSON，
+// 于是"昨天还搜得到、今天怎么搜不到了"这类判断只能靠记忆。
+const evalState = { loaded: false, mode: "reports", reports: [], detail: null, stats: null };
+
+// 报告类型决定出现哪几列：单跳是 Hit@K/MRR，多跳是覆盖率/整段命中/单跳召回。
+// 两者语义不可互译（多跳的 coverage_at_5 不是"Hit@5"），所以列必须分开渲染。
+const EVAL_KIND_LABEL = { single_hop: "单跳检索", multihop: "多跳检索", unreadable: "读不出来" };
+
+const evalPct = (v) => (typeof v === "number" ? `${(v * 100).toFixed(1)}%` : "—");
+const evalNum = (v) => (typeof v === "number" ? v.toFixed(2) : "—");
+const evalMs = (v) => (typeof v === "number"
+  ? (v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${v.toFixed(1)}ms`) : "—");
+
+async function loadEval() {
+  evalState.loaded = true;
+  // 两个接口互不依赖，并行拉；一个挂了另一个照样显示，各自 catch。
+  await Promise.all([loadEvalReports(), loadTraceStats()]);
+}
+
+async function loadEvalReports() {
+  try {
+    const body = await api("GET", "/eval-reports");
+    evalState.reports = body.items || [];
+    $("#eval-dir").textContent = body.directory ? `报告目录：${body.directory}` : "";
+    renderEvalPicker();
+    renderEvalOverview();
+    const first = evalState.reports.find((item) => item.kind !== "unreadable");
+    if (first) {
+      await openEvalReport(first.file);
+    } else {
+      $("#eval-report-meta").textContent = "";
+      $("#eval-metrics").innerHTML = "";
+      $("#eval-ablation").innerHTML = "";
+      $("#eval-case-count").textContent = "";
+      $("#eval-cases").innerHTML =
+        '<p class="muted">还没有评测报告。跑一次 scripts/retrieval_eval.py --save-json 就有了。</p>';
+    }
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function renderEvalPicker() {
+  const select = $("#eval-report-picker");
+  select.innerHTML = "";
+  for (const item of evalState.reports) {
+    const option = document.createElement("option");
+    option.value = item.file;
+    const kind = EVAL_KIND_LABEL[item.kind] || item.kind;
+    const dedup = item.deduplicate_notes === true ? " · 去重"
+      : item.deduplicate_notes === false ? " · 不去重" : "";
+    option.textContent = `${kind}${dedup} · ${item.file}`;
+    select.appendChild(option);
+  }
+  select.disabled = evalState.reports.length === 0;
+}
+
+// 概览卡取“最新一份评测”的指标。不跨报告求平均：不同批次的题集与模型可能都变了，
+// 平均出来的数字没有任何一次运行对得上。
+function renderEvalOverview() {
+  const box = $("#eval-cards");
+  box.innerHTML = "";
+  const usable = evalState.reports.filter((item) => item.kind !== "unreadable");
+  const broken = evalState.reports.length - usable.length;
+  box.appendChild(evalCard("报告数", String(evalState.reports.length),
+    broken ? `其中 ${broken} 份读不出来` : "全部可读"));
+  const latest = usable[0];
+  if (!latest) return;
+  for (const [label, value, note] of evalMetricCards(latest)) {
+    box.appendChild(evalCard(label, value, note));
+  }
+  box.appendChild(evalCard("最新一份", latest.file, latest.modified_at
+    ? `更新于 ${relativeTime(latest.modified_at)}` : ""));
+}
+
+function evalCard(label, value, note) {
+  const card = document.createElement("div");
+  card.className = "eval-card";
+  card.innerHTML = `<div class="eval-card-label"></div>
+    <div class="eval-card-value"></div>
+    <div class="eval-card-note muted"></div>`;
+  card.querySelector(".eval-card-label").textContent = label;
+  card.querySelector(".eval-card-value").textContent = value;
+  card.querySelector(".eval-card-note").textContent = note || "";
+  return card;
+}
+
+function evalMetricCards(summary) {
+  const metrics = summary.metrics || {};
+  const cards = [];
+  if (summary.kind === "multihop") {
+    cards.push(["整段命中 @5", evalPct(metrics.all_hit_at_5), "每一跳都召回才算命中"]);
+    cards.push(["覆盖率 @5", evalPct(metrics.coverage_at_5), "至少一跳召回的题占比"]);
+    cards.push(["单跳召回 @5", evalPct(metrics.hop_recall_at_5), "逐跳统计，不看另一跳"]);
+    cards.push(["跳均耗时", evalMs(summary.average_hop_latency_ms), "单次检索的耗时"]);
+  } else {
+    cards.push(["Hit@1", evalPct(metrics.hit_at_1), "第一条就是相关笔记"]);
+    cards.push(["Hit@3", evalPct(metrics.hit_at_3), ""]);
+    cards.push(["Hit@5", evalPct(metrics.hit_at_5), ""]);
+    cards.push(["MRR", evalNum(metrics.mrr), "相关笔记排得越靠前越接近 1"]);
+  }
+  const types = summary.type_counts
+    ? Object.entries(summary.type_counts).map(([k, v]) => `${k} ${v}`).join(" · ") : "";
+  cards.push(["题数", summary.case_count == null ? "—" : String(summary.case_count), types]);
+  cards.push(["平均耗时", evalMs(summary.average_latency_ms),
+    summary.model ? summary.model : ""]);
+  return cards;
+}
+
+async function openEvalReport(file) {
+  if (!file) return;
+  $("#eval-report-picker").value = file;
+  try {
+    evalState.detail = await api("GET", `/eval-reports/${encodeURIComponent(file)}`);
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  renderEvalDetail();
+}
+
+function renderEvalDetail() {
+  const detail = evalState.detail;
+  if (!detail) return;
+  const summary = detail.summary;
+  const metrics = summary.metrics || {};
+
+  const meta = [`报告：${summary.file}`];
+  if (summary.retrieval_mode) meta.push(`模式 ${summary.retrieval_mode}`);
+  if (summary.deduplicate_notes != null) {
+    meta.push(summary.deduplicate_notes ? "按笔记去重" : "不去重");
+  }
+  if (summary.chunk_candidate_count != null) meta.push(`候选 chunk ${summary.chunk_candidate_count}`);
+  if (summary.answerable_count != null) meta.push(`有答案 ${summary.answerable_count} 题`);
+  if (summary.modified_at) meta.push(`生成于 ${fmtTime(summary.modified_at)}`);
+  $("#eval-report-meta").textContent = meta.join(" · ");
+
+  const metricsBox = $("#eval-metrics");
+  metricsBox.innerHTML = "";
+  metricsBox.className = "eval-cards";
+  for (const [label, value, note] of evalMetricCards(summary)) {
+    metricsBox.appendChild(evalCard(label, value, note));
+  }
+
+  renderEvalNote(summary);
+  renderAblation(summary);
+  renderEvalCases();
+}
+
+// 只有多跳报告会带“缺失跳的向量得分”：它是拒答阈值的直接依据，值得单独说一句。
+function renderEvalNote(summary) {
+  const note = $("#eval-note");
+  const scores = summary.missing_hop_vector_scores || [];
+  const noAnswer = summary.no_answer_max_scores || [];
+  const parts = [];
+  if (scores.length) {
+    parts.push(`标为“缺失跳”的题，其最高向量得分是 ${scores.map(evalNum).join(" / ")}；`
+      + "低于这个量级才算真的没有可答内容，阈值就从这里取。");
+  }
+  if (noAnswer.length) {
+    parts.push(`无答案题的最高分：${noAnswer.map(evalNum).join(" / ")}。`
+      + "它和上面那组数字之间的空档，就是“该拒答”和“该作答”的分界。");
+  }
+  if (!parts.length) { note.hidden = true; note.innerHTML = ""; return; }
+  note.hidden = false;
+  note.textContent = parts.join(" ");
+}
+
+// 消融对比：同一批题、同一模型，只有“是否按笔记去重”这一个变量不同。
+// 这个面板存在的意义是把“去重到底有没有代价”用两次真实运行摆出来，
+// 而不是在一段注释里声称“去重更好”。
+function renderAblation(summary) {
+  const box = $("#eval-ablation");
+  box.innerHTML = "";
+  if (summary.kind !== "single_hop") return;
+  const raw = evalState.reports.find((item) =>
+    item.kind === "single_hop" && item.deduplicate_notes === false
+    && item.average_duplicate_slots_top5 != null);
+  const dedup = evalState.reports.find((item) =>
+    item.kind === "single_hop" && item.deduplicate_notes === true
+    && item.average_duplicate_slots_top5 != null);
+  if (!raw || !dedup) return;
+
+  const rows = [
+    ["Hit@1", (item) => evalPct(item.metrics.hit_at_1)],
+    ["MRR", (item) => evalNum(item.metrics.mrr)],
+    ["Top5 平均重复槽位", (item) => evalNum(item.average_duplicate_slots_top5)],
+    ["平均耗时", (item) => evalMs(item.average_latency_ms)],
+  ];
+  // 结论按实际数字生成，不写死：报告是外部产物，重跑一次结论就可能变。
+  const rawSlots = raw.average_duplicate_slots_top5;
+  const dedupSlots = dedup.average_duplicate_slots_top5;
+  const delta = (dedup.metrics.mrr ?? 0) - (raw.metrics.mrr ?? 0);
+  const verdict = delta === 0 ? "MRR 持平" : (delta > 0 ? "MRR 略升" : "MRR 略降");
+  box.innerHTML = `<div class="section-h">消融对比：按笔记去重</div>
+    <p class="hint">同一批题、同一模型的两次运行，只改“是否每篇笔记只留最高分的一个 chunk”
+    这一个变量。Top5 平均重复槽位 ${escapeHtml(evalNum(rawSlots))} → ${escapeHtml(evalNum(dedupSlots))}，
+    ${escapeHtml(verdict)}。去掉重复候选腾出的名额，才轮到真正相关的笔记。</p>
+    <table class="eval-table"><thead><tr><th>指标</th>
+      <th>不去重<span class="muted"> ${escapeHtml(raw.file)}</span></th>
+      <th>按笔记去重<span class="muted"> ${escapeHtml(dedup.file)}</span></th>
+    </tr></thead><tbody>${rows.map(([label, render]) => `<tr><td>${label}</td>
+      <td>${render(raw)}</td><td>${render(dedup)}</td></tr>`).join("")}</tbody></table>`;
+}
+
+function renderEvalCases() {
+  const detail = evalState.detail;
+  const cases = (detail && detail.cases) || [];
+  const multihop = detail && detail.summary.kind === "multihop";
+  $("#eval-case-count").textContent = cases.length ? `${cases.length} 题` : "";
+  const box = $("#eval-cases");
+  box.innerHTML = "";
+  if (!cases.length) {
+    box.innerHTML = '<p class="muted">这份报告里没有逐题记录。</p>';
+    return;
+  }
+  for (const item of cases) box.appendChild(evalCaseEl(item, multihop));
+}
+
+function evalCaseEl(item, multihop) {
+  const wrap = document.createElement("div");
+  const relevant = item.relevant_note_ids || [];
+  // 无答案题没有“排名正确”可言，把它和“未命中”混为一谈会让人以为检索错了。
+  const isNoAnswer = relevant.length === 0;
+  const hitFlag = multihop ? item.all_hit_at_5 : item.hit_at_5;
+  const missed = !isNoAnswer && hitFlag === 0;
+  wrap.className = `eval-case${missed ? " miss" : ""}${isNoAnswer ? " no-answer" : ""}`;
+
+  const bits = [];
+  if (item.difficulty) bits.push(item.difficulty);
+  if (item.type) bits.push(item.type);
+  bits.push(isNoAnswer ? "无答案题" : (missed ? "未命中" : "命中"));
+  if (!multihop && item.reciprocal_rank != null) bits.push(`RR ${evalNum(item.reciprocal_rank)}`);
+  bits.push(evalMs(item.latency_ms));
+
+  const head = document.createElement("div");
+  head.className = "eval-case-head";
+  head.innerHTML = `<span class="eval-case-id"></span>
+    <span class="eval-case-query"></span>
+    <span class="eval-case-bits">${escapeHtml(bits.join(" · "))}</span>`;
+  head.querySelector(".eval-case-id").textContent = item.id || "—";
+  head.querySelector(".eval-case-query").textContent = item.query || "（没有 query）";
+  wrap.appendChild(head);
+
+  const topRow = document.createElement("div");
+  topRow.className = "eval-case-top";
+  const top = (item.top_results || [])[0];
+  if (top) {
+    topRow.innerHTML = `<span class="muted">Top1</span>
+      <button class="hit-title"></button>
+      <span class="hit-score">相关度 ${escapeHtml(evalNum(top.score))}</span>`;
+    const button = topRow.querySelector(".hit-title");
+    button.textContent = top.title || `笔记 ${String(top.note_id || "").slice(0, 8)}`;
+    button.title = top.note_id || "";
+    if (top.note_id) button.onclick = () => gotoNote(top.note_id);
+  } else {
+    topRow.innerHTML = '<span class="muted">这一题没有任何候选</span>';
+  }
+  wrap.appendChild(topRow);
+
+  // 未命中的题默认展开：那正是需要“为什么”的时候，不该还要多点一下。
+  const details = document.createElement("details");
+  details.className = "eval-case-more";
+  if (missed || isNoAnswer) details.open = true;
+  details.innerHTML = "<summary>标注与细节</summary>";
+  const body = document.createElement("div");
+  body.className = "eval-case-body";
+  if (item.reason) {
+    const reason = document.createElement("p");
+    reason.className = "eval-reason";
+    reason.textContent = `考察意图：${item.reason}`;
+    body.appendChild(reason);
+  }
+  if (item.hops && item.hops.length) {
+    const list = document.createElement("div");
+    list.className = "eval-hops";
+    item.hops.forEach((hop, index) => {
+      const row = document.createElement("div");
+      row.className = "eval-hop";
+      row.innerHTML = `<span class="muted">第 ${index + 1} 跳</span>
+        <span class="eval-hop-query"></span>
+        <span class="muted">Top1</span>
+        <button class="hit-title"></button>
+        <span class="hit-score">${escapeHtml(evalNum(hop.top_score))}</span>`;
+      row.querySelector(".eval-hop-query").textContent = hop.query || "";
+      const button = row.querySelector(".hit-title");
+      button.textContent = hop.top_title || "（无候选）";
+      if (hop.top_note_id) button.onclick = () => gotoNote(hop.top_note_id);
+      list.appendChild(row);
+    });
+    body.appendChild(list);
+  }
+  if (!body.childNodes.length) {
+    body.innerHTML = '<p class="muted">这道题没有人工标注。</p>';
+  }
+  details.appendChild(body);
+  wrap.appendChild(details);
+  return wrap;
+}
+
+async function loadTraceStats() {
+  try {
+    evalState.stats = await api("GET", "/traces/stats");
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  renderTraces();
+}
+
+function renderTraces() {
+  const stats = evalState.stats;
+  if (!stats) return;
+  const cards = $("#trace-cards");
+  cards.innerHTML = "";
+  const citation = stats.citation || {};
+  const duration = stats.duration || {};
+  const cardsData = [
+    ["有工具调用的回答", `${stats.turn_count} 轮`, "只统计真的调过工具的回答"],
+    ["工具调用总数", `${stats.call_count} 次`, `${evalNum(stats.steps_per_turn.avg)} 步/轮，最多 ${stats.steps_per_turn.max ?? "—"} 步`],
+    ["失败的调用", `${stats.failed_count} 次`, stats.failed_count ? "失败明细见下方" : "没有失败"],
+    ["平均调用耗时", evalMs(duration.avg_ms), `p95 ${evalMs(duration.p95_ms)}`],
+    ["平均一轮总耗时", evalMs(duration.avg_turn_ms), `最慢一轮 ${evalMs(duration.max_turn_ms)}`],
+    ["引用率", evalPct(citation.rate),
+      `${citation.cited ?? 0} 处出处 / 检索到 ${citation.retrieved ?? 0} 篇`],
+  ];
+  for (const [label, value, note] of cardsData) cards.appendChild(evalCard(label, value, note));
+
+  const toolCount = $("#trace-tool-count");
+  toolCount.textContent = stats.tools.length ? `${stats.tools.length} 类工具` : "";
+  const toolBox = $("#trace-tools");
+  if (!stats.tools.length) {
+    toolBox.innerHTML = '<p class="muted">还没有带工具调用的对话。这一栏要真实用过才会长出来。</p>';
+  } else {
+    toolBox.innerHTML = `<table class="eval-table"><thead><tr>
+        <th>工具</th><th>次数</th><th>失败</th><th>平均</th><th>p95</th><th>平均命中</th>
+      </tr></thead><tbody>${stats.tools.map((tool) => `<tr>
+        <td class="eval-tool-name">${escapeHtml(tool.name)}</td>
+        <td>${tool.calls}</td>
+        <td>${tool.failed ? `<span class="eval-bad">${tool.failed}</span>` : "0"}</td>
+        <td>${escapeHtml(evalMs(tool.avg_ms))}</td>
+        <td>${escapeHtml(evalMs(tool.p95_ms))}</td>
+        <td>${tool.avg_results == null ? "—" : escapeHtml(evalNum(tool.avg_results))}</td>
+      </tr>`).join("")}</tbody></table>`;
+  }
+
+  const slowest = stats.slowest || [];
+  $("#trace-slowest").innerHTML = slowest.length ? `<table class="eval-table"><thead><tr>
+      <th>工具</th><th>耗时</th><th>那一轮在问什么</th><th>时间</th>
+    </tr></thead><tbody>${slowest.slice(0, 5).map((row) => `<tr>
+      <td class="eval-tool-name">${escapeHtml(row.tool)}</td>
+      <td>${escapeHtml(evalMs(row.duration_ms))}</td>
+      <td class="eval-label">${escapeHtml(row.label || "—")}</td>
+      <td class="muted">${escapeHtml(fmtTime(row.created_at))}</td>
+    </tr>`).join("")}</tbody></table>`
+    : '<p class="muted">没有可展示的调用。</p>';
+
+  const failures = stats.failures || [];
+  $("#trace-fail-count").textContent = failures.length ? `${failures.length} 条` : "";
+  $("#trace-failures").innerHTML = failures.length ? `<table class="eval-table"><thead><tr>
+      <th>工具</th><th>错误码</th><th>那一轮在问什么</th><th>时间</th>
+    </tr></thead><tbody>${failures.map((row) => `<tr>
+      <td class="eval-tool-name">${escapeHtml(row.tool)}</td>
+      <td class="eval-bad">${escapeHtml(row.error_code || "未记录")}</td>
+      <td class="eval-label">${escapeHtml(row.label || "—")}</td>
+      <td class="muted">${escapeHtml(fmtTime(row.created_at))}</td>
+    </tr>`).join("")}</tbody></table>`
+    : '<p class="muted">没有失败的调用。</p>';
+}
+
+function setEvalMode(mode) {
+  evalState.mode = mode;
+  $$("#eval-modes .seg").forEach((button) =>
+    button.classList.toggle("active", button.dataset.evalmode === mode));
+  $("#eval-reports-body").hidden = mode !== "reports";
+  $("#eval-traces-body").hidden = mode !== "traces";
+}
+
 // ----------------------------- 事件绑定 -----------------------------
 $("#btn-memory-refresh").onclick = loadMemories;
 $("#btn-memory-add").onclick = () => {
@@ -2436,6 +2898,11 @@ $("#btn-mem-add-save").onclick = addMemory;
 $("#mem-add-content").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); addMemory(); }
 });
+$("#btn-eval-refresh").onclick = () => { evalState.loaded = false; loadEval(); };
+$$("#eval-modes .seg").forEach((button) => {
+  button.onclick = () => setEvalMode(button.dataset.evalmode);
+});
+$("#eval-report-picker").onchange = (e) => openEvalReport(e.target.value);
 $("#btn-import").onclick = importBatch;
 $("#btn-read-all").onclick = readAllImages;
 $("#btn-refresh-notes").onclick = loadNotes;

@@ -848,3 +848,121 @@ body.theme-dark .fchip.on { background: var(--primary-soft); }
    一行灰色小字会被当成无关紧要的提示，而这里可能是整批都没进来。 */
 #import-result { white-space: pre-line; }
 #import-result.error { color: var(--danger); }
+
+/* ----------------------------- 评估看板 ----------------------------- */
+/* 指标卡是这一页的主视觉：数字大、说明小，一行扫完。
+   用 auto-fit 而不是写死列数，窄屏自动折行，省掉媒体查询。 */
+.eval-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 10px;
+  margin: 12px 0 4px;
+}
+.eval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.eval-card-label { font-size: 12px; color: var(--muted); }
+.eval-card-value { font-size: 20px; font-weight: 600; line-height: 1.3; }
+.eval-card-note { font-size: 11.5px; }
+
+.eval-pick { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.eval-pick select { min-width: 300px; max-width: 100%; }
+.eval-pick .hint { margin-top: 0; width: auto; }
+
+/* 拒答阈值的依据就藏在这段话里，用主色调提一下，别让它看起来像普通提示。 */
+.eval-note {
+  margin-top: 10px;
+  padding: 9px 12px;
+  background: var(--primary-soft);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.eval-block { margin-top: 18px; }
+
+.eval-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.eval-table th, .eval-table td {
+  padding: 7px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.eval-table th { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--bg); }
+.eval-table tbody tr:last-child td { border-bottom: none; }
+.eval-tool-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.eval-bad { color: var(--danger); font-weight: 600; }
+.eval-label { font-size: 12px; color: var(--muted); }
+
+/* 未命中的题整块标红：一页十题，扫一眼就知道该看哪几道。 */
+.eval-case {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.eval-case.miss { border-color: var(--danger); background: #fff7f8; }
+.eval-case.no-answer { border-style: dashed; }
+.eval-case-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.eval-case-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+.eval-case-query { flex: 1; min-width: 200px; }
+.eval-case-bits { font-size: 11.5px; color: var(--muted); }
+.eval-case.miss .eval-case-bits { color: var(--danger); font-weight: 600; }
+.eval-case-top { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; font-size: 12.5px; flex-wrap: wrap; }
+.eval-case-more { margin-top: 8px; }
+.eval-case-more > summary { font-size: 12px; color: var(--muted); cursor: pointer; }
+.eval-case-body { margin-top: 6px; font-size: 12.5px; }
+.eval-reason {
+  margin: 0 0 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+.eval-hops { display: flex; flex-direction: column; gap: 5px; }
+.eval-hop { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 12.5px; }
+.eval-hop-query { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* 执行路径图：横向链路，flex-wrap 自动折行，不需要算坐标。
+   三种状态各有颜色含义：空手而归=警告、失败=危险、引用=成功。 */
+.trace { margin-bottom: 12px; }
+.trace-head { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.trace-chain { display: flex; align-items: stretch; flex-wrap: wrap; gap: 6px; }
+.trace-node {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 92px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.trace-step { font-size: 10.5px; color: var(--muted); }
+.trace-name { font-size: 12.5px; font-weight: 600; }
+.trace-meta { font-size: 11px; color: var(--muted); }
+.trace-node.empty { border-color: var(--warn); background: #fffaf0; }
+.trace-node.empty .trace-name { color: var(--warn); }
+.trace-node.fail { border-color: var(--danger); background: #fff7f8; }
+.trace-node.fail .trace-name { color: var(--danger); }
+.trace-node.ref { border-color: var(--ok); background: #f2fbf6; }
+.trace-node.ref .trace-name { color: var(--ok); }
+.trace-arrow { align-self: center; font-size: 13px; color: var(--muted); }
