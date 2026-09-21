@@ -109,6 +109,46 @@ def local_file_valid(root, asset):
         return False
 
 
+# 「图片只有远程地址、还没下载」这类话是采集那一刻的快照。图片落盘之后它就成了假话，
+# 而 payload 里的警告没有任何代码会回头改——详情页因此出现过自相矛盾：徽章写着未下载，
+# 下面的图片区却写着"已保存 7 / 共 7 张"（用户点下载，接口答"跳过已有 7 张"）。
+# 所以存储状态与识别状态都不进 payload，只在读取时按当前事实现算；下面这些片段是
+# 历史数据里残留的同义说法，读到就丢掉。
+STALE_IMAGE_WARNING_MARKERS = ("未下载", "临时地址", "需及时下载")
+
+
+def strip_stale_image_warnings(warnings):
+    """丢掉"图片没下载"这类会随下载动作过期的说法，其余警告原样保留。"""
+    return [w for w in (warnings or [])
+            if not any(marker in w for marker in STALE_IMAGE_WARNING_MARKERS)]
+
+
+def image_state_warnings(assets, image_text, expected_total=0):
+    """按当前真实状态给出图片提示：文件在不在、图里的文字读没读。
+
+    空列表表示图片这块没有需要提醒的事。资产顺序与原笔记一致，但"共几张"只数
+    仍然对应原笔记的图；刷新来源后留下的 obsolete 记录只是审计痕迹，不算进来。
+    expected_total 是笔记 payload 里记的图片张数：资产记录还没建出来时（老数据、
+    或落盘中途失败），只靠 assets 会算出"0 张图、无需提醒"，那是不诚实的。
+    """
+    items = [item for item in (assets or []) if item.get("status") != "obsolete"]
+    total = max(len(items), int(expected_total or 0))
+    if not total:
+        return []
+    saved = sum(1 for item in items
+                if item.get("file_available") or item.get("status") == "success")
+    if not saved:
+        return [f"{total} 张图片只有远程地址、本地没有文件；原始地址带签名会过期，"
+                "需重新采集这篇才能补齐。"]
+    if saved < total:
+        return [f"本地已保存 {saved}/{total} 张图片；其余 {total - saved} 张未保存，"
+                "原始地址可能已过期。"]
+    if not str(image_text or "").strip():
+        return [f"{total} 张图片都已保存在本地；尚未识别图里的文字，"
+                "可点「补读图片」在本地读图。"]
+    return []
+
+
 def _place_verified(asset, root, temporary, size, digest):
     """校验临时文件确为支持的图片，按内容指纹命名后原子替换到最终位置。
 

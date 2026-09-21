@@ -1,5 +1,6 @@
 # pytest 自动发现 test_ 开头的函数。测试使用合成网页，不会抓取真实小红书。
 # 测试通过只证明这些场景符合预期，不能证明任意真实笔记都能导入。
+import asyncio
 import json
 
 import httpx
@@ -7,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.extractor import ImportProblem, share_url, parse_note, fetch_page
-from app import indexing
+from app import indexing, xhs_mcp, xhs_source
 from app.main import create_app
 
 URL = "https://www.xiaohongshu.com/explore/abc123"
@@ -27,7 +28,18 @@ def test_parse_and_keep_original_content():
     note = parse_note(fixture_html("undefined #标签 正文"), URL)
     assert note["content"] == "undefined #标签 正文"
     assert note["note_id"] == "abc123"
-    assert note["warnings"]
+
+
+def test_parse_does_not_freeze_image_storage_state_into_warnings():
+    """解析阶段不得把"图片还没下载"写进 payload。
+
+    同一轮导入就会把图存到本地，而写进 payload 的这句话之后没有任何代码会回头改，
+    详情页于是长期贴着一条假警告：徽章说没下载，图片区却写着"已保存 7 / 共 7 张"。
+    图片状态改由详情接口按 assets 现算，所以这里应当什么都不写。
+    """
+    note = parse_note(fixture_html("不限字数的正文"), URL)
+    assert note["images"]  # 这篇确实带图
+    assert not any("未下载" in w or "临时地址" in w for w in note["warnings"])
 
 
 # 参数化测试：同一段测试逻辑分别使用这两种输入执行。
@@ -489,3 +501,72 @@ def test_jobs_left_running_are_marked_interrupted_after_restart(tmp_path):
     assert job["status"] == "failed"
     assert job["current_step"] == "interrupted"
     assert job["progress"]["interrupted"] is True
+
+
+# ---------------------- 采集通道状态如实回报 ----------------------
+# 一次"整批全失败"最难回答的问题是：这是环境坏了（本地采集服务没开），
+# 还是这几条链接坏了？两者的修理方式完全不同，所以通道状态必须能带出来。
+
+# MCP 通道要求链接里有 24 位十六进制的笔记编号，用它才测得到"确实去调了 MCP"。
+FEED_ID = "6aa3c6ff0000000025036dd4"
+MCP_URL = f"https://www.xiaohongshu.com/explore/{FEED_ID}?xsec_token=abc_123&xsec_source=pc_feed"
+
+
+def test_mcp_failure_flag_clears_after_the_service_comes_back(monkeypatch):
+    """采集成功一次就要清掉故障标记。
+
+    熔断窗口只有 60 秒，采集服务重启后同一批导入的后半段就能恢复；如果成功
+    路径不清标记，服务已经好了界面还顶着"采集服务没开"，那就成了误导。
+    """
+    calls = []
+
+    async def failing(*_args, **_kwargs):
+        calls.append("fail")
+        raise xhs_mcp.XhsMcpUnavailable("测试环境模拟服务未启动。")
+
+    monkeypatch.setattr(xhs_source, "fetch_feed_detail", failing)
+    # 不必真的等熔断窗口过去：窗口长度是模块级常量，调用时才读。
+    monkeypatch.setattr(xhs_source, "BREAKER_SECONDS", 0)
+    xhs_source.reset_breaker()
+    assert asyncio.run(xhs_source.collect_via_mcp(MCP_URL)) is None
+    assert xhs_source.mcp_failure() == xhs_source.MCP_UNAVAILABLE
+
+    async def healthy(_feed_id, _xsec_token):
+        calls.append("ok")
+        return {"data": {"note": {"noteId": FEED_ID, "title": "标题",
+                                  "desc": "正文够长，不会被当成图片笔记。",
+                                  "type": "normal"}}}
+
+    monkeypatch.setattr(xhs_source, "fetch_feed_detail", healthy)
+    note = asyncio.run(xhs_source.collect_via_mcp(MCP_URL))
+    assert note["note_id"] == FEED_ID
+    assert xhs_source.mcp_failure() is None
+    assert calls == ["fail", "ok"]
+
+
+def test_batch_import_reports_the_channel_it_actually_used(tmp_path, monkeypatch):
+    """批量导入要回报采集通道与通道故障类别，不让用户去猜。"""
+    async def fake_fetch(_url):
+        # 页面里的编号必须和链接里的一致，否则解析器会判定"这不是你要的那篇"。
+        return fixture_html(note_id=FEED_ID), f"https://www.xiaohongshu.com/explore/{FEED_ID}"
+
+    monkeypatch.setattr("app.main.fetch_page", fake_fetch)
+    with TestClient(create_app(tmp_path / "test.db")) as client:
+        # 带令牌的链接才会去试 MCP，而默认夹具让 MCP 报故障。
+        ok = client.post("/notes/import-batch", json={"share_text": MCP_URL}).json()
+        assert ok["succeeded"] == 1
+        assert ok["collector_mcp"] == xhs_source.MCP_UNAVAILABLE
+        # 这一条实际上是网页解析采到的，调用方要能分辨。
+        assert ok["items"][0]["source"] == xhs_source.SOURCE_HTML
+
+        # 连网页解析也拿不到内容时，除了状态还必须给出可读原因。
+        async def login_page(_url):
+            return "登录页面", f"https://www.xiaohongshu.com/explore/{FEED_ID}"
+
+        monkeypatch.setattr("app.main.fetch_page", login_page)
+        bad = client.post("/notes/import-batch", json={
+            "share_text": f"https://www.xiaohongshu.com/explore/{FEED_ID}?xsec_token=t"
+        }).json()
+        assert (bad["succeeded"], bad["failed"]) == (0, 1)
+        assert bad["items"][0]["error"]
+        assert bad["items"][0]["source"] == xhs_source.SOURCE_HTML

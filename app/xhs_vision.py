@@ -28,7 +28,7 @@ import httpx
 # 复用 ai 里的消息文本提取：它已经把 content 可能是字符串、可能是分块数组
 # 这两种形态都抹平了，比在图片链路里重写一份可靠。
 from .ai import AIProblem, _message_text
-from .media import IMAGE_HOSTS, stash_image
+from .media import IMAGE_HOSTS, stash_image, strip_stale_image_warnings
 
 logger = logging.getLogger(__name__)
 
@@ -301,8 +301,8 @@ def apply_image_text(note: dict, vision: dict) -> None:
     放在视觉模块而不是某个采集通道里：MCP 通道（Agent 收藏）和收件箱通道
     （统一收件、批量导入）都要用，转写结果的落地格式只该有一份定义。
     """
-    warnings = [w for w in note.get("warnings", []) if "主要内容在图片里" not in w
-                and "需及时下载" not in w]
+    warnings = [w for w in strip_stale_image_warnings(note.get("warnings", []))
+                if "主要内容在图片里" not in w]
     text = str(vision.get("text") or "").strip()
     if text:
         note["image_text"] = text

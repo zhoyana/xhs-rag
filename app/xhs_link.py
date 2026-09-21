@@ -240,8 +240,9 @@ def note_from_feed_detail(payload) -> dict:
     if not title:
         title = text_only[:30] or "未命名笔记"
         warnings.append("原笔记没有标题，已用正文开头代替。")
-    if images:
-        warnings.append(f"笔记含 {len(images)} 张图片，链接为带签名的临时地址，需及时下载。")
+    # 不再写"图片含 N 张、链接为临时地址需及时下载"：同一轮就会把它们存到本地，
+    # 存完之后这句话就是假的，而它会被永久留在 payload 里。图片状态改由详情接口
+    # 按 assets 现算（app/media.py 的 image_state_warnings）。
 
     return {
         "note_id": note_id,

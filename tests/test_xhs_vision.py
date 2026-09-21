@@ -251,7 +251,9 @@ def test_collect_attaches_image_text_and_fixes_warnings():
     assert PAGE_1 in data["image_text"]
     assert data["image_count"] == 2
     assert not any("主要内容在图片里" in w for w in data["warnings"])
-    assert not any("需及时下载" in w for w in data["warnings"])
+    # 存储状态那类话根本不会写进 payload（同一轮就落盘了，写了会过期）；
+    # 这里再钉一次，防止有人图省事把"未下载/临时地址"加回采集层。
+    assert not any("未下载" in w or "临时地址" in w for w in data["warnings"])
     assert any("已用视觉模型识别" in w for w in data["warnings"])
 
 

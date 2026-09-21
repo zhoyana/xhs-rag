@@ -24,7 +24,8 @@ from dotenv import load_dotenv
 
 from .database import NoteStore, DEFAULT_DB
 from .extractor import ImportProblem, share_url, fetch_page, parse_note
-from .media import download_note_assets, local_file_valid, storage_path
+from .media import (download_note_assets, image_state_warnings, local_file_valid,
+                    storage_path, strip_stale_image_warnings)
 from .ai import (
     AIProblem,
     MEMORY_INJECT_CONTENT_LIMIT,
@@ -835,6 +836,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
 
         # request_id 用来关联同一批次的日志和响应，但不包含任何用户输入。
         request_id = uuid4().hex
+        # 批末要回答"这一批失败是不是因为本地采集服务没开"，所以开工前先清掉
+        # 上一批留下的标记，只统计本批。
+        xhs_source.clear_mcp_failure()
         items = []
         seen_urls = set()
         for position, candidate in enumerate(candidates, 1):
@@ -851,6 +855,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                     "status": result["status"],
                     "note_id": result["note"]["note_id"],
                     "title": result["note"]["title"],
+                    # 采集走的哪条通道也要带上：MCP（本地采集服务）和网页解析
+                    # 的失败原因完全不同，只报"导入失败"用户无从下手。
+                    "source": result["source"],
                     # 批量导入最关心的就是"哪几条现在能搜到"，直接放在每条结果里。
                     "searchable": bool(result["index"].get("searchable")),
                     "index_status": result["index"].get("status"),
@@ -862,7 +869,11 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
                     "error": None,
                 })
             except ImportProblem as exc:
-                items.append({"position": position, "status": "failed", "error": str(exc)})
+                # 走到这里说明 MCP 通道没给出结果、网页解析也拿不到内容，
+                # 所以失败原因一律来自网页解析——如实标出来，用户才知道
+                # 这次失败跟"采集服务"有没有关系。
+                items.append({"position": position, "status": "failed",
+                              "source": xhs_source.SOURCE_HTML, "error": str(exc)})
             except httpx.HTTPError as exc:
                 error_code, message = classify_network_error(exc)
                 logger.warning(
@@ -888,6 +899,9 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             "succeeded": succeeded,
             "failed": failed,
             "duplicates": duplicates,
+            # 本批里 MCP 通道的故障类别（unavailable / timeout / None）。
+            # 全批失败时它决定提示语该说"去启动采集服务"还是"这几条链接有问题"。
+            "collector_mcp": xhs_source.mcp_failure(),
             "items": items,
         }
 
@@ -897,14 +911,22 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
         # limit 控制返回条数，offset 控制跳过条数；ge 是 >=，le 是 <=。
         return {"items": app.state.store.list(limit, offset)}
 
-    @app.get("/notes/{note_id}", summary="查看单篇笔记")
-    def get_note(note_id: str):
-        # {note_id} 是路径参数，例如 /notes/abc123 会传入字符串 "abc123"。
+    def get_note(note_id):
+        """取一篇笔记，不存在时 404。下载、分析等内部流程也复用它。
+
+        返回的是库里原样的 payload——历史数据里那些"图片还没下载"的旧警告还在里面，
+        因为它们当初写进去的时候是真的。对外展示一律走 note_with_image_state()。
+        """
         note = app.state.store.get(note_id)
         if note is None:
             # None 表示没有查到；404 表示请求的资源不存在。
             raise HTTPException(404, detail="笔记不存在。")
         return note
+
+    @app.get("/notes/{note_id}", summary="查看单篇笔记")
+    def view_note(note_id: str):
+        # {note_id} 是路径参数，例如 /notes/abc123 会传入字符串 "abc123"。
+        return note_with_image_state(get_note(note_id))
 
     def purge_note(note_id, delete_tasks=True):
         """删掉一篇笔记的全部痕迹：数据库行 + 磁盘图片。
@@ -1440,6 +1462,20 @@ def create_app(db_path=DEFAULT_DB, media_root=None):
             item["file_available"] = ready
             item["file_url"] = f"/assets/{item['id']}/file" if ready else None
         return items
+
+    def note_with_image_state(note):
+        """把笔记里的图片提示换成按当前真实状态现算的版本。
+
+        payload 里的 warnings 记的是"导入那一刻"的范围：图片下载完、图片文字读完之后，
+        其中一部分就成了假话，而且没有任何代码会回头改它。界面因此出现过自相矛盾——
+        徽章写着"未下载"，下面图片区却写着"已保存 7 / 共 7 张"。这里丢掉过期说法，
+        再按 assets / image_text 现算一条，让两处说的是同一件事。
+        """
+        assets = asset_items(note["note_id"])
+        warnings = strip_stale_image_warnings(note.get("warnings") or [])
+        derived = image_state_warnings(assets, note.get("image_text"),
+                                       expected_total=len(note.get("images") or []))
+        return {**note, "warnings": warnings + derived}
 
     @app.post("/notes/{note_id}/assets/download", summary="下载图片；重复执行会跳过已有完整文件")
     def download_assets(note_id: str):

@@ -310,3 +310,71 @@ def test_batch_import_reports_image_failure_without_losing_the_note(tmp_path, mo
         assert result["items"][0]["status"] == "imported"
         assert result["items"][0]["images"] == {"total": 1, "saved": 0, "failed": 1}
         assert client.get("/notes/abc123").status_code == 200
+
+
+# ---------------------- 详情页的图片提示以真实文件为准 ----------------------
+# 真机现场：一篇 7/7 都已落盘的笔记，详情页徽章还写着"图片仅保存远程地址，未下载、
+# 未进行文字识别"，同一页的图片区却写着"已保存 7 / 共 7 张"，用户点下载得到
+# "跳过已有 7 张"——三条信息互相打脸。根因是那句警告写死在导入那一刻的 payload 里，
+# 之后没有任何代码会回头改它。下面是修复后的对外契约。
+
+
+def legacy_note(path, urls, image_text=None):
+    """造一篇"老数据"：payload 里还带着会过期的那句图片警告。"""
+    note = {"note_id": "abc123", "title": "test", "content": "正文够长" * 20,
+            "images": urls,
+            "warnings": ["图片仅保存远程地址，未下载、未进行文字识别。"]}
+    if image_text is not None:
+        note["image_text"] = image_text
+    NoteStore(path).save(note)
+    return path
+
+
+def test_detail_hint_follows_the_files_not_the_import_snapshot(tmp_path, mock_network):
+    """图片已经落盘时，详情接口不得再说"未下载"。"""
+    mock_network(lambda request: httpx.Response(200, content=picture_bytes()))
+    path = legacy_note(tmp_path / "test.sqlite3", [CDN])
+    with TestClient(create_app(path)) as client:
+        assert client.post("/notes/abc123/assets/download").json()["downloaded"] == 1
+        warnings = client.get("/notes/abc123").json()["warnings"]
+        assert not any("未下载" in w for w in warnings)
+        # 图在盘上、但没读过图，这时该说的是"还没识别文字"，不是"没下载"。
+        assert any("都已保存在本地" in w and "补读图片" in w for w in warnings)
+
+
+def test_detail_hint_stays_silent_when_images_and_text_are_both_there(tmp_path, mock_network):
+    """图和图里的文字都齐了，就不该再有图片相关的提醒。"""
+    mock_network(lambda request: httpx.Response(200, content=picture_bytes()))
+    vision_warning = "已用视觉模型识别 1 张图片，完整内容见 image_text，可直接引用。"
+    path = legacy_note(tmp_path / "test.sqlite3", [CDN], image_text="图里读出来的字")
+    with TestClient(create_app(path)) as client:
+        NoteStore(path).update_note_fields("abc123", {"warnings": [vision_warning]})
+        client.post("/notes/abc123/assets/download")
+        assert client.get("/notes/abc123").json()["warnings"] == [vision_warning]
+
+
+def test_detail_hint_reports_partial_saves_with_counts(tmp_path, mock_network):
+    """只存下一部分时要说出张数，不能笼统说"已保存"。"""
+    data = picture_bytes()
+
+    def handler(request):
+        # 第一张能存，第二张按真机那样 403。
+        return httpx.Response(200, content=data) if str(request.url) == CDN else httpx.Response(403)
+
+    mock_network(handler)
+    path = legacy_note(tmp_path / "test.sqlite3", [CDN, CDN + "2"])
+    with TestClient(create_app(path)) as client:
+        client.post("/notes/abc123/assets/download")
+        warnings = client.get("/notes/abc123").json()["warnings"]
+        assert any("已保存 1/2" in w and "其余 1 张未保存" in w for w in warnings)
+
+
+def test_detail_hint_counts_payload_images_even_without_asset_rows(tmp_path):
+    """还没有资产记录时也要按 payload 的张数说话，不能算成"没有图片"。"""
+    path = tmp_path / "test.sqlite3"
+    NoteStore(path).save({"note_id": "abc123", "title": "test", "content": "正文",
+                          "images": [CDN, CDN + "2", CDN + "3"]})
+    with TestClient(create_app(path)) as client:
+        assert client.get("/notes/abc123/assets").json()["items"] == []
+        warnings = client.get("/notes/abc123").json()["warnings"]
+        assert any("3 张图片只有远程地址" in w for w in warnings)

@@ -139,7 +139,9 @@ def test_image_only_note_warns_that_content_is_in_pictures():
     """正文只剩话题标签时，必须如实警告，否则模型会把空壳当正文。"""
     note = note_from_feed_detail(feed_detail_payload(desc="#面经[话题]# #ai[话题]#"))
     assert any("主要内容在图片里" in w for w in note["warnings"])
-    assert any("临时地址" in w for w in note["warnings"])
+    # 但"图片还没下载、地址是临时的"不能写进来：同一轮就会落盘，写进去就成了
+    # 一条没人会改的假警告（详情页据此长期显示"未下载"）。
+    assert not any("未下载" in w or "临时地址" in w for w in note["warnings"])
 
 
 def test_many_topic_tags_still_count_as_empty_body():

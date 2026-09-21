@@ -153,8 +153,11 @@ def parse_note(html: str, final_url: str, requested_url: str | None = None) -> d
             if isinstance(image_url, str) and image_url.startswith(("https://", "http://")):
                 images.append(image_url)
         kind = note.get("type", "unknown")
-        # warnings 提醒客户端当前导入的范围，避免把“图片地址”误当成已识别的知识。
-        warnings = ["图片仅保存远程地址，未下载、未进行文字识别。"] if images else []
+        # 这里不再写"图片只存了远程地址、未下载"那句：它在采集这一刻为真，但同一轮
+        # 落盘之后就成了假话，而 payload 里的警告没人会回头改（详情页因此自相矛盾）。
+        # 存储状态与识别状态都随后的动作而变，改由读取时按 assets / image_text 现算，
+        # 见 media.image_state_warnings。
+        warnings = []
         if kind == "video":
             warnings.append("只导入视频笔记的文字描述，未提取或转写视频。")
         return {"note_id": note_id, "title": title, "content": content,
