@@ -841,3 +841,8 @@ body.theme-dark .fchip.on { background: var(--primary-soft); }
   cursor: default;
 }
 .mem-archived { opacity: .7; }
+
+/* 导入结果要逐条说清失败原因，所以允许多行；有失败时换成警告色——
+   一行灰色小字会被当成无关紧要的提示，而这里可能是整批都没进来。 */
+#import-result { white-space: pre-line; }
+#import-result.error { color: var(--danger); }

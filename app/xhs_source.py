@@ -48,20 +48,46 @@ BREAKER_SECONDS = float(os.getenv("XHS_MCP_BREAKER_SECONDS", "60"))
 
 _blocked_until = 0.0
 
+# 最近一次 MCP 采集失败的类别。采集失败时用户只会看到"这条链接没导进来"，
+# 看不出是"本地采集服务没开"（几十条全失败，一条命令就能救）还是"这条笔记本身
+# 有问题"（只坏这一条）。两者要用户做的事完全不同，所以通道状态必须单独记下来。
+# 注意别和上面的 MCP_TIMEOUT（秒数）重名，那是超时预算，不是故障类别。
+MCP_UNAVAILABLE = "unavailable"
+MCP_TIMED_OUT = "timeout"
+
+_mcp_failure: str | None = None
+
 
 def reset_breaker():
     """清空熔断状态；测试与手动恢复时使用。"""
-    global _blocked_until
+    global _blocked_until, _mcp_failure
     _blocked_until = 0.0
+    _mcp_failure = None
 
 
 def circuit_open() -> bool:
     return time.monotonic() < _blocked_until
 
 
-def _trip_breaker():
-    global _blocked_until
+def mcp_failure() -> str | None:
+    """最近一次 MCP 通道的故障类别；通道是通的时候返回 None。"""
+    return _mcp_failure
+
+
+def clear_mcp_failure():
+    """清掉故障标记，只清标记不动熔断状态。
+
+    批量导入在开工前调一次，这样批末读到的就是"这一批里 MCP 有没有坏"，
+    而不是被上一批的旧故障顶着。
+    """
+    global _mcp_failure
+    _mcp_failure = None
+
+
+def _trip_breaker(reason: str):
+    global _blocked_until, _mcp_failure
     _blocked_until = time.monotonic() + BREAKER_SECONDS
+    _mcp_failure = reason
 
 
 async def collect_via_mcp(url: str) -> dict | None:
@@ -95,21 +121,24 @@ async def collect_via_mcp(url: str) -> dict | None:
             fetch_feed_detail(ref["feed_id"], ref["xsec_token"]), MCP_TIMEOUT
         )
     except asyncio.TimeoutError:
-        _trip_breaker()
+        _trip_breaker(MCP_TIMED_OUT)
         logger.warning("xhs_source_mcp_timeout timeout=%s", MCP_TIMEOUT)
         return None
     except XhsMcpUnavailable:
-        _trip_breaker()
+        _trip_breaker(MCP_UNAVAILABLE)
         logger.warning("xhs_source_mcp_unavailable", exc_info=True)
         return None
 
     try:
-        return note_from_feed_detail(payload)
+        note = note_from_feed_detail(payload)
     except XhsLinkError as exc:
         # 通道是通的，只是这篇的结果不合规（内容受限、字段变化等），
         # 换网页解析再试一次即可，不需要熔断。
         logger.info("xhs_source_mcp_payload_rejected code=%s", exc.code)
         return None
+    # 通道这次是通的：清掉上一次的故障标记，避免一条旧故障让整批都顶着提示。
+    clear_mcp_failure()
+    return note
 
 
 def parse_html_note(parser, html, final_url, requested_url):

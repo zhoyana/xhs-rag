@@ -13,6 +13,8 @@ plan_flow_checkpoints.sqlite3
 /data/
 *.log
 uvicorn.*.log
+# 轮转后的日志（server_real.log.prev、server_real.log.20260918 之类）
+*.log.*
 *.lock
 # 本地密钥文件绝不能提交到 Git，也不要发给别人。
 .env

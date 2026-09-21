@@ -461,14 +461,43 @@ async function analyzeNote(noteId) {
   } catch (e) { toast(e.message, true); }
 }
 
+// 采集服务没开是这个项目里"一整批全失败"最常见的原因，而它用户自己能修
+// （去启动那个 exe）。所以单独给一句可操作的提示，而不是让人对着
+// "失败 12 条"猜是链接的问题还是系统坏了。
+const COLLECTOR_HINTS = {
+  unavailable: "本地采集服务（xiaohongshu-mcp，端口 18060）没启动或未登录，"
+    + "已退回网页解析；小红书网页拿不到笔记数据，所以整批都失败。启动采集服务后重试即可。",
+  timeout: "本地采集服务 60 秒内没有返回，已退回网页解析。先确认它是不是僵死了，再重试。",
+};
+
+// 失败原因按"原因"归并而不是逐条列：一批里同样一句错误重复十几遍没有信息量。
+function failureReasons(result) {
+  const counted = new Map();
+  for (const item of result.items || []) {
+    if (item.status !== "failed") continue;
+    const why = item.error || "原因未知";
+    counted.set(why, (counted.get(why) || 0) + 1);
+  }
+  return [...counted.entries()].sort((a, b) => b[1] - a[1]);
+}
+
 async function importBatch() {
   const text = $("#import-box").value.trim();
   if (!text) { toast("请先粘贴链接", true); return; }
   $("#btn-import").disabled = true;
   try {
     const r = await api("POST", "/notes/import-batch", { share_text: text });
-    $("#import-result").textContent =
-      `成功 ${r.succeeded} · 失败 ${r.failed} · 重复 ${r.duplicates}`;
+    const reasons = failureReasons(r);
+    // 结果区把所有事实都摆出来：成功几条、失败几条并给出原因。
+    // 只报"成功 0"，用户既不知道是链接的问题还是环境的问题。
+    let summary = `成功 ${r.succeeded} · 失败 ${r.failed} · 重复 ${r.duplicates}`;
+    if (r.failed && COLLECTOR_HINTS[r.collector_mcp]) {
+      summary += `\n${COLLECTOR_HINTS[r.collector_mcp]}`;
+    }
+    for (const [why, count] of reasons) summary += `\n${count} 条失败：${why}`;
+    $("#import-result").textContent = summary;
+    // 有失败时不能再是一行灰色小字——那是"提示"的语气，会被当成无关紧要。
+    $("#import-result").classList.toggle("error", Boolean(r.failed));
     loadNotes();
     // 导入只是把内容存下来；真正决定知识库好不好用的是"这篇为什么被收藏、
     // 该放进哪个收藏夹"。所以导入一结束就把这几篇交给 AI 读一遍并给出建议，
@@ -482,8 +511,12 @@ async function importBatch() {
     if (fresh.length) {
       toast(`导入 ${r.succeeded} 条，AI 开始整理…`);
       enqueuePrepare(fresh);
+    } else if (r.failed) {
+      // 这一支以前不问青红皂白地说"导入成功 0 条"，把整批失败说成了成功。
+      const why = reasons.length ? `：${reasons[0][0]}` : "";
+      toast(`导入失败 ${r.failed} 条${why}`, true);
     } else {
-      toast(`导入成功 ${r.succeeded} 条`);
+      toast(`没有新增：这 ${r.duplicates} 条都是已收藏的`);
     }
   } catch (e) { toast(e.message, true); }
   finally { $("#btn-import").disabled = false; }
