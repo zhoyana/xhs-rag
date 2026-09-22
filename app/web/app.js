@@ -1165,7 +1165,9 @@ function stepEl(t) {
   const label = TOOL_LABELS[t.name] || t.name;
   const bits = [];
   if (t.result_count != null) bits.push(`${t.result_count} 条命中`);
-  if (t.top_score != null) bits.push(`最高分 ${Number(t.top_score).toFixed(2)}`);
+  // 混合检索下 top_score 是 RRF 融合分（0.01 量级），显示向量分才有可比性。
+  const topScore = t.top_vector_score != null ? t.top_vector_score : t.top_score;
+  if (topScore != null) bits.push(`最高分 ${Number(topScore).toFixed(2)}`);
   if (t.duration_ms != null) bits.push(`${(t.duration_ms / 1000).toFixed(1)}s`);
   if (failed) bits.push(t.error_code || "失败");
   if (t.ok === null || t.ok === undefined) bits.push("进行中…");
@@ -1210,10 +1212,16 @@ function hitsEl(meta) {
   for (const h of hits) {
     const row = document.createElement("div");
     row.className = "hit";
-    const score = typeof h.score === "number" ? h.score.toFixed(3) : "?";
+    // score 在混合检索下是 RRF 融合分（0.01 量级），直接显示会像"相关度极低"；
+    // 有 vector_score 时优先用它——那才是有物理含义的余弦相似度。
+    const shown = h.vector_score != null ? h.vector_score : h.score;
+    const score = typeof shown === "number" ? shown.toFixed(3) : "?";
+    // 来源标签是混合检索唯一能自证的地方：这条是关键词捞回来的，还是向量本来就有。
+    const channels = Array.isArray(h.channels) ? h.channels : [];
+    const via = channels.length > 1 ? " · 关键词+向量" : channels.length === 1 ? ` · ${channels[0] === "keyword" ? "关键词" : "向量"}` : "";
     row.innerHTML = `<div class="hit-head">
       <button class="hit-title"></button>
-      <span class="hit-score">相关度 ${escapeHtml(score)}</span>
+      <span class="hit-score">相关度 ${escapeHtml(score)}${escapeHtml(via)}</span>
     </div>
     <div class="hit-snippet"></div>`;
     const title = row.querySelector(".hit-title");
@@ -1504,7 +1512,8 @@ function traceNodeEl(trace, index) {
   const bits = [];
   if (trace.duration_ms != null) bits.push(`${(trace.duration_ms / 1000).toFixed(2)}s`);
   if (trace.result_count != null) bits.push(`${trace.result_count} 条`);
-  if (trace.top_score != null) bits.push(`top ${Number(trace.top_score).toFixed(2)}`);
+  const traceTop = trace.top_vector_score != null ? trace.top_vector_score : trace.top_score;
+  if (traceTop != null) bits.push(`top ${Number(traceTop).toFixed(2)}`);
   if (failed) bits.push(trace.error_code || "失败");
   if (trace.ok === null || trace.ok === undefined) bits.push("进行中");
   node.innerHTML = `<span class="trace-step">第 ${index + 1} 步</span>

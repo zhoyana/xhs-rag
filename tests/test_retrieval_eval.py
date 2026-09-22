@@ -13,7 +13,10 @@ def load_cases():
 
 def test_retrieval_eval_schema():
     cases = load_cases()
-    assert 5 <= len(cases) <= 10
+    # 题量只锁一个合理区间，不锁死具体数字：评测集是会持续扩充的资产，
+    # 写死 10 会让每次加题都变成一次测试失败。这里真正要保护的是
+    # 标注格式和无答案样本，不是题数本身。
+    assert 10 <= len(cases) <= 40
     assert len({case["id"] for case in cases}) == len(cases)
     assert any(not case["relevant_note_ids"] for case in cases), "至少保留一条无答案问题。"
 

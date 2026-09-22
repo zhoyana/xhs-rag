@@ -6,9 +6,60 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from .fts import build_match_query, segment
+
+logger = logging.getLogger(__name__)
+
 # __file__ 是当前文件路径；resolve() 转为绝对路径；parents[1] 取项目目录。
 # Path 可以用 / 拼接路径，避免手动处理 Windows 的反斜杠。
 DEFAULT_DB = Path(__file__).resolve().parents[1] / "data" / "notes.sqlite3"
+
+
+def _fts_ready(db) -> bool:
+    """当前库里有没有 FTS5 虚拟表。
+
+    FTS5 是 SQLite 的编译期扩展，自带 SQLite 的 Python 发行版通常有，
+    但不能假定（源码编译、精简发行版可能没带）。建不出来时只是少一路
+    关键词召回，整个检索仍然可用，所以这里用探测而不是硬依赖。
+    """
+    try:
+        return db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+        ).fetchone() is not None
+    except sqlite3.DatabaseError:
+        return False
+
+
+def _drop_fts_for_document(db, document_id) -> None:
+    """清理某文档在 FTS 里的行。
+
+    FTS5 只支持按 rowid 删除，所以先取出该文档旧的 chunk id 再批量删；
+    不这么做的话，chunks 换了一批新 id，旧行为就永远留在索引里，
+    表现为"删掉的正文还能搜到"。
+    """
+    if not _fts_ready(db):
+        return
+    ids = [row[0] for row in db.execute(
+        "SELECT id FROM chunks WHERE document_id = ?", (document_id,))]
+    if not ids:
+        return
+    placeholders = ",".join("?" * len(ids))
+    db.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({placeholders})", ids)
+
+
+def _insert_fts_rows(db, title, document_id, chunk_ids, chunks) -> None:
+    """把新分块写进 FTS 索引。
+
+    body 存的是单字切分后的文本，与查询侧共用 app.fts.segment——两侧分词口径
+    必须一致，否则会出现"索引建好了但一条都搜不到"这种最难排查的状态。
+    """
+    if not _fts_ready(db):
+        return
+    db.executemany(
+        "INSERT INTO chunks_fts (rowid, title, body, document_id) VALUES (?, ?, ?, ?)",
+        [(chunk_id, segment(title), segment(chunk.page_content), document_id)
+         for chunk_id, chunk in zip(chunk_ids, chunks, strict=True)],
+    )
 
 
 class NoteStore:
@@ -206,6 +257,17 @@ class NoteStore:
                 UNIQUE(chunk_id, model)
             )""")
             # 秋招知识点：BLOB 保存原始字节；SQLite 不理解向量含义，维度和 dtype 由应用保证。
+            # 全文检索索引（FTS5）。rowid 直接对齐 chunks.id，删除时按 rowid 定位即可，
+            # 不用额外维护一张 id 映射表。title / body 两列分开存是为了让 bm25() 能按列
+            # 加权——标题命中的价值高于正文命中，这一层权重在查询时给。
+            # body 里存的是**单字切分后**的文本（见 app.fts）：FTS5 内置分词器会把连续
+            # 汉字当成一个 token，中文短查询因此永远匹配不上，必须自己先切开。
+            try:
+                db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+                    USING fts5(title, body, document_id UNINDEXED)""")
+            except sqlite3.OperationalError:
+                # 这个 Python 自带的 SQLite 没编 FTS5：关键词那一路缺席，向量路照常。
+                logger.warning("fts5_unavailable 关键词检索将退化为不可用")
 
     def ensure_assets(self, note):
         # enumerate(..., 1) 从 1 开始编号，保留原笔记图片顺序。
@@ -796,7 +858,10 @@ class NoteStore:
                     (note["title"], document.page_content, document.metadata["source_type"],
                      document.metadata["source_url"], content_hash, now, document_id))
                 # chunks 是可重建的派生数据；只替换当前文档的旧分块。
-                # Chunk 即将替换，先清理依赖旧 chunk_id 的派生向量，避免孤儿记录。
+                # Chunk 即将替换，先清理依赖旧 chunk_id 的派生数据，避免孤儿记录：
+                # FTS 行必须赶在 chunks 删除**之前**清——之后按 document_id 就查不到
+                # 旧 id 了，而新分块很可能复用同一个 rowid，插入时直接撞唯一约束。
+                _drop_fts_for_document(db, document_id)
                 db.execute("""DELETE FROM embeddings WHERE chunk_id IN
                     (SELECT id FROM chunks WHERE document_id = ?)""", (document_id,))
                 db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
@@ -810,13 +875,19 @@ class NoteStore:
                      content_hash, now, now))
                 document_id = cursor.lastrowid
 
-            db.executemany("""INSERT INTO chunks
-                (document_id, chunk_index, content, content_hash, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)""", [
-                (document_id, chunk.metadata["chunk_index"], chunk.page_content,
-                 chunk.metadata["content_hash"], json.dumps(chunk.metadata, ensure_ascii=False), now)
+            # 逐条插入而不是 executemany，是为了拿到每条 Chunk 的 rowid——
+            # FTS 索引的 rowid 必须与它一致，否则删除时对不上号。
+            # 插入条数等于分块数（几十条量级），这点开销换索引可维护性是划算的。
+            chunk_ids = [
+                db.execute("""INSERT INTO chunks
+                    (document_id, chunk_index, content, content_hash, metadata_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (document_id, chunk.metadata["chunk_index"], chunk.page_content,
+                     chunk.metadata["content_hash"],
+                     json.dumps(chunk.metadata, ensure_ascii=False), now)).lastrowid
                 for chunk in chunks
-            ])
+            ]
+            _insert_fts_rows(db, note["title"], document_id, chunk_ids, chunks)
         return self.document_for_note(note["note_id"]), True
 
     def document_for_note(self, note_id):
@@ -887,6 +958,78 @@ class NoteStore:
             item["metadata"] = json.loads(item.pop("metadata_json"))
             results.append(item)
         return results
+
+    def search_chunks_fts(self, query, limit=30):
+        """BM25 关键词检索；FTS 索引未建或查询里没有可用字词时返回空列表。
+
+        返回项的 bm25_score 已取负号，变成"越大越相关"，与向量余弦分同向，
+        两路分数可以并列展示。FTS5 的 bm25() 本身是越小越相关，且不返回
+        原始词频统计——这是刻意的不透明，排序能力靠它、解释能力不靠它。
+
+        title 权重给 5.0：标题命中「秋招时间线」比正文某处顺带提到它更能说明
+        这篇笔记就是用户在找的。权重是拍的经验值，改动前先看评测集指标。
+        """
+        match = build_match_query(query)
+        if not match:
+            return []
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            if not _fts_ready(db):
+                return []
+            try:
+                rows = db.execute("""SELECT f.rowid AS chunk_id,
+                        -bm25(chunks_fts, 5.0, 1.0) AS bm25_score,
+                        c.chunk_index, c.content, c.metadata_json,
+                        d.id AS document_id, d.note_id, d.title, d.source_url
+                    FROM chunks_fts f
+                    JOIN chunks c ON c.id = f.rowid
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE chunks_fts MATCH ?
+                    ORDER BY bm25_score DESC
+                    LIMIT ?""", (match, limit)).fetchall()
+            except sqlite3.OperationalError:
+                # 极端输入仍可能被 FTS5 判为语法错误。关键词这一路退化为空，
+                # 让向量路把这一轮答完，而不是把 500 抛给用户。
+                logger.warning("fts_query_failed 已跳过关键词召回 query_len=%s", len(query))
+                return []
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            results.append(item)
+        return results
+
+    def rebuild_fts_index(self):
+        """按 chunks 全量重建 FTS 索引，可重复执行。
+
+        引入混合检索之前建好的库只有 chunks、没有 FTS 行，需要跑一次补齐。
+        索引内容能由 chunks + documents 完整重算，所以这是纯派生数据重建，
+        失败或重复执行都不会伤到笔记原文。
+        """
+        with closing(sqlite3.connect(self.path)) as db, db:
+            if not _fts_ready(db):
+                return {"status": "unavailable", "indexed": 0}
+            db.row_factory = sqlite3.Row
+            db.execute("DELETE FROM chunks_fts")
+            rows = db.execute("""SELECT c.id, c.document_id, c.content, d.title
+                FROM chunks c JOIN documents d ON d.id = c.document_id
+                ORDER BY c.id""").fetchall()
+            if rows:
+                db.executemany(
+                    "INSERT INTO chunks_fts (rowid, title, body, document_id) VALUES (?, ?, ?, ?)",
+                    [(row["id"], segment(row["title"]), segment(row["content"]),
+                      row["document_id"]) for row in rows])
+        return {"status": "rebuilt", "indexed": len(rows)}
+
+    def fts_stats(self):
+        """关键词索引的覆盖情况，用于判断老库是否还需要补建。"""
+        with closing(sqlite3.connect(self.path)) as db:
+            if not _fts_ready(db):
+                return {"available": False, "chunks": 0, "fts_rows": 0, "in_sync": False}
+            chunks = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            indexed = db.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        return {"available": True, "chunks": chunks, "fts_rows": indexed,
+                "in_sync": chunks == indexed}
 
     def analysis(self, note_id):
         """读取某篇笔记已有的 AI 分析；从未分析时返回 None。"""

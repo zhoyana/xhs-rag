@@ -227,6 +227,11 @@ class SearchRequest(BaseModel):
     deduplicate_notes: bool = Field(
         default=True, description="是否限制每篇笔记最多返回一个最高分 Chunk"
     )
+    mode: Literal["vector", "hybrid"] = Field(
+        default="hybrid",
+        description="hybrid=关键词与向量双路召回后按 RRF 融合；vector=仅向量余弦，"
+                    "保留它是为了做消融对比，不是默认行为",
+    )
 
 
 class ThreadCreateRequest(BaseModel):
@@ -365,6 +370,12 @@ def create_app(db_path=DEFAULT_DB, media_root=None, case_dir=None):
         app.state.media_root = Path(media_root) if media_root else Path(db_path).parent / "media"
         # 第一版使用单进程锁，避免重复点击同时下载；不能当作多进程任务队列使用。
         app.state.media_lock = Lock()
+        # 引入混合检索之前建好的库只有 chunks、没有关键词索引，不补一次的话
+        # 关键词这一路会静默缺席（检索仍能用，只是退化成纯向量，很难被发现）。
+        # 检查是常数级的，只有确实不同步时才重建，所以放在启动路径上是安全的。
+        fts = app.state.store.fts_stats()
+        if fts["available"] and not fts["in_sync"]:
+            logger.info("fts_index_rebuild %s", app.state.store.rebuild_fts_index())
         # yield 把控制权交回框架，让服务开始处理请求；关闭时会继续执行其后的代码。
         yield
 
@@ -1442,21 +1453,37 @@ def create_app(db_path=DEFAULT_DB, media_root=None, case_dir=None):
             raise HTTPException(404, detail="文档不存在或尚无分块。")
         return result
 
-    @app.post("/search", summary="使用 Embedding 余弦相似度检索知识库")
+    @app.post("/search", summary="混合检索知识库（关键词 + 向量，RRF 融合）")
     def semantic_search(body: SearchRequest):
+        # 默认走 hybrid：关键词路认专有名词与精确短语，向量路认语义近义，
+        # 单靠后者时"型号、术语、缩写"这类中文短查询最容易失手。
         selected = search_knowledge(
             app.state.store, body.query.strip(), body.top_k, body.deduplicate_notes,
-            query_embedder=embed_search_query,
+            query_embedder=embed_search_query, mode=body.mode,
         )
         if not selected:
             raise HTTPException(409, detail="知识库中还没有可检索向量，请先建立索引并生成 Embedding。")
+        fts = app.state.store.fts_stats()
         return {
             "query": body.query.strip(),
             "model": EMBEDDING_MODEL,
+            "retrieval_mode": body.mode,
             "total_candidates": len(app.state.store.searchable_embeddings(EMBEDDING_MODEL)),
+            # 关键词索引没建出来（本机 SQLite 无 FTS5）时返回 null，
+            # 让调用方能区分"没有命中"和"这一路根本没启用"。
+            "fts_rows": fts["fts_rows"] if fts["available"] else None,
             "deduplicated_notes": body.deduplicate_notes,
             "items": selected,
         }
+
+    @app.post("/search/rebuild-index", summary="重建关键词索引（FTS5）")
+    def rebuild_search_index():
+        """把 chunks 全量重建成 FTS 索引，供引入混合检索前建好的老库补齐。
+
+        纯派生数据重建：只读 chunks 与 documents，不动笔记原文、图片和向量，
+        可以重复执行。
+        """
+        return app.state.store.rebuild_fts_index()
 
     def asset_items(note_id):
         # 只在文件存在且指纹一致时提供访问地址，不暴露本机绝对路径。

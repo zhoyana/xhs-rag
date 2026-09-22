@@ -79,7 +79,11 @@ def test_semantic_search_returns_most_related_chunk(tmp_path, monkeypatch):
         for note in notes:
             document = client.post(f"/notes/{note['note_id']}/index").json()["document"]
             client.post(f"/documents/{document['id']}/embed")
-        result = client.post("/search", json={"query": "怎么做预测基线？", "top_k": 1})
+        # 显式走 vector：这条用例测的是"余弦相似度把语义最近的那篇排第一"，
+        # 与混合检索的融合排序是两件事。不指定的话默认走 hybrid，
+        # 关键词路一命中分数就换成 RRF 融合分，这条断言会变成在测别的东西。
+        result = client.post("/search", json={
+            "query": "怎么做预测基线？", "top_k": 1, "mode": "vector"})
 
     assert result.status_code == 200
     body = result.json()

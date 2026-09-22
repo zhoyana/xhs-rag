@@ -8,3 +8,14 @@
 {"id":"q008","query":"如何把 AI 项目整理成 STAR 简历描述并准备模拟面试？","relevant_note_ids":["6a0960f500000000080319ce"],"difficulty":"medium","reason":"该笔记覆盖 STAR 项目描述、量化指标和模拟面试演练，与查询的多个要点一一对应。"}
 {"id": "q009","query": "我想做饭，给我推荐一个菜谱？","relevant_note_ids": ["6a053a8c000000000803123c","69f59c8e000000002003b703"],"difficulty": "easy","reason": "知识库中裤带面和沙拉笔记都提供了食材与做法；考察宽泛菜谱需求下的多结果召回。"}
 {"id":"q010","query":"汽车发动机出现异响应该怎样维修？","relevant_note_ids":[],"difficulty":"no_answer","reason":"知识库中无汽车维修内容，预期不应返回任何相关笔记；用于评估系统在无答案场景下是否会强行返回伪相关结果（no_answer 测试）。"}
+{"id":"q011","query":"TFMixer 是解决什么问题的","relevant_note_ids":["6a94ead10000000025011119"],"difficulty":"hard","reason":"TFMixer 是只在一篇笔记里出现过的专有名词，512 维小模型对这类低频词区分度弱，容易召回到别的时序笔记；考察关键词精确匹配能力。"}
+{"id":"q012","query":"ConFlux 在多少个数据集上做了实验","relevant_note_ids":["6a94ead10000000025011119"],"difficulty":"hard","reason":"查询同时含专有名词 ConFlux 和数字，纯向量容易把语义相近的其他时序笔记排上来；是混合检索的主要增益场景。"}
+{"id":"q013","query":"Hermes Agent 的 MEMORY.md 大概有多大","relevant_note_ids":["69ff02ff0000000023006644"],"difficulty":"hard","reason":"MEMORY.md 是笔记里的文件名式专有名词，向量路难以表达“文件名”这种精确符号；考察关键词路对符号串的命中。"}
+{"id":"q014","query":"Honcho 在 Hermes 记忆系统里起什么作用","relevant_note_ids":["69ff02ff0000000023006644"],"difficulty":"hard","reason":"Honcho 只在 Hermes 笔记中出现，属于极低频专有名词；考察系统能否靠关键词把无关的 Agent 笔记排除掉。"}
+{"id":"q015","query":"DLinear 和 Seasonal Naive 哪个更适合先跑基线","relevant_note_ids":["6a982cac0000000011035f54","6a9998e9000000002601c8b3"],"difficulty":"hard","reason":"两篇笔记都点名了 DLinear 与 Seasonal Naive 这类简单模型，但一篇讲基线选择、一篇讲删减复杂模型；考察多结果召回与专有名词精确匹配。"}
+{"id":"q016","query":"ICML 2026 时间序列方向录用了几篇","relevant_note_ids":["6a94ead10000000025011119"],"difficulty":"hard","reason":"查询含会议名缩写与年份数字，笔记正文里是原样出现的“ICML 2026”“158 篇”；考察数字与缩写的精确匹配。"}
+{"id":"q017","query":"面经里问 LangGraph 和 OpenAI SDK 怎么选型","relevant_note_ids":["6aa3c6ff0000000025036dd4"],"difficulty":"hard","reason":"LangGraph / OpenAI SDK 是英文专有名词，来自淘宝面经笔记；考察对框架名的精确匹配而不是语义泛化。"}
+{"id":"q018","query":"ReAct 和 Self-reflection 两种范式的区别","relevant_note_ids":["6aa3c6ff0000000025036dd4"],"difficulty":"hard","reason":"查询由两个英文范式名组成，笔记中也是原样出现；向量路容易把其他 Agent 话题的笔记排进来。"}
+{"id":"q019","query":"用 Codex 按 JD 改造 GitHub 项目写进简历","relevant_note_ids":["6a0960f500000000080319ce"],"difficulty":"hard","reason":"查询混了 JD、GitHub、Codex、简历 四个高频词，只有一篇笔记同时命中；考察关键词路的组合命中能力。"}
+{"id":"q020","query":"Rust 的 async runtime 是怎么调度任务的","relevant_note_ids":[],"difficulty":"no_answer","reason":"知识库中没有 Rust 相关内容，用于补充无答案样本、校准拒答阈值（原先只有 1 道无答案题，阈值样本太少）。"}
+{"id":"q021","query":"Flutter 列表下拉刷新怎么做","relevant_note_ids":[],"difficulty":"no_answer","reason":"知识库中只有 Flutter 客户端代码、没有相关笔记；用于评估系统在技术栈相近但无对应内容时会不会强行返回时序/Agent 笔记。"}

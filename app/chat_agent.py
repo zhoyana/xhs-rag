@@ -169,6 +169,12 @@ def build_hits(items, limit: int = HIT_LIMIT) -> list[dict]:
             "note_id": item["note_id"],
             "title": str(item.get("title") or ""),
             "score": item.get("score"),
+            # 混合检索下 score 是 RRF 融合分，量级只有 0.01，界面直接显示会像
+            # "相关度极低"；vector_score 才是有物理含义的余弦相似度，所以两个都留：
+            # 界面显示后者，排查排序问题时看前者。channels 记下这条是关键词救回来的
+            # 还是向量本来就命中——这是混合检索唯一能自证的地方。
+            "vector_score": item.get("vector_score"),
+            "channels": item.get("channels"),
             "snippet": " ".join(str(item.get("content") or "").split())[:HIT_SNIPPET_CHARS],
         })
         if len(hits) == limit:
@@ -183,11 +189,16 @@ def build_trace(call: dict, result: dict, duration_ms: float) -> dict:
     scores = ([item.get("score") for item in data
                if isinstance(item.get("score"), (int, float))]
               if isinstance(data, list) else [])
+    # 与 hits 同一套口径：融合分决定顺序，向量分用于显示。
+    vector_scores = ([item.get("vector_score") for item in data
+                      if isinstance(item.get("vector_score"), (int, float))]
+                     if isinstance(data, list) else [])
     return {
         "name": call["name"], "args": call["args"], "ok": result.get("ok", False),
         "duration_ms": duration_ms,
         "result_count": len(data) if isinstance(data, list) else None,
         "top_score": max(scores) if scores else None,
+        "top_vector_score": max(vector_scores) if vector_scores else None,
         "error_code": (error.get("code") if isinstance(error, dict)
                        else "validation_error" if error else None),
     }
