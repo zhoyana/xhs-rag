@@ -423,6 +423,33 @@ def test_chat_agent_can_save_notes(tmp_path, monkeypatch, fake_mcp):
     assert "publish_content" not in seen["names"]
 
 
+def test_chat_agent_can_import_my_favorites(tmp_path, monkeypatch, fake_mcp):
+    """接线检查："让 Agent 帮我导收藏"这条路上，两个工具都得真的在模型视野里。
+
+    `load_xhs_tools` 的单元用例证明工具造得出来，这条证明它们被**装进了一次真实
+    对话**。两者缺一都可能出现"功能写好了但模型看不见"——那种故障只有用户点开
+    聊天才会发现。
+    """
+    fake_mcp.tools = [fake_tool("search_feeds"), fake_tool("get_feed_detail")]
+
+    seen = {}
+
+    async def fake_agent(history, tools, **_kwargs):
+        seen["names"] = {tool.name for tool in tools}
+        return {"content": "好的。", "tool_calls": [], "retrieved_note_ids": [],
+                "cited_note_ids": [], "source_note_ids": [], "plan_id": None}
+
+    monkeypatch.setattr("app.main.run_agent_turn", fake_agent)
+
+    with TestClient(create_app(tmp_path / "fav-mount.sqlite3")) as client:
+        thread_id = client.post("/threads", json={"title": "测试"}).json()["id"]
+        assert client.post(f"/threads/{thread_id}/messages",
+                           json={"content": "把我收藏的面经都存进来"}).status_code == 200
+
+    assert xhs_mcp.LIST_FAVORITES_TOOL_NAME in seen["names"]
+    assert xhs_mcp.IMPORT_FAVORITES_TOOL_NAME in seen["names"]
+
+
 # ---------------------- 本机服务不能被系统代理劫持 ----------------------
 # 真机现场：采集服务在 18060 正常监听、登录也有效，但所有 MCP 工具都加载不出来，
 # 日志只有一句 xhs_mcp_tools_unavailable，异常里是 `502 Bad Gateway for
