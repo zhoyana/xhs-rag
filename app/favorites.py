@@ -15,6 +15,7 @@
 """
 from urllib.parse import quote, urlsplit
 import re
+import time
 
 from .media import IMAGE_HOSTS
 
@@ -142,3 +143,64 @@ def parse_profile(payload) -> dict:
         })
 
     return {"profile": _profile_summary(payload), "items": items, "skipped": skipped}
+
+
+# 会话令牌（xsec_token）的有效期远长于一次对话，但也确实会过期；半小时是个折中：
+# 足够用户"先看看有哪些、过十分钟再说要哪几篇"，又不至于拿着隔夜的令牌去采集。
+DEFAULT_TOKEN_TTL = 30 * 60
+
+
+class TokenCache:
+    """记下「读收藏」那一步拿到的 xsec_token，供「导入收藏」按编号取用。
+
+    为什么要服务端记：令牌是 44 个字符的 base64，里面有 `+` `/` `=`。让模型把它
+    原样抄进下一次工具调用，等于给幻觉留了个必中的口子——抄错一个字符，表现不是
+    "报错"而是"这条采集失败"，用户看到的是"导入失败"却不知道为什么。
+    工具之间传数据的那条通道不该经过模型：模型只需要说清"要哪几篇"，令牌由服务端
+    自己接上。
+
+    单进程假设：这里就是一个带过期的 dict，进程重启即失效（下次调用会重新读一遍
+    收藏，代价是几十秒，不会有错误结果）。多实例部署时必须换成 Redis 或落库，
+    否则"A 实例读到列表、请求落到 B 实例"就会查不到令牌。
+    """
+
+    def __init__(self, ttl: float = DEFAULT_TOKEN_TTL, clock=None):
+        self._ttl = float(ttl)
+        # 注入时钟，单测里把半小时拨过去不必真的等。
+        self._clock = clock or time.monotonic
+        self._entries: dict[str, dict] = {}
+
+    def remember(self, items) -> int:
+        """记下这批条目里能用来采集的那些（缺令牌的条目本来就采不了）。"""
+        now = self._clock()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            feed_id = _text(item.get("feed_id"))
+            token = _text(item.get("xsec_token"))
+            if feed_id and token:
+                self._entries[feed_id] = {
+                    "xsec_token": token,
+                    "title": _text(item.get("title")),
+                    "at": now,
+                }
+        self._expire(now)
+        return len(self._entries)
+
+    def feed_ids(self) -> list[str]:
+        """当前还能用的编号，按记下的顺序（= 收藏列表的展示顺序）。"""
+        self._expire(self._clock())
+        return list(self._entries)
+
+    def entry(self, feed_id) -> dict | None:
+        self._expire(self._clock())
+        found = self._entries.get(_text(feed_id))
+        return dict(found) if found else None
+
+    def forget_all(self) -> None:
+        self._entries.clear()
+
+    def _expire(self, now: float) -> None:
+        for feed_id in [k for k, v in self._entries.items()
+                        if now - v["at"] > self._ttl]:
+            del self._entries[feed_id]

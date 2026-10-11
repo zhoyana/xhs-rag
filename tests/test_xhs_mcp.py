@@ -377,16 +377,28 @@ def test_collect_tool_stays_read_only(tmp_path):
 
 
 def test_save_tool_is_mounted_only_when_a_store_is_available(fake_mcp):
-    """写工具必须挂在某个知识库上；没有库就不该出现在工具列表里。"""
+    """写工具必须挂在某个知识库上；没有库就不该出现在工具列表里。
+
+    读收藏（list_my_favorites）是只读的，但它和导入工具成对使用，所以一起随
+    store 挂载：留着单独一个"只能看不能导"的入口，模型只会多一次无效调用。
+    """
     fake_mcp.tools = [fake_tool("search_feeds"), fake_tool("get_feed_detail")]
 
     without_store = [t.name for t in run(xhs_mcp.load_xhs_tools())]
     assert xhs_mcp.SAVE_TOOL_NAME not in without_store
+    assert xhs_mcp.IMPORT_FAVORITES_TOOL_NAME not in without_store
 
     with_store = [t.name for t in run(xhs_mcp.load_xhs_tools(
         store=object(), media_root="C:/tmp"))]
-    assert with_store[-1] == xhs_mcp.SAVE_TOOL_NAME
     assert with_store[:2] == ["search_feeds", "get_feed_detail"]
+    # 白名单工具在前，本地补的四个工具跟在后面（顺序无关紧要，成员关系才是契约）：
+    # 按链接采集 + 按链接收藏 + 读收藏夹 + 导入收藏夹。
+    assert set(with_store[2:]) == {"collect_note_by_link", xhs_mcp.SAVE_TOOL_NAME,
+                                   xhs_mcp.LIST_FAVORITES_TOOL_NAME,
+                                   xhs_mcp.IMPORT_FAVORITES_TOOL_NAME}
+
+    # 不传 store 时"按链接采集"仍然在（它不落库），但三写/读收藏的入口一个都不该有。
+    assert "collect_note_by_link" in without_store
 
 
 def test_chat_agent_can_save_notes(tmp_path, monkeypatch, fake_mcp):

@@ -1100,6 +1100,10 @@ const TOOL_LABELS = {
   get_feed_detail: "读笔记详情",
   collect_note_by_link: "按链接采集",
   save_note_by_link: "收藏进知识库",
+  // 这两个一个只读一个写，标签上也分开——"读收藏"要等几十秒是正常的，
+  // 标签里带「收藏夹」三个字，用户在路径图上就知道它在读自己的账号。
+  list_my_favorites: "读我的收藏夹",
+  import_my_favorites: "导入收藏夹",
 };
 
 const chatState = {

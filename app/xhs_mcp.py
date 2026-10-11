@@ -1,10 +1,10 @@
 """xiaohongshu-mcp 桥接：把外部 MCP 服务的读类工具挂进本地 Agent。
 
 xiaohongshu-mcp（github.com/xpzouying/xiaohongshu-mcp）以 Streamable HTTP
-协议提供 MCP 服务（默认 http://localhost:18060/mcp）。本模块做五件事：
+协议提供 MCP 服务（默认 http://localhost:18060/mcp）。本模块做六件事：
 连接、按白名单过滤、把"粘链接采集"补成本地工具、把"收藏进知识库"补成本地工具、
-失败降级。MCP 工具与本地工具在 LangChain 里是同一抽象（BaseTool /
-StructuredTool），因此 Agent 循环（run_agent_turn）零改动。
+把"读收藏夹 / 导入收藏夹"补成本地工具、失败降级。MCP 工具与本地工具在 LangChain
+里是同一抽象（BaseTool / StructuredTool），因此 Agent 循环（run_agent_turn）零改动。
 """
 import asyncio
 import json
@@ -19,7 +19,7 @@ from langchain_core.tools import StructuredTool
 from .media import download_note_assets
 from .xhs_link import XhsLinkError, expand_short_link, note_from_feed_detail, parse_xhs_link
 from .xhs_vision import apply_image_text, transcribe_images
-from . import indexing
+from . import favorites, indexing
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +81,40 @@ SAVE_TOOL_DESCRIPTION = (
     "必须按返回值如实汇报，不要编造保存结果。"
 )
 
+LIST_FAVORITES_TOOL_NAME = "list_my_favorites"
+LIST_FAVORITES_DESCRIPTION = (
+    "读取当前登录账号自己的小红书收藏夹，返回编号、标题、作者和是否已在知识库里。"
+    "用户问「我收藏了什么」「收藏里有没有讲某某的」时用它；只读，不写库。"
+    "三个必须如实转达的限制："
+    "① 一次只读得到首屏的收藏（最多 20 条，实测 10–20 条浮动），服务没有翻页参数，"
+    "更早的收藏读不到——被问「全部收藏」时要说明这一点，不要假装读全了；"
+    "② 这次调用要等几十秒（服务在无头浏览器里等页面渲染），而且可能失败一两次才成功，"
+    "慢和偶发失败都是正常的，不要因为慢就重复调用；"
+    "③ 返回值里的 feed_id 就是导入时要填的编号，令牌由服务端自己记住，不要追问用户。"
+)
+
+IMPORT_FAVORITES_TOOL_NAME = "import_my_favorites"
+IMPORT_FAVORITES_DESCRIPTION = (
+    "把收藏夹里的笔记导入知识库：采集正文、下载图片、建立语义索引。"
+    "用户说「把收藏存进来 / 把新收藏同步一下 / 把这几篇存进我的资料」时用它。"
+    "feed_ids 留空表示把刚读到的收藏全都要（已在知识库里的自动跳过）；只想导其中几篇时，"
+    "先调 list_my_favorites，再把要的那几篇的 feed_id 填进来。"
+    "必须先调 list_my_favorites：编号与令牌都来自那一次读取的结果，没读过、或离上次读取"
+    "超过半小时，会返回 favorites_not_listed，此时重新读一次列表即可。"
+    "导入是**串行**的（同时拉十几篇会撞小红书风控，而且图片地址会过期），"
+    "十几篇要花几分钟，慢是正常的，不要中途重复调用；也不要因为用户催就跳过某几条。"
+    "返回的 imported / existing / failed 和每条的 index.searchable 必须如实汇报："
+    "searchable 为 false 表示这篇没有可检索的正文（纯图片且没识别出文字），"
+    "不等于导入失败；failed 的那几条要在汇报里点名，不要只报成功数。"
+)
+
 _cache: list | None = None
 DEFAULT_TRANSCRIBE = transcribe_images
 DEFAULT_DOWNLOAD = download_note_assets
+
+# 读收藏拿到的会话令牌暂存在这里，供导入时按编号取回（见 favorites.TokenCache）。
+# 模块级单例：一次对话读到、下一轮对话导入，中间隔着两条 HTTP 请求。
+_favorites_cache = favorites.TokenCache()
 
 
 class XhsMcpUnavailable(Exception):
@@ -116,10 +147,34 @@ class SaveNoteInput(BaseModel):
                       description="小红书笔记链接，或包含链接的整段分享文案")
 
 
+class ListFavoritesInput(BaseModel):
+    """读收藏不需要参数：读的就是当前登录账号自己的收藏夹。
+
+    刻意留空而不是留一个 `tab` 之类的开关——能读别的 tab 就等于把"看用户在别人
+    主页上点了什么"也挂给了模型，而当前需求只到"我自己的收藏"。
+    """
+
+
+class ImportFavoritesInput(BaseModel):
+    """只接收编号：正文与令牌都由服务端从上次读取的结果里取。
+
+    令牌（44 字符 base64）刻意不进模型视野：它必须逐字符正确，抄错一个字符的后果
+    不是报错而是"这条采集失败"，排查成本极高。工具间的数据传递不该经过模型。
+    """
+
+    feed_ids: list[str] | None = Field(
+        default=None, max_length=favorites.FAVORITES_PER_PAGE,
+        description=("要导入的收藏编号（取自 list_my_favorites 的返回值）。"
+                     "留空表示把刚读到的收藏全部导入，已在知识库里的会自动跳过。"))
+
+
 def reset_cache():
     """测试与配置变更时清空缓存；生产进程内无需调用。"""
     global _cache
     _cache = None
+    # 收藏令牌一并清掉：它和 MCP 工具表一样，是"进程内的会话状态"，
+    # 用例之间串味会让"没读过列表就导入"这类断言随机通过。
+    _favorites_cache.forget_all()
 
 
 def _failure(code: str, message: str) -> dict:
@@ -339,6 +394,167 @@ def build_save_note_tool(detail_tool, store, media_root, *, transcribe=None,
     )
 
 
+def _favorites_item(feed_id: str, title: str, status: str, *, error=None,
+                    index=None, assets=None) -> dict:
+    """工具返回给模型的一条结果。字段刻意少：模型只需要能如实汇报的那几个。"""
+    item = {"feed_id": feed_id, "note_id": feed_id, "title": title, "status": status}
+    if index is not None:
+        item["searchable"] = bool(index.get("searchable"))
+        item["index_status"] = index.get("status")
+    if assets is not None:
+        item["images"] = {"total": assets.get("total", 0),
+                          "saved": assets.get("downloaded", 0) + assets.get("skipped", 0),
+                          "failed": assets.get("failed", 0)}
+    if error:
+        item["error"] = error
+    return item
+
+
+def build_favorites_tools(detail_tool, store, media_root, *, fetch=None,
+                          transcribe=None, downloader=None, collector=None,
+                          indexer=None, cache=None) -> list[StructuredTool]:
+    """收藏夹的两个工具：读列表（只读）+ 导入（写）。
+
+    为什么读和写都做成工具、而不复用界面上那个「同步收藏」面板：界面那条路要求
+    用户先切到笔记库、点按钮、勾选、再点导入，四步；而收藏这件事的意图常常是
+    一句话——"我刚收藏了几篇面经，存进来"。写工具只在传了 store 时才挂载，
+    没有知识库就自然没有这个入口。
+
+    与 `save_note_by_link` 共用 `_persist_note`，所以入库、图床下载、索引三件事
+    的行为完全一致，不会出现"从链接收藏的能搜、从收藏夹导入的搜不到"这种分叉。
+
+    秋招知识点（工具边界按**读/写**切，不按页面切）：采集只读、导入才写。这样
+    普通问答时模型视野里没有任何写入口，提示词注入要落地成"往知识库里塞东西"
+    必须先把话说成明确的导入意图。
+    """
+    fetch = fetch or fetch_my_favorites
+    transcribe = transcribe or DEFAULT_TRANSCRIBE
+    downloader = downloader or DEFAULT_DOWNLOAD
+    collector = collector or _collect_note_for_link
+    cache = cache or _favorites_cache
+
+    async def listing() -> dict:
+        try:
+            payload = await fetch()
+        except XhsMcpUnavailable as exc:
+            return _failure("favorites_unavailable", str(exc))
+        try:
+            parsed = favorites.parse_profile(payload)
+        except favorites.FavoritesError as exc:
+            return _failure(exc.code, str(exc))
+
+        # 令牌在这里进缓存、不进返回值：模型要的是"有哪几篇"，不是"怎么采"。
+        cache.remember(parsed["items"])
+        items = [{
+            "feed_id": item["feed_id"],
+            "title": item["title"],
+            "author": item["author"],
+            "in_library": store.get(item["feed_id"]) is not None,
+        } for item in parsed["items"]]
+        return {"ok": True, "data": {
+            "profile": parsed["profile"],
+            "items": items,
+            "in_library": sum(1 for item in items if item["in_library"]),
+            "skipped": parsed["skipped"],
+            # 能力边界跟着结果一起给模型，它才能回答"能不能把全部收藏都同步过来"。
+            "limit_note": favorites.LIMIT_NOTE,
+        }, "error": None}
+
+    async def importing(feed_ids: list[str] | None = None) -> dict:
+        known = cache.feed_ids()
+        if not known:
+            return _failure(
+                "favorites_not_listed",
+                "还没读到可导入的收藏（或上次读取已超过半小时）。先调用 list_my_favorites "
+                "读一次收藏列表，再导入。")
+
+        unknown = [feed_id for feed_id in (feed_ids or []) if feed_id not in known]
+        if unknown:
+            # 拒绝编造出来的编号：拿一个不存在的编号去采集，只会得到一句含糊的
+            # "采集失败"，而真实原因是模型把编号记错了——宁可让它重读一次列表。
+            return _failure(
+                "favorites_unknown_id",
+                "这些编号不在刚读到的收藏里：" + "、".join(unknown[:5])
+                + "。请重新调用 list_my_favorites 后再试。")
+
+        targets = list(feed_ids) if feed_ids else known
+        results, imported, existing, failed = [], 0, 0, 0
+        channel_error = None
+        for feed_id in targets:
+            entry = cache.entry(feed_id) or {}
+            title = entry.get("title") or ""
+            in_library = store.get(feed_id)
+            if in_library is not None:
+                # 已在库的重复导入只会白跑一次采集 + 一次视觉调用。界面上的勾选列表
+                # 也是这么处理的（已入库置灰），两条路保持一致。
+                existing += 1
+                results.append(_favorites_item(
+                    feed_id, in_library.get("title") or title, "existing"))
+                continue
+            try:
+                note = await collector(
+                    favorites.note_link(feed_id, entry.get("xsec_token", "")),
+                    detail_tool, read_images=True, transcribe=transcribe,
+                    with_comments=False)
+            except XhsMcpUnavailable as exc:
+                # 通道级故障：剩下的每一条都会以同样的方式失败，对着一个死掉的服务
+                # 连打十几次只会让用户多等几分钟。停在这里，把原因和剩余条数带回去。
+                channel_error = str(exc)
+                failed += 1
+                results.append(_favorites_item(feed_id, title, "failed", error=channel_error))
+                logger.warning("favorites_import_channel_down done=%d total=%d",
+                               len(results), len(targets))
+                break
+            except XhsLinkError as exc:
+                failed += 1
+                results.append(_favorites_item(feed_id, title, "failed", error=str(exc)))
+                continue
+
+            try:
+                saved, status, assets, index = await asyncio.to_thread(
+                    _persist_note, store, media_root, note, downloader, indexer)
+            except Exception:  # noqa: BLE001 - 一条写库失败不该带走整批
+                logger.warning("favorites_import_persist_failed feed_id=%s", feed_id,
+                               exc_info=True)
+                failed += 1
+                results.append(_favorites_item(
+                    feed_id, title, "failed", error="采集成功但写入知识库失败。"))
+                continue
+
+            if status == "imported":
+                imported += 1
+            else:
+                existing += 1
+            results.append(_favorites_item(feed_id, saved.get("title") or title, status,
+                                           index=index, assets=assets))
+
+        data = {"requested": len(targets), "imported": imported,
+                "existing": existing, "failed": failed,
+                "attempted": len(results),
+                # 通道中途挂掉时剩下的条数：让模型能说清"是导到一半停了"，
+                # 而不是把 10 条里只试了 3 条说成"收藏里只有 3 条"。
+                "not_attempted": len(targets) - len(results),
+                "items": results}
+        if channel_error:
+            data["channel_error"] = channel_error
+        return {"ok": True, "data": data, "error": None}
+
+    return [
+        StructuredTool.from_function(
+            name=LIST_FAVORITES_TOOL_NAME,
+            description=LIST_FAVORITES_DESCRIPTION,
+            coroutine=listing,
+            args_schema=ListFavoritesInput,
+        ),
+        StructuredTool.from_function(
+            name=IMPORT_FAVORITES_TOOL_NAME,
+            description=IMPORT_FAVORITES_DESCRIPTION,
+            coroutine=importing,
+            args_schema=ImportFavoritesInput,
+        ),
+    ]
+
+
 async def _cached_tools() -> list:
     """白名单 MCP 工具 + 本地"粘链接采集"工具，成功后进程内缓存。
 
@@ -451,7 +667,9 @@ async def load_xhs_tools(*, store=None, media_root=None) -> list:
     """加载站外工具。
 
     不传 store 时返回"白名单 MCP 工具 + 链接采集工具"（无状态调用方，如采集层）；
-    传入 store 时再追加收藏工具——写操作需要落地到某个知识库，没有库就没有它。
+    传入 store 时再追加两个**写**工具：按链接收藏（save_note_by_link）、把收藏夹
+    导进知识库（import_my_favorites，连同只读的 list_my_favorites）。
+    写工具需要落地到某个知识库，没有库就没有它们的入口。
     """
     tools = await _cached_tools()
     if store is None:
@@ -459,4 +677,5 @@ async def load_xhs_tools(*, store=None, media_root=None) -> list:
     detail = get_detail_tool_from(tools)
     if detail is None:
         return tools
-    return tools + [build_save_note_tool(detail, store, media_root)]
+    return tools + [build_save_note_tool(detail, store, media_root),
+                    *build_favorites_tools(detail, store, media_root)]
