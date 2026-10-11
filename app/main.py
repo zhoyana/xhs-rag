@@ -49,7 +49,7 @@ from .plan_quality import check_plan_quality
 from .plan_flow import commit_plan, flow_snapshot, start_review
 from .tools import build_langchain_tools
 from .xhs_mcp import load_xhs_tools
-from . import eval_reports, indexing, xhs_source
+from . import eval_reports, favorites, indexing, xhs_mcp, xhs_source
 from .xhs_vision import apply_image_text, transcribe_local_files
 from .embeddings import (
     MODEL_NAME as EMBEDDING_MODEL,
@@ -118,6 +118,26 @@ class BatchImportRequest(BaseModel):
         max_length=100000,
         description="批量粘贴内容，可每行一个链接，也可包含小红书分享文案",
     )
+
+
+class FavoriteImportItem(BaseModel):
+    """勾选回来的一条收藏：只带"要哪一篇"和授权令牌。
+
+    标题等展示字段刻意不带过来——正文一律由采集得到，接口不接受客户端提供的
+    内容。否则这个端点就成了"随便写一篇进知识库"的入口，和"笔记内容只能来自
+    采集"的既有约定相冲突。
+    """
+
+    feed_id: str = Field(min_length=8, max_length=32, pattern=favorites.FEED_ID_PATTERN,
+                         description="小红书笔记编号（收藏列表返回的 id）")
+    xsec_token: str = Field(min_length=8, max_length=512,
+                            description="采集所需的签名令牌（收藏列表返回的 xsecToken）")
+
+
+class FavoritesImportRequest(BaseModel):
+    # 上限与批量导入一致：小红书对连续拉详情有风控，一次几十条会被限流。
+    items: list[FavoriteImportItem] = Field(min_length=1, max_length=20,
+                                            description="勾选要导入知识库的收藏条目")
 
 
 class ReadImagesRequest(BaseModel):
@@ -919,6 +939,144 @@ def create_app(db_path=DEFAULT_DB, media_root=None, case_dir=None):
             "collector_mcp": xhs_source.mcp_failure(),
             "items": items,
         }
+
+    async def process_favorites_sync(job_id: str):
+        """后台读取收藏列表。
+
+        这一步本身就慢（无头浏览器要等页面渲染出「收藏」子 tab，实测 30–60 秒，
+        还不稳定），所以不能卡在请求里等——前端拿 job_id 轮询，读到了再渲染。
+        """
+        store = app.state.store
+        store.update_job(job_id, status="running", current_step="fetch",
+                         progress={"fetch": "running"},
+                         now=datetime.now(timezone.utc).isoformat())
+        try:
+            payload = await xhs_mcp.fetch_my_favorites()
+            parsed = favorites.parse_profile(payload)
+        except xhs_mcp.XhsMcpUnavailable as exc:
+            logger.warning("favorites_sync_unavailable job_id=%s", job_id)
+            store.update_job(job_id, status="failed", current_step="failed",
+                             progress={"fetch": "failed"}, error=str(exc),
+                             now=datetime.now(timezone.utc).isoformat(),
+                             finished_at=datetime.now(timezone.utc).isoformat())
+            return
+        except favorites.FavoritesError as exc:
+            logger.info("favorites_sync_invalid job_id=%s code=%s", job_id, exc.code)
+            store.update_job(job_id, status="failed", current_step="failed",
+                             progress={"fetch": "failed", "error_code": exc.code},
+                             error=str(exc),
+                             now=datetime.now(timezone.utc).isoformat(),
+                             finished_at=datetime.now(timezone.utc).isoformat())
+            return
+
+        # 已经在库里的标出来，前端默认不勾选——重复导入只会白跑一次采集 + 视觉调用。
+        # 能直接查是因为 note_id 就是 feed_id（note_from_feed_detail 用同一个编号）。
+        for item in parsed["items"]:
+            item["in_library"] = app.state.store.get(item["feed_id"]) is not None
+        store.update_job(
+            job_id, status="completed", current_step="completed",
+            progress={"fetch": "completed"},
+            result={"profile": parsed["profile"], "items": parsed["items"],
+                    "skipped": parsed["skipped"], "limit_note": favorites.LIMIT_NOTE,
+                    "fetched_at": datetime.now(timezone.utc).isoformat()},
+            now=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(timezone.utc).isoformat())
+
+    async def process_favorites_import(job_id: str, targets: list):
+        """逐条走现有导入链路：采集 → 落图 → 建索引。
+
+        串行、每批 ≤20 条。并发拉几十条详情会撞小红书风控，而且图片必须在采集的
+        同一轮里落盘（地址带签名），并发反而更容易出现"采到了但图过期"。
+        """
+        store = app.state.store
+        total = len(targets)
+        progress = {"done": 0, "total": total, "current": None}
+        store.update_job(job_id, status="running", current_step="import",
+                         progress=progress,
+                         now=datetime.now(timezone.utc).isoformat())
+        items = []
+        for position, (feed_id, token) in enumerate(targets, 1):
+            item = {"position": position, "feed_id": feed_id, "note_id": feed_id,
+                    "status": "failed", "source": None, "error": None}
+            try:
+                result = await import_from_url(favorites.note_link(feed_id, token))
+                item.update({
+                    "status": result["status"],
+                    "title": result["note"]["title"],
+                    "source": result["source"],
+                    # 这条现在能不能被语义检索，是用户最关心的结果，如实回报。
+                    "searchable": bool(result["index"].get("searchable")),
+                    "index_status": result["index"].get("status"),
+                    "images": {"total": result["assets"]["total"],
+                               "saved": result["assets"]["downloaded"] + result["assets"]["skipped"],
+                               "failed": result["assets"]["failed"]},
+                })
+            except ImportProblem as exc:
+                # 与批量导入一致：走到这里说明两条通道都没给出内容。
+                item["source"] = xhs_source.SOURCE_HTML
+                item["error"] = str(exc)
+            except httpx.HTTPError as exc:
+                error_code, message = classify_network_error(exc)
+                logger.warning("favorites_import_failed job_id=%s position=%d error_code=%s",
+                               job_id, position, error_code)
+                item["error_code"] = error_code
+                item["error"] = message
+            except Exception:
+                # 后台任务里一条笔记的意外异常不能把整批带走，也不能让 job 永远停在
+                # running（那样前端会一直转圈）；记日志、标这一条失败，继续下一条。
+                logger.exception("favorites_import_crashed job_id=%s position=%d",
+                                 job_id, position)
+                item["error"] = "处理失败，请查看服务端日志。"
+            items.append(item)
+            progress["done"] = position
+            progress["current"] = item.get("title") or feed_id
+            store.update_job(job_id, status="running", current_step="import",
+                             progress=progress,
+                             now=datetime.now(timezone.utc).isoformat())
+
+        imported = sum(i["status"] == "imported" for i in items)
+        existing = sum(i["status"] == "existing" for i in items)
+        failed = total - imported - existing
+        store.update_job(
+            job_id, status="completed" if failed == 0 else "partial",
+            current_step="completed",
+            progress={**progress, "current": None},
+            result={"total": total, "imported": imported, "existing": existing,
+                    "failed": failed,
+                    # 整批失败时靠它区分"采集服务没开"和"这几条链接坏了"。
+                    "collector_mcp": xhs_source.mcp_failure(),
+                    "items": items},
+            now=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(timezone.utc).isoformat())
+
+    @app.post("/favorites/sync", status_code=202,
+              summary="读取小红书收藏夹（后台任务，完成后从 /jobs/{id} 取列表）")
+    async def sync_favorites(background_tasks: BackgroundTasks):
+        job_id = uuid4().hex
+        app.state.store.create_job(job_id, "favorites_sync",
+                                   datetime.now(timezone.utc).isoformat(),
+                                   {"fetch": "pending"})
+        background_tasks.add_task(process_favorites_sync, job_id)
+        return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}"}
+
+    @app.post("/favorites/import", status_code=202,
+              summary="把勾选的收藏导入知识库（后台任务，逐条上报进度）")
+    async def import_favorites(body: FavoritesImportRequest,
+                               background_tasks: BackgroundTasks):
+        # 同一次勾选里重复的编号只采一次；前端可能因为两次渲染把同一条带上两次。
+        seen, targets = set(), []
+        for entry in body.items:
+            if entry.feed_id in seen:
+                continue
+            seen.add(entry.feed_id)
+            targets.append((entry.feed_id, entry.xsec_token))
+        job_id = uuid4().hex
+        app.state.store.create_job(job_id, "favorites_import",
+                                   datetime.now(timezone.utc).isoformat(),
+                                   {"done": 0, "total": len(targets), "current": None})
+        background_tasks.add_task(process_favorites_import, job_id, targets)
+        return {"job_id": job_id, "total": len(targets), "status": "queued",
+                "poll_url": f"/jobs/{job_id}"}
 
     @app.get("/notes", summary="查看已保存的笔记")
     def list_notes(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):

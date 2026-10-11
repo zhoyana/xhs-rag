@@ -12,6 +12,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
+import httpx
 from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 
@@ -28,8 +29,31 @@ logger = logging.getLogger(__name__)
 # 调用危险工具；白名单在"工具进入模型视野之前"收敛，比靠提示词约束可靠。
 XHS_MCP_ALLOWED = ("search_feeds", "get_feed_detail", "list_feeds", "get_my_profile")
 
+# get_my_profile 的 tab 取值：note=自己发的、fav=自己的收藏、liked=自己点赞的。
+# 工具早就在白名单里，但过去从没传过 tab，所以"读自己的收藏"一直不可达。
+FAVORITES_TAB = "fav"
+PROFILE_TOOL_NAME = "get_my_profile"
+
 # 服务地址可用环境变量覆盖；与本仓库 tools 目录下的启动配置保持一致。
 XHS_MCP_URL = os.getenv("XHS_MCP_URL", "http://localhost:18060/mcp")
+
+
+def local_only_client(*, headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
+    """给本机 MCP 服务用的 httpx 客户端：**不走代理**。
+
+    ⚠️ 真机踩过的坑（症状极具误导性）：本机注册表里配了系统代理（Clash 之类），
+    `urllib.request.getproxies()` 实测返回 `http://127.0.0.1:7892`。httpx 默认
+    `trust_env=True` 会连 `localhost` 一起塞进代理，而代理对 localhost 直接回
+    **502 Bad Gateway** —— 于是「采集服务明明在监听 18060，工具却一个都加载不出来」，
+    日志里只有一句 `xhs_mcp_tools_unavailable`，看错误码（502）还会以为是采集服务
+    自己挂了。httpx 的 trust_env 读的是**系统代理设置**，不只是环境变量，所以
+    在一个 HTTP_PROXY 为空的环境里照样会中招。
+
+    本机服务不该经过代理：这里显式 `trust_env=False`。外部站点（图床、DeepSeek）
+    的客户端不动 —— 那些确实需要代理。
+    """
+    return httpx.AsyncClient(headers=headers, auth=auth, trust_env=False,
+                             timeout=timeout or httpx.Timeout(30.0))
 
 LINK_TOOL_NAME = "collect_note_by_link"
 LINK_TOOL_DESCRIPTION = (
@@ -330,7 +354,9 @@ async def _cached_tools() -> list:
         from langchain_mcp_adapters.client import MultiServerMCPClient
 
         client = MultiServerMCPClient({
-            "xiaohongshu": {"transport": "streamable_http", "url": XHS_MCP_URL},
+            "xiaohongshu": {"transport": "streamable_http", "url": XHS_MCP_URL,
+                            # 本机服务不走系统代理，否则 localhost 会被代理成 502。
+                            "httpx_client_factory": local_only_client},
         })
         tools = [t for t in await client.get_tools() if t.name in XHS_MCP_ALLOWED]
         # 只有拿得到 get_feed_detail 时才补本地工具，否则它们无从执行。
@@ -345,13 +371,67 @@ async def _cached_tools() -> list:
         return []
 
 
+def get_tool_from(tools: list, name: str):
+    """按名字从工具列表里取一个；找不到返回 None。"""
+    return next((t for t in tools if t.name == name), None)
+
+
 def get_detail_tool_from(tools: list):
-    return next((t for t in tools if t.name == "get_feed_detail"), None)
+    return get_tool_from(tools, "get_feed_detail")
 
 
 async def get_detail_tool():
     """取 MCP 的 get_feed_detail 工具；服务不可用时返回 None。"""
     return get_detail_tool_from(await _cached_tools())
+
+
+async def get_tool(name: str):
+    """取一个白名单 MCP 工具；服务不可用时返回 None。"""
+    return get_tool_from(await _cached_tools(), name)
+
+
+async def fetch_my_favorites(*, tab: str = FAVORITES_TAB, attempts: int = 3,
+                             delay: float = 2.0) -> dict:
+    """读取当前登录用户主页的指定 tab；tab="fav" 就是收藏夹。
+
+    为什么要重试：这个工具在无头浏览器里要等页面渲染出子 tab，实测三次里只有一次
+    一次就成功，余下报「未找到子 tab "收藏"」——重试即可，并不是登录失效。
+    抖动收敛在这一层，调用方（后台任务）只看到"成功"或"彻底失败"。
+
+    返回原始 payload（`{userBasicInfo, interactions, feeds}`），归一化交给
+    `app.favorites.parse_profile`——传输层不认识收藏的语义。
+    """
+    tool = await get_tool(PROFILE_TOOL_NAME)
+    if tool is None:
+        raise XhsMcpUnavailable(
+            "本地采集服务不可用：请确认 xiaohongshu-mcp 已启动（端口 18060）"
+            "且在带代理的环境下运行。")
+
+    last = "未知原因"
+    total = max(1, attempts)
+    for attempt in range(1, total + 1):
+        try:
+            raw = await tool.ainvoke({"tab": tab})
+        except Exception:  # noqa: BLE001 - 通道抖动一律重试
+            logger.warning("xhs_favorites_invoke_failed attempt=%d", attempt, exc_info=True)
+            last = "调用采集服务异常"
+        else:
+            text = _tool_text(raw)
+            if not text:
+                last = "返回为空"
+            else:
+                try:
+                    payload = json.loads(text)
+                except (TypeError, ValueError):
+                    # 未登录、或页面没渲染出来时服务返回的是纯文本提示，不是 JSON。
+                    last = text.strip()[:160]
+                else:
+                    if isinstance(payload, dict):
+                        return payload
+                    last = "返回不是对象"
+        if attempt < total:
+            await asyncio.sleep(delay)
+    raise XhsMcpUnavailable(f"读取收藏夹失败（已重试 {total} 次）：{last}")
 
 
 async def fetch_feed_detail(feed_id: str, xsec_token: str, *,

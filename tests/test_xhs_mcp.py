@@ -115,6 +115,8 @@ def test_only_whitelisted_tools_are_loaded(fake_mcp):
 
     # 连接配置：Streamable HTTP 指向本地 MCP 服务。
     assert fake_mcp.last_config["xiaohongshu"]["transport"] == "streamable_http"
+    # 而且必须带"不走代理"的客户端工厂：本机服务走系统代理会被代理成 502。
+    assert fake_mcp.last_config["xiaohongshu"]["httpx_client_factory"] is xhs_mcp.local_only_client
 
 
 def test_service_down_degrades_to_empty_and_retries(fake_mcp):
@@ -407,3 +409,55 @@ def test_chat_agent_can_save_notes(tmp_path, monkeypatch, fake_mcp):
 
     assert xhs_mcp.SAVE_TOOL_NAME in seen["names"]
     assert "publish_content" not in seen["names"]
+
+
+# ---------------------- 本机服务不能被系统代理劫持 ----------------------
+# 真机现场：采集服务在 18060 正常监听、登录也有效，但所有 MCP 工具都加载不出来，
+# 日志只有一句 xhs_mcp_tools_unavailable，异常里是 `502 Bad Gateway for
+# http://localhost:18060/mcp`。根因不是采集服务挂了，而是 Windows 注册表里配了
+# 系统代理（实测 getproxies() 返回 http://127.0.0.1:7892），httpx 默认
+# trust_env=True 把 localhost 也塞进了代理，代理对 localhost 回 502。
+# 下面这条用例把"本机服务不走代理"钉死：只要哪天有人把工厂去掉，它就会红。
+
+def test_local_mcp_client_bypasses_the_system_proxy(monkeypatch):
+    import http.server
+    import threading
+
+    import httpx
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server 要求的接口名
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # 访问日志不必出现在测试输出里
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/mcp"
+
+    # 指向一个必然连不上的代理：默认客户端会走它而失败，我们的客户端直连本机。
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    async def probe():
+        # 工厂返回的是 AsyncClient（MCP 适配器要的就是异步客户端）。
+        async with xhs_mcp.local_only_client() as client:
+            response = await client.get(url)
+            assert response.status_code == 200
+
+    try:
+        run(probe())
+        # 对照组：默认设置确实会被代理带走，否则上面那条断言就没有意义了。
+        with httpx.Client() as proxied:
+            with pytest.raises(httpx.HTTPError):
+                proxied.get(url)
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -2895,6 +2895,193 @@ function setEvalMode(mode) {
   $("#eval-traces-body").hidden = mode !== "traces";
 }
 
+// ------------------------- 收藏夹同步（从账号收藏导入） -------------------------
+// 手动粘贴链接之外的第二条进口。两个动作都走「202 + 后台任务 + 轮询」：
+// 读收藏要等无头浏览器把主页渲染出来（实测 30–60 秒且会抖），导入是逐条采集，
+// 两者都远超一次请求该有的时长——卡在请求里等只会让人以为页面死了。
+const favState = { items: [], picked: new Set(), loading: false };
+
+const JOB_POLL_MS = 800;
+const JOB_POLL_DEADLINE_MS = 8 * 60 * 1000;
+
+async function pollJob(jobId, onTick) {
+  // 轮询到终态为止。也设了上限：后台任务若真的把状态写坏了，宁可报超时，
+  // 也不要让页面永远停在"正在读取…"。
+  const deadline = Date.now() + JOB_POLL_DEADLINE_MS;
+  for (;;) {
+    const job = await api("GET", `/jobs/${jobId}`);
+    if (onTick) onTick(job);
+    if (["completed", "partial", "failed"].includes(job.status)) return job;
+    if (Date.now() > deadline) throw new Error("等待超时，请刷新页面后重试。");
+    await new Promise((r) => setTimeout(r, JOB_POLL_MS));
+  }
+}
+
+function setFavStatus(text, isError = false) {
+  const el = $("#fav-status");
+  el.textContent = text || "";
+  el.classList.toggle("error", Boolean(isError));
+}
+
+function openFavorites() {
+  $("#fav-panel").hidden = false;
+  if (favState.items.length) renderFavorites();
+  else syncFavorites();
+}
+
+async function syncFavorites() {
+  if (favState.loading) return;
+  favState.loading = true;
+  favState.picked.clear();
+  $("#fav-list").innerHTML = "";
+  $("#fav-result").textContent = "";
+  $("#btn-fav-import").disabled = true;
+  setFavStatus("正在读取你的收藏夹…首次可能要 30–60 秒，失败会自动重试。");
+  try {
+    const queued = await api("POST", "/favorites/sync");
+    const job = await pollJob(queued.job_id, (j) => {
+      const step = (j.progress || {}).fetch;
+      if (step === "running") setFavStatus("正在读取你的收藏夹…（等采集服务把主页渲染出来）");
+    });
+    if (job.status === "failed") {
+      // 后端的 error 已经区分了"采集服务没开"和"返回的东西不是收藏列表"，
+      // 原样显示——这里再翻译一遍只会丢掉细节。
+      setFavStatus(job.error || "读取失败。", true);
+      return;
+    }
+    favState.items = (job.result || {}).items || [];
+    favState.limitNote = (job.result || {}).limit_note || "";
+    favState.skipped = (job.result || {}).skipped || 0;
+    renderFavorites();
+  } catch (e) {
+    setFavStatus(e.message, true);
+  } finally {
+    favState.loading = false;
+  }
+}
+
+function updateFavCount() {
+  $("#fav-count").textContent = `已选 ${favState.picked.size} 条`;
+  $("#btn-fav-import").disabled = favState.picked.size === 0;
+}
+
+function renderFavorites() {
+  const list = $("#fav-list");
+  list.innerHTML = "";
+  const items = favState.items;
+  if (!items.length) {
+    setFavStatus("没有读到收藏条目。", true);
+    updateFavCount();
+    return;
+  }
+  const fresh = items.filter((it) => !it.in_library).length;
+  const parts = [`读到 ${items.length} 条，其中 ${fresh} 条还没入库`];
+  // 被跳过的条目（缺令牌或编号不合规）要报出来，否则"收藏 20 条只列出 18 条"
+  // 就成了静默丢数据。
+  if (favState.skipped) parts.push(`跳过 ${favState.skipped} 条（缺采集令牌）`);
+  if (favState.limitNote) parts.push(favState.limitNote);
+  setFavStatus(parts.join(" · "));
+
+  for (const it of items) {
+    const li = document.createElement("li");
+    li.className = "fav-item";
+
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = favState.picked.has(it.feed_id);
+    // 已在库的不给勾：重复导入只会白跑一次采集 + 视觉调用。
+    box.disabled = Boolean(it.in_library);
+    box.addEventListener("change", () => {
+      if (box.checked) favState.picked.add(it.feed_id);
+      else favState.picked.delete(it.feed_id);
+      updateFavCount();
+    });
+    li.appendChild(box);
+
+    if (it.cover) {
+      const img = document.createElement("img");
+      img.className = "fav-cover";
+      img.loading = "lazy";
+      img.alt = "";
+      img.src = it.cover;
+      // 图床地址带签名，放一会儿就 404；不显示破图，直接撤掉。
+      img.addEventListener("error", () => img.remove());
+      li.appendChild(img);
+    }
+
+    const main = document.createElement("div");
+    main.className = "fav-main";
+    const badges = [`<span class="badge">${it.kind === "video" ? "视频" : "图文"}</span>`];
+    if (it.in_library) badges.push('<span class="badge ok">已入库</span>');
+    const meta = [it.author || "未知作者"];
+    if (it.liked_count) meta.push(`赞 ${it.liked_count}`);
+    main.innerHTML = `<div class="fav-title">${escapeHtml(it.title)}</div>
+      <div class="fav-sub">${escapeHtml(meta.join(" · "))} ${badges.join(" ")}</div>`;
+    li.appendChild(main);
+    list.appendChild(li);
+  }
+  updateFavCount();
+}
+
+function renderFavResult(result) {
+  const box = $("#fav-result");
+  if (!result) { box.textContent = ""; return; }
+  const lines = [`成功导入 ${result.imported} 篇 · 已存在 ${result.existing} 篇 · 失败 ${result.failed} 篇`];
+  if (result.failed && COLLECTOR_HINTS[result.collector_mcp]) {
+    lines.push(COLLECTOR_HINTS[result.collector_mcp]);
+  }
+  for (const it of result.items) {
+    if (it.status === "failed") lines.push(`「${it.title || it.feed_id}」失败：${it.error || "未知原因"}`);
+  }
+  box.textContent = lines.join("\n");
+  box.classList.toggle("error", Boolean(result.failed));
+  // 入库的那几篇交给 AI 读一遍并给收藏夹建议，和手动粘贴链接的流程保持一致。
+  const fresh = result.items
+    .filter((it) => it.status === "imported" && it.note_id)
+    .map((it) => it.note_id);
+  if (fresh.length) {
+    toast(`已导入 ${result.imported} 篇，AI 开始整理…`);
+    enqueuePrepare(fresh);
+  } else if (result.failed) {
+    toast(`导入失败 ${result.failed} 篇`, true);
+  }
+}
+
+async function importFavorites() {
+  const picked = favState.items.filter((it) => favState.picked.has(it.feed_id));
+  if (!picked.length) { toast("先勾选要导入的收藏", true); return; }
+  $("#btn-fav-import").disabled = true;
+  $("#fav-result").textContent = "";
+  try {
+    const queued = await api("POST", "/favorites/import", {
+      // 只带编号与令牌：正文一律由服务端采集得到，前端提供的展示字段不作数。
+      items: picked.map((it) => ({ feed_id: it.feed_id, xsec_token: it.xsec_token })),
+    });
+    const job = await pollJob(queued.job_id, (j) => {
+      const p = j.progress || {};
+      const done = p.done || 0;
+      const total = p.total || queued.total;
+      const current = p.current ? `：${String(p.current).slice(0, 24)}` : "";
+      $("#fav-result").textContent = `正在导入 ${done}/${total}${current}`;
+    });
+    renderFavResult(job.result);
+    favState.picked.clear();
+    // 刚导入的把「已入库」标上，避免再勾一次；顺便把列表状态刷新。
+    const done = ((job.result || {}).items) || [];
+    for (const it of favState.items) {
+      if (done.some((r) => r.feed_id === it.feed_id && r.status !== "failed")) {
+        it.in_library = true;
+      }
+    }
+    renderFavorites();
+    loadNotes();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    $("#btn-fav-import").disabled = favState.picked.size === 0;
+  }
+}
+
 // ----------------------------- 事件绑定 -----------------------------
 $("#btn-memory-refresh").onclick = loadMemories;
 $("#btn-memory-add").onclick = () => {
@@ -2913,6 +3100,17 @@ $$("#eval-modes .seg").forEach((button) => {
 });
 $("#eval-report-picker").onchange = (e) => openEvalReport(e.target.value);
 $("#btn-import").onclick = importBatch;
+$("#btn-fav-sync").onclick = openFavorites;
+$("#btn-fav-reload").onclick = syncFavorites;
+$("#btn-fav-close").onclick = () => { $("#fav-panel").hidden = true; };
+$("#btn-fav-import").onclick = importFavorites;
+$("#fav-pick-all").onchange = (e) => {
+  favState.picked.clear();
+  if (e.target.checked) {
+    for (const it of favState.items) if (!it.in_library) favState.picked.add(it.feed_id);
+  }
+  renderFavorites();
+};
 $("#btn-read-all").onclick = readAllImages;
 $("#btn-refresh-notes").onclick = loadNotes;
 $("#notes-pick-all").onchange = (e) => toggleAll("notes", e.target.checked);

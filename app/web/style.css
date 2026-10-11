@@ -846,8 +846,46 @@ body.theme-dark .fchip.on { background: var(--primary-soft); }
 
 /* 导入结果要逐条说清失败原因，所以允许多行；有失败时换成警告色——
    一行灰色小字会被当成无关紧要的提示，而这里可能是整批都没进来。 */
-#import-result { white-space: pre-line; }
-#import-result.error { color: var(--danger); }
+#import-result, #fav-result { white-space: pre-line; }
+#import-result.error, #fav-result.error { color: var(--danger); }
+
+/* ==================== 收藏夹同步（笔记库内的浮层列表） ====================
+   不是新 tab、也不是全屏弹窗：它是「批量导入」旁边的一个备选入口，
+   用完就关，所以做成页面内的一段面板。
+   ======================================================================== */
+.fav-panel {
+  margin-bottom: 12px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.fav-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+/* 状态文字要能吃掉剩余宽度并折行，否则"读到 20 条…"会把按钮挤到下一行。 */
+.fav-head .hint { flex: 1; min-width: 200px; margin-top: 0; }
+.fav-list { list-style: none; margin: 8px 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow: auto; }
+.fav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.fav-item input { width: 15px; height: 15px; margin: 0; flex: none; cursor: pointer; accent-color: var(--accent); }
+.fav-item input:disabled { cursor: default; }
+.fav-cover {
+  width: 40px; height: 52px; flex: none;
+  object-fit: cover; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg);
+}
+.fav-main { min-width: 0; }
+.fav-title { font-weight: 600; margin-bottom: 2px; }
+.fav-sub { font-size: 12px; color: var(--muted); }
+.fav-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.fav-foot .hint { width: auto; margin-top: 0; }
 
 /* ----------------------------- 评估看板 ----------------------------- */
 /* 指标卡是这一页的主视觉：数字大、说明小，一行扫完。

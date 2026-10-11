@@ -39,11 +39,37 @@
         <textarea id="import-box" placeholder="粘贴小红书分享链接，每行一个，批量导入到收件箱…"></textarea>
         <div class="toolbar-actions">
           <button id="btn-import" class="primary">批量导入</button>
+          <button id="btn-fav-sync" class="ghost"
+            title="读取你小红书账号的收藏夹（最近 20 条），勾选后再导入知识库">同步收藏</button>
           <button id="btn-read-all" class="ghost" title="为所有已下载图片的笔记补读图（会消耗视觉模型额度）">全部补读图</button>
           <button id="btn-refresh-notes" class="ghost">刷新</button>
         </div>
         <div id="import-result" class="hint"></div>
       </div>
+
+      <!-- 收藏夹同步：手动粘贴链接之外的第二条进口。
+           刻意先列出来再让你勾，而不是一键全导——小红书收藏里混着转租、电影、
+           香薰这类时效性内容，全塞进知识库会污染语义检索的结果。
+           读取慢且会抖（无头浏览器要等页面渲染），所以后端是「202 + 轮询」，
+           这里如实显示"在读第几次"，而不是让按钮转圈转到人怀疑死机。 -->
+      <section class="fav-panel" id="fav-panel" hidden>
+        <div class="fav-head">
+          <b>我的小红书收藏</b>
+          <span class="hint" id="fav-status"></span>
+          <div class="toolbar-actions">
+            <label class="bulk-all"><input type="checkbox" id="fav-pick-all" /><span>全选未入库</span></label>
+            <button id="btn-fav-reload" class="ghost">重新读取</button>
+            <button id="btn-fav-close" class="ghost">关闭</button>
+          </div>
+        </div>
+        <ul class="fav-list" id="fav-list"></ul>
+        <div class="fav-foot">
+          <span class="bulk-count" id="fav-count">已选 0 条</span>
+          <button id="btn-fav-import" class="primary" disabled>导入选中</button>
+          <span class="hint">导入会在后台逐条采集（含图片落盘与建索引），条数多时请留着本页</span>
+        </div>
+        <div id="fav-result" class="hint"></div>
+      </section>
       <!-- 批量删除：一篇一篇点太累。勾选后在这里一次处理；常驻显示是为了让「全选」
            一直够得着——按钮只在有选中时才出现的话，用户就没法从零开始全选。 -->
       <div class="bulk-bar" id="notes-bulk">
